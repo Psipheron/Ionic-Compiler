@@ -129,3 +129,5 @@ and the ignored `main` return value. Reference:
 - [ ] You can compile any `.ionic` file and explain where the `.o` goes and why.
 - [ ] You reproduced at least two of the seven known discrepancies.
 - [ ] You can state, in one sentence, what "self-hosting fixed point" means.
+
+## [Next](01-language-core.md)
