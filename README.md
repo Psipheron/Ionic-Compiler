@@ -534,3 +534,8 @@ There are two independent ways to bootstrap, and both now start from the
 Once a self-hosted `ionic_new` exists it is a fixed point: it reproduces
 itself (byte-identical object files). End users who install the tarball
 only ever see `ionic_new`.
+
+---
+## Contributing
+PR's are always welcome.
+If you want a in-depth intro to the compiler and it's intricacies, look at the [Tutorial](docs/tutorial/README.md)
