@@ -189,6 +189,8 @@ import "../lepton/src/screen.ionic";
 The `term_*` runtime builtins it depends on (raw mode, alternate screen, key
 decoding) remain part of the compiler's C runtime.
 
+This is only possible if you have the lepton repository installed on your computer, next to the project.
+
 ---
 
 ## Selective compilation — how it works
