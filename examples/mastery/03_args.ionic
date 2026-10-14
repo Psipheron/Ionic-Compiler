@@ -1,0 +1,17 @@
+// Mastery 03.3 — command-line arguments and exit codes.
+//
+// As in 00_hello: main's return value is ignored by the wrapper; use exit() for
+// a specific status.
+//   ./ionic_new examples/mastery/03_args.ionic -o /tmp/a
+//   /tmp/a            -> prints usage, exit 2
+//   /tmp/a hello      -> prints "got arg: hello", exit 0
+
+fn main() -> int64 {
+    let first = get_arg(0);          // first arg after the program name
+    if (str_eq(first, "")) {
+        println("usage: 03_args <something>");
+        exit(2);                     // non-zero exit code
+    }
+    println(str_concat("got arg: ", first));
+    return 0;
+}

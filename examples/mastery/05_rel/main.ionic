@@ -1,0 +1,12 @@
+// Mastery 05.3 — relative (path) import.
+// Compile THIS file directly; helper.ionic is spliced in by the import, which
+// resolves relative to this file's directory.
+//   ./ionic_new examples/mastery/05_rel/main.ionic -o /tmp/rel && /tmp/rel
+
+import "helper.ionic";
+
+fn main() -> int64 {
+    println(greet("relative import"));
+    println(str_concat("shout(7) = ", int64_to_str(shout(7))));
+    return 0;
+}

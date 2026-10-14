@@ -1,0 +1,8 @@
+// Mastery EXERCISE 01.5 — this program must FAIL to compile.
+// Assigning to a `let` binding.
+//
+//   ./ionic_new examples/mastery/fail/immutable.ionic -o /tmp/x
+// Expected: [error] assigning to immutable variable 'x'  (or similar)
+
+let x = 10;
+x = 20;

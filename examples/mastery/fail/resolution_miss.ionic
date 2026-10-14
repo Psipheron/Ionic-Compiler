@@ -1,0 +1,15 @@
+// Mastery EXERCISE 05.5 — unresolvable import; must exit non-zero with the
+// list of paths tried.
+//
+//   ./ionic_new examples/mastery/fail/resolution_miss.ionic -o /tmp/x
+// Expected:
+//   ionic: cannot resolve import 'std.nosuch'
+//     tried: ./.ionic/packages/std/nosuch.ionic
+//     tried: ...
+//     tried: lib/std/nosuch.ionic
+
+import std.nosuch;
+
+fn main() -> int64 {
+    return 0;
+}

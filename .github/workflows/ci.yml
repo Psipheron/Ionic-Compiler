@@ -88,6 +88,19 @@ jobs:
       - name: Verify self-hosting (object files byte-identical)
         run: ./build.sh --verify-self-hosting
 
+      # ── RSS regression gate (ADVISORY during memory-model rollout) ───────
+      # Smallest-possible-RSS is a core language goal. scripts/rss_check.sh
+      # compiles a string-churn benchmark at two sizes and fails if peak RSS
+      # grows with N (a leaking allocator grows ~48 B/iter; a correct one is
+      # flat). It currently FAILS by design: the runtime still leaks, so this
+      # records the baseline and gives the ownership work a number to defend.
+      # `continue-on-error` keeps CI green for unrelated work and shows a red
+      # step so the leak stays visible. When the memory model lands, delete
+      # `continue-on-error` to make this a hard gate.
+      - name: RSS regression gate (advisory until memory model lands)
+        continue-on-error: true
+        run: ./scripts/rss_check.sh
+
       - name: Smoke test — hello world (self-hosted compiler)
         run: |
           echo 'fn main() -> int64 { print("ok"); return 0; }' > /tmp/hi2.ionic

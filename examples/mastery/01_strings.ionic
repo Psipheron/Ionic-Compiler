@@ -1,0 +1,15 @@
+// Mastery 01.1b — string builtins and format().
+// Note: format() does NOT coerce numbers — wrap with *_to_str first.
+
+let s = "hello world";
+
+println(str_concat("str_len       = ", int64_to_str(str_len(s))));
+println(str_concat("str_concat    = ", str_concat("<<", s)));
+println(str_concat("str_eq        = ", int64_to_str(str_eq(s, "hello world"))));
+println(str_concat("str_index(0)  = ", int64_to_str(str_index(s, 0))));   // 'h' = 104
+println(str_concat("char_to_str   = ", char_to_str(65)));                 // "A"
+println(str_concat("int64_to_str  = ", int64_to_str(42)));
+println(str_concat("float64_to_str= ", float64_to_str(3.140000)));
+
+let msg = format("{} and {}", "A", int64_to_str(42));
+println(str_concat("format        = ", msg));

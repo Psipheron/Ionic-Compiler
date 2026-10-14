@@ -553,7 +553,13 @@ mut local_slots    = [0];   // stack slot index
 mut local_is_float = [0];   // 1 if float64
 mut local_is_str   = [0];   // 1 if string type
 mut local_stypes   = [""];  // struct type name, or "" for non-struct locals
+mut local_model    = [0];   // 1 if this local owns a `model` resource (RAII)
 mut local_count    = 0;
+
+// Names+slots of model-owning locals, for auto-free at function end.
+mut model_names    = [""];
+mut model_slots    = [0];
+mut model_count    = 0;
 
 // Tracks the struct type name of the most recently evaluated expression.
 // Set by ncg_expr whenever it evaluates a struct-typed expression.
@@ -589,6 +595,10 @@ fn local_reset() -> int64 {
     arr_reset(local_is_float);
     arr_reset(local_is_str);
     arr_reset(local_stypes);
+    arr_reset(local_model);
+    arr_reset(model_names);
+    arr_reset(model_slots);
+    model_count = 0;
     n_csr = 0;
     csr_base_slot = 0;
     spill_base = 0;
@@ -626,6 +636,7 @@ fn local_def(string name, int64 is_float) -> int64 {
     local_is_float.push(is_float);
     local_is_str.push(0);
     local_stypes.push("");
+    local_model.push(0);
     local_count = local_count + 1;
     return slot;
 }
@@ -672,6 +683,87 @@ fn local_is_float_slot(string name) -> int64 {
         if (local_names[i] == h) { return local_is_float[i]; }
         i = i + 1;
     }
+    return 0;
+}
+
+// ── RAII helpers for `model` resources ─────────────────────────────────────────
+fn local_owns_model(string name) -> int64 {
+    let h = str_hash(name);
+    mut last = 0;
+    mut i = 0;
+    while (i < local_count) {
+        if (local_names[i] == h) { last = local_model[i]; }
+        i = i + 1;
+    }
+    return last;
+}
+
+fn local_set_model(string name, int64 v) -> int64 {
+    let h = str_hash(name);
+    mut last = -1;
+    mut i = 0;
+    while (i < local_count) {
+        if (local_names[i] == h) { last = i; }
+        i = i + 1;
+    }
+    if (last < 0) { return 0; }
+    local_model[last] = v;
+    if (v == 1) {
+        let slot = local_slots[last];
+        mut j = 0;
+        mut dup = 0;
+        while (j < model_count) {
+            if (model_slots[j] == slot) { dup = 1; }
+            j = j + 1;
+        }
+        if (dup == 0) {
+            model_names.push(name);
+            model_slots.push(slot);
+            model_count = model_count + 1;
+        }
+    }
+    return 0;
+}
+
+// Free any model-owning locals still live at scope exit (RAII destructor).
+fn ncg_release_models() -> int64 {
+    mut i = 0;
+    while (i < model_count) {
+        let nm = model_names[i];
+        if (local_owns_model(nm) == 1) {
+            let slot = model_slots[i];
+            let r = scratch_push();
+            if (slot < n_csr) {
+                a64_mov(r, REG_X19 + slot);
+            } else {
+                let off = local_offset(slot);
+                if (off >= 0) { a64_ldr(r, REG_X29, off >> 3); }
+                else {
+                    let neg = 0 - off;
+                    if (neg <= 255) { a64_ldur(r, REG_X29, off); }
+                    else {
+                        a64_sub_imm(REG_X16, REG_X29, neg);
+                        a64_ldr(r, REG_X16, 0);
+                    }
+                }
+            }
+            let fs = sym_undef("ionic_model_free");
+            a64_mov(REG_X0, r);
+            a64_bl_sym(fs);
+            scratch_pop();
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Does this expression produce a `model` resource?
+fn ncg_model_expr(int64 n) -> int64 {
+    let k = nd_kind[n];
+    if (k == ND_CALL) {
+        if (str_eq(nd_sv[n], "load_model")) { return 1; }
+    }
+    if (k == ND_IDENT) { return local_owns_model(nd_sv[n]); }
     return 0;
 }
 
@@ -1259,6 +1351,16 @@ fn ncg_call(int64 node) -> int64 {
     let callee = nd_sv[node];
     let args   = nd_i2[node];   // linked list of arg nodes
 
+    // RAII: an explicit model_free(m) consumes the local's ownership, so the
+    // implicit destructor must not free it again at scope exit.
+    if (str_eq(callee, "model_free")) {
+        let a0 = nd_i2[args];
+        if (a0 != 0) {
+            let e0 = nd_i2[a0];
+            if (nd_kind[e0] == ND_IDENT) { local_set_model(nd_sv[e0], 0); }
+        }
+    }
+
     // Reset type tracker before evaluating args
     ncg_last_ty = 0;
 
@@ -1437,6 +1539,8 @@ fn ncg_stmt(int64 node) -> int64 {
         if (ncg_last_ty == 1) { local_set_str(slot, 1); }
         if (ncg_last_ty == 2) { local_set_float(slot, 1); }
         if (!str_eq(ncg_last_stype, "")) { local_set_stype(slot, ncg_last_stype); }
+        // RAII: a local bound to a freshly loaded model owns that resource.
+        if (ncg_model_expr(init) == 1) { local_set_model(name, 1); }
         // Store to stack
         if (off >= 0) { a64_str(r, REG_X29, off >> 3); }
         else {
@@ -1462,6 +1566,29 @@ fn ncg_stmt(int64 node) -> int64 {
             let name = nd_sv[target];
             let slot = local_find(name);
             if (slot >= 0) {
+                // RAII: assigning over this local's model resource frees the old
+                // one. Skip when the RHS is the local itself (x = x).
+                if (local_owns_model(name) == 1 && !(nd_kind[val] == ND_IDENT && str_eq(nd_sv[val], name))) {
+                    let or_ = scratch_push();
+                    if (slot < n_csr) {
+                        a64_mov(or_, REG_X19 + slot);
+                    } else {
+                        let ooff = local_offset(slot);
+                        if (ooff >= 0) { a64_ldr(or_, REG_X29, ooff >> 3); }
+                        else {
+                            let oneg = 0 - ooff;
+                            if (oneg <= 255) { a64_ldur(or_, REG_X29, ooff); }
+                            else {
+                                a64_sub_imm(REG_X16, REG_X29, oneg);
+                                a64_ldr(or_, REG_X16, 0);
+                            }
+                        }
+                    }
+                    let fsm = sym_undef("ionic_model_free");
+                    a64_mov(REG_X0, or_);
+                    a64_bl_sym(fsm);
+                    scratch_pop();
+                }
                 if (slot < n_csr) {
                     // Register-promoted param: write to callee-saved reg X19+slot
                     a64_mov(REG_X19 + slot, vr);
@@ -1477,6 +1604,8 @@ fn ncg_stmt(int64 node) -> int64 {
                         }
                     }
                 }
+                // RAII: track model ownership after the store.
+                if (ncg_model_expr(val) == 1) { local_set_model(name, 1); }
             } else {
                 // Not a local — store to global data slot
                 let gi = ncg_glob_find(name);
@@ -1527,9 +1656,14 @@ fn ncg_stmt(int64 node) -> int64 {
         let val = nd_i2[node];
         if (val != 0) {
             let r = ncg_expr(val);
+            // RAII: returning a model transfers ownership; don't free the source.
+            if (nd_kind[val] == ND_IDENT && local_owns_model(nd_sv[val]) == 1) {
+                local_set_model(nd_sv[val], 0);
+            }
             a64_mov(REG_X0, r);
             scratch_pop();
         }
+        ncg_release_models();
         // Epilogue inline (jump to epilogue label would be cleaner but this works)
         ncg_fn_epilogue();
         return 0;
@@ -1853,6 +1987,7 @@ fn ncg_fn_node(int64 fn_node) -> int64 {
     ncg_stmts(body_list);
 
     // Implicit return 0 at end of function if no explicit return
+    ncg_release_models();
     a64_load_imm(REG_X0, 0);
     ncg_fn_epilogue();
 
@@ -2189,6 +2324,10 @@ fn codegen_program(int64 structs_list, int64 fns_list, int64 top_list, string ou
     local_is_float = [0]; arr_reset(local_is_float);
     local_is_str   = [0]; arr_reset(local_is_str);
     local_stypes   = [""]; arr_reset(local_stypes);
+    local_model    = [0];  arr_reset(local_model);
+    model_names    = [""]; arr_reset(model_names);
+    model_slots    = [0];  arr_reset(model_slots);
+    model_count    = 0;
     local_count    = 0;
     scratch_depth  = 0;
     fn_ret_stype_hashes = [0]; arr_reset(fn_ret_stype_hashes);

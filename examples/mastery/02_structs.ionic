@@ -1,0 +1,14 @@
+// Mastery 02.4 — struct fields are mutable regardless of the binding.
+
+struct Point { x: float64, y: float64 }
+
+let p = Point { x: 1.0, y: 2.0 };   // `let` binding ...
+println(str_concat("p.x = ", float64_to_str(p.x)));
+
+p.y = 3.0;                          // ... field assignment still allowed
+println(str_concat("p.y = ", float64_to_str(p.y)));
+
+// A method-style call and a plain function call are the same thing:
+struct Counter { n: int64 }
+let c = Counter { n: 0 };
+println(str_concat("c.n = ", int64_to_str(c.n)));

@@ -1,0 +1,27 @@
+// RSS regression benchmark — string allocation churn.
+//
+// Property under test: the loop allocates two fresh strings per iteration
+// (int64_to_str + str_concat) but keeps only the latest one live. A correct
+// memory model reclaims each iteration's garbage as it dies, so peak RSS is
+// flat in N. A leaking runtime grows RSS roughly linearly with N.
+//
+// scripts/rss_check.sh compiles this with the self-hosted compiler and fails
+// if peak RSS exceeds a budget. Change N here only alongside the budget.
+//
+// Run manually:
+//   ./ionic_new examples/rss_churn.ionic -o /tmp/rss_churn
+//   /usr/bin/time -l /tmp/rss_churn 2>&1 | grep 'maximum resident'
+
+fn main() -> int64 {
+    let n = 300000;
+    mut s = "";
+    mut i = 0;
+    while (i < n) {
+        // Two allocations per iteration; previous `s` becomes garbage.
+        s = str_concat(int64_to_str(i), "-x");
+        i = i + 1;
+    }
+    // Keep `s` live so the whole loop cannot be dead-code eliminated.
+    println(str_concat("iters=", str_concat(int64_to_str(n), str_concat(" last=", s))));
+    return 0;
+}

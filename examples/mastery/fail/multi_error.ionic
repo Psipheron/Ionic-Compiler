@@ -1,0 +1,12 @@
+// Mastery EXERCISE 03.5 — several errors in ONE pass (panic-mode recovery).
+// Each statement below is independently broken; the compiler should report all
+// of them, not stop at the first.
+//
+//   NO_COLOR=1 ./ionic_new examples/mastery/fail/multi_error.ionic -o /tmp/x
+
+fn main() -> int64 {
+    let a = 1 +;          // syntax error: missing operand
+    let b = nosuch(3);    // unknown function
+    let c = 2 $ 3;        // unknown character '$'
+    return 0;
+}

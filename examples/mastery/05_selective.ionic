@@ -1,0 +1,12 @@
+// Mastery 05.1 — wildcard import, selective at codegen.
+// Only clamp is called, so only clamp (plus any constants it needs) is emitted.
+// Compiling this file with `import std.math.{clamp};` instead yields an
+// identical object file: compare the two <out>.o.
+
+import std.math.*;
+
+fn main() -> int64 {
+    let v = clamp(2.5, 0.0, 1.0);
+    println(str_concat("clamp(2.5,0,1) = ", float64_to_str(v)));   // 1
+    return 0;
+}

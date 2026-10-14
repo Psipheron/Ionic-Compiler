@@ -1,0 +1,20 @@
+// Mastery 03.4 — file_write / file_read round trip.
+//
+// NOTE: docs/language.md and docs/guide.md mention file_exists(), but the
+// shipped self-hosted compiler does NOT register it (it exists only in the
+// legacy compiler.ionic and the Rust frontend). This is another doc-vs-compiler
+// discrepancy — see docs/mastery/README.md. Use file_read's "" on miss instead.
+
+let path = "/tmp/ionic_mastery_io.txt";
+let payload = "round-trip payload 123\n";
+
+file_write(path, payload);
+
+let back = file_read(path);
+println(str_concat("wrote:    ", payload));
+println(str_concat("read back:", back));
+println(str_concat("equal?    ", int64_to_str(str_eq(back, payload))));
+
+// Missing files read as "" rather than erroring.
+let missing = file_read("/tmp/ionic_no_such_file");
+println(str_concat("missing file len = ", int64_to_str(str_len(missing))));

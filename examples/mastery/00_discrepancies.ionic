@@ -1,0 +1,33 @@
+// Mastery 00.4 — the "known discrepancies" from docs/mastery/README.md, reproduced.
+//
+// Run:
+//   ./ionic_new examples/mastery/00_discrepancies.ionic -o /tmp/d && /tmp/d
+//
+// You will see:
+//   1. mean_f([1,2,3,4]) = 3   (WRONG; a correct mean is 2.5) — the std.data
+//      off-by-one, because those helpers assume 1-based arrays while Ionic
+//      arrays are 0-based.
+//   2. println(names[0]) prints a pointer-ish integer, not "alice" — element
+//      loads lose string-ness at the codegen level (unit 06 §8).
+//
+// (Discrepancy 3 — CLI/`--run` — is about the tooling, not output. Discrepancy
+//  4 — print vs println — is shown in 01_print_variants.ionic.)
+
+import std.data.*;
+
+mut names = ["alice", "bob"];
+
+let a = [1.0, 2.0, 3.0, 4.0];
+println(str_concat("mean_f([1,2,3,4]) = ", float64_to_str(mean_f(a))));
+println("   (correct answer is 2.5; std.data drops index 0)");
+
+// This line is deliberately non-deterministic: it prints a pointer as an int.
+println("names[0] via println(arr[i]) — garbage, varies run to run:");
+println(names[0]);
+
+// For contrast, indexing into an [int64] prints correctly:
+mut nums = [10, 20, 30];
+println(str_concat("nums[0] (int array) = ", int64_to_str(nums[0])));
+
+// Bounds checking (discrepancy 1b): uncomment to see the runtime abort.
+// println(str_concat("OOB: ", int64_to_str(nums[3])));

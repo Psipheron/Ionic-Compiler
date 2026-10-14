@@ -1,0 +1,23 @@
+// Mastery 07.1 — demonstrate the string leak (no GC, no refcounting today).
+//
+// Each iteration builds two fresh strings (int64_to_str + str_concat) and
+// rebinds `s`, so the previous values become garbage that is never freed.
+//
+//   ./ionic_new examples/mastery/07_leak.ionic -o /tmp/leak
+//   /usr/bin/time -l /tmp/leak 2>&1 | grep -E "maximum resident"
+//
+// Watch "maximum resident set size" grow with N. The compiler has the same
+// leak, which is why docs/memory-model.md exists.
+
+fn main() -> int64 {
+    let n = 1000000;              // lower this if it runs too long
+    mut s = "";
+    mut i = 0;
+    while (i < n) {
+        s = str_concat(int64_to_str(i), "-x");   // two allocations per iteration
+        i = i + 1;
+    }
+    println(str_concat("last value: ", s));
+    println(str_concat("iterations: ", int64_to_str(n)));
+    return 0;
+}

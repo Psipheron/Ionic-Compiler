@@ -1,0 +1,8 @@
+// Mastery 00.2 — no `fn main`; top-level statements run directly.
+// Expected: three lines printed, exit code 0.
+//   ./ionic_new examples/mastery/00_toplevel.ionic -o /tmp/t && /tmp/t; echo "exit=$?"
+
+let who = "mastery";
+println(str_concat("line 1: ", who));
+println("line 2: top-level statements run without a main");
+println("line 3: done");

@@ -1,0 +1,42 @@
+// Mastery 04.4 — hardware placement that must COMPILE.
+//
+// Rules the checker enforces (unit 04):
+//   - tensor@cpu and tensor@gpu are distinct, invariant types.
+//   - .toGpu()/.toCpu() are the only transfers.
+//   - A tensor@gpu value may only be *referenced* inside a gpu { ... } block
+//     (or an @gpu fn body). You may declare it outside and use it inside.
+//   - An @gpu fn body is a GPU context: no CPU-only I/O, no tensor@cpu, no @cpu
+//     calls.
+//
+// model_forward(model, tensor) yields a tensor@cpu; load_model yields model@cpu.
+
+@gpu fn run(tensor@gpu x) -> tensor@gpu {
+    // GPU context: tensor@gpu compute only.
+    return run2(x);
+}
+
+@gpu fn run2(tensor@gpu x) -> tensor@gpu {
+    return x;
+}
+
+@gpu(0.5) fn run_half(tensor@gpu x) -> tensor@gpu {
+    return x;
+}
+
+fn main() -> int64 {
+    let m: model@cpu = load_model("m.onnx");
+
+    // Build a CPU tensor, then transfer it to the GPU.
+    let host: tensor@cpu = model_forward(m, m);
+    let dev = host.toGpu();              // declared here, referenced only in gpu{}
+
+    gpu {
+        let y = run(dev);                // ok: tensor@gpu into @gpu fn
+        let z = run_half(y);
+    }
+
+    // Bring a value back with .toCpu() (outside the block).
+    let back = dev.toCpu();
+    println("placement program compiled and ran");
+    return 0;
+}

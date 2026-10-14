@@ -1,0 +1,14 @@
+// Mastery EXERCISE 02.5 — compiles and RUNS, but misbehaves.
+// `println` of a [string] array element prints the element's pointer as an
+// integer, because element loads lose string-ness at the codegen level
+// (unit 06 §8). Output differs run to run.
+//
+//   ./ionic_new examples/mastery/fail/string_array_print.ionic -o /tmp/sap && /tmp/sap
+
+mut names = ["alice", "bob"];
+println("expected: alice");
+print("actual:   ");
+println(names[0]);          // prints a pointer-ish integer, not "alice"
+
+// The workaround is to copy through a plain string local first, or index an
+// [int64] array (which prints correctly).

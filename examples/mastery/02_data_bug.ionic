@@ -1,0 +1,22 @@
+// Mastery 02.3 — reproduce the lib/std/data.ionic off-by-one.
+//
+// Ionic arrays are 0-based: a[0] is the first element.
+// But std.data's mean_f/min_f/max_f/stdev_f/to_csv_line assume 1-based arrays:
+// they set `n = len(a) - 1` and start at index 1, silently skipping a[0].
+//
+//   mean_f([1,2,3,4]) = mean(2,3,4) = 3.0   (WRONG; correct is 2.5)
+
+import std.data.*;
+
+let a = [1.0, 2.0, 3.0, 4.0];
+
+println(str_concat("mean_f = ", float64_to_str(mean_f(a))));   // 3, should be 2.5
+println(str_concat("min_f  = ", float64_to_str(min_f(a))));     // 2, should be 1
+println(str_concat("max_f  = ", float64_to_str(max_f(a))));     // 4 (coincidentally right)
+println(str_concat("stdev_f= ", float64_to_str(stdev_f(a))));   // computed over 2,3,4
+
+// A correct 0-based mean, for contrast:
+mut total = 0.0;
+mut i = 0;
+while (i < len(a)) { total = total + a[i]; i = i + 1; }
+println(str_concat("correct mean = ", float64_to_str(total / int64_to_float64(len(a)))));

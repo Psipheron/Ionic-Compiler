@@ -1,0 +1,19 @@
+// Mastery 02.2 — array semantics: .len property, len() builtin, 0-based index,
+// element assignment, and the runtime bounds check.
+
+mut a = [10, 20, 30];
+println(str_concat("a.len    = ", int64_to_str(a.len)));    // property
+println(str_concat("len(a)   = ", int64_to_str(len(a))));   // builtin
+println(str_concat("a[0]     = ", int64_to_str(a[0])));     // 0-based
+println(str_concat("a[1]     = ", int64_to_str(a[1])));
+println(str_concat("a[2]     = ", int64_to_str(a[2])));
+
+a[1] = 99;
+println(str_concat("after a[1]=99 -> ", int64_to_str(a[1])));
+
+a.push(40);
+println(str_concat("after push 40 -> len = ", int64_to_str(a.len)));
+
+// Runtime bounds check. Uncomment to abort:
+//   ionic: index out of bounds: index 3, length 3
+// println(str_concat("a[3] = ", int64_to_str(a[3])));

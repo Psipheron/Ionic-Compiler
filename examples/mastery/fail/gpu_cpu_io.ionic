@@ -1,0 +1,9 @@
+// Mastery EXERCISE 04.3 — contradictory hardware annotation; must be REJECTED.
+// An @gpu function whose parameter is annotated @cpu can never be satisfied at
+// any call site, so the checker rejects it.
+//
+//   ./ionic_new examples/mastery/fail/gpu_cpu_io.ionic -o /tmp/x
+
+@gpu fn bad(@cpu tensor@cpu x) -> tensor@gpu {
+    return x;
+}

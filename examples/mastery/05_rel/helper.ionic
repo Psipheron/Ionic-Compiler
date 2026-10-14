@@ -1,0 +1,9 @@
+// helper module for the relative-import exercise (05.3).
+
+fn greet(string who) -> string {
+    return str_concat("hello, ", who);
+}
+
+fn shout(int64 n) -> int64 {
+    return n * n;
+}

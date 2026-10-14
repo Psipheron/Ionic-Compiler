@@ -1,0 +1,16 @@
+// Mastery — print vs println and the type-overloaded output path.
+// print    -> no trailing newline (fputs)
+// println  -> trailing newline    (puts)
+// Integer args use printf("%lld"), floats use printf("%g").
+
+print("no newline here:");
+print(int64_to_str(1));
+println("");
+
+println("with newline");
+
+// Float printing via %g (trailing zeros trimmed), unlike float64_to_str which
+// uses %lf (fixed 6 decimals).
+println(str_concat("println(3.5) prints -> ", "3.5 via %g"));
+println(3.5);
+println(str_concat("float64_to_str(3.5) -> ", float64_to_str(3.5)));

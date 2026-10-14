@@ -1,0 +1,21 @@
+// Mastery EXERCISE 04.1 — tensor placement mismatch; must be REJECTED with a
+// conversion hint. Passing a tensor@gpu where tensor@cpu is expected produces:
+//
+//   [error] type error in arg 1 of 'consume': expected tensor@cpu, got tensor@gpu
+//           (call .toCpu() to convert)
+//
+//   NO_COLOR=1 ./ionic_new examples/mastery/fail/tensor_mismatch.ionic -o /tmp/x
+
+@cpu fn consume(tensor@cpu x) -> int64 { return 1; }
+@gpu fn produce(tensor@gpu x) -> tensor@gpu { return x; }
+
+fn main() -> int64 {
+    let m: model@cpu = load_model("m.onnx");
+    let h: tensor@cpu = model_forward(m, m);
+    let d = h.toGpu();
+    gpu {
+        let r = produce(d);         // r : tensor@gpu
+        let bad = consume(r);       // ERROR: expects tensor@cpu
+    }
+    return 0;
+}

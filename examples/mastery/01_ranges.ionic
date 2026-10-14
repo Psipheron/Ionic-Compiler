@@ -1,0 +1,15 @@
+// Mastery 01.2 — for-range is EXCLUSIVE of the upper bound.
+// `for (i in 0..5)` visits 0,1,2,3,4.
+
+mut sum = 0;
+for (i in 0..5) {
+    println(str_concat("i = ", int64_to_str(i)));
+    sum = sum + i;
+}
+println(str_concat("sum(0..5) = ", int64_to_str(sum)));   // 10, not 15
+
+// Same shape with a variable bound.
+let n = 4;
+mut c = 0;
+for (k in 0..n) { c = c + 1; }
+println(str_concat("iterations over 0..n (n=4) = ", int64_to_str(c)));  // 4

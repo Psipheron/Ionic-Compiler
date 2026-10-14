@@ -1,0 +1,16 @@
+// Mastery 00.1 — `fn main` entry point and process exit codes.
+//
+// FINDING (verify it yourself): the *return value* of main is NOT used as the
+// process exit code in the shipped compiler. The generated `main` wrapper calls
+// ionic_user_main(...) and then unconditionally loads 0 into the return
+// register (src/codegen/native.ionic, ncg_main_wrapper). So `return 7` still
+// exits 0. Use exit(code) to set the status.
+//
+//   ./ionic_new examples/mastery/00_hello.ionic -o /tmp/h && /tmp/h; echo "exit=$?"
+// Expected: prints the line, and exit=7 (via exit()).
+
+fn main() -> int64 {
+    println("Hello, Ionic!");
+    exit(7);        // explicit exit status — main's return value is ignored
+    return 0;
+}

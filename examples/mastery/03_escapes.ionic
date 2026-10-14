@@ -1,0 +1,15 @@
+// Mastery 03.2 — escapes and char_to_str.
+//   \e    ESC (0x1B)          \xHH  raw byte from two hex digits
+//   char_to_str(codepoint)    UTF-8 encodes a Unicode codepoint
+
+// ANSI red, then reset.
+print("\e[31mred\e[0m\n");
+
+// Raw bytes: 0x41 0x42 = "AB"
+print("\x41\x42\n");
+
+// A box-drawing horizontal bar (U+2500) and a top-left corner (U+250C).
+print(char_to_str(0x250C));
+print(char_to_str(0x2500));
+print(char_to_str(0x2500));
+print("\n");

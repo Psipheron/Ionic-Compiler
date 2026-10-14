@@ -1,0 +1,17 @@
+// Mastery 01.1 — one value of each literal type.
+// Only string-typed args print directly; numbers/strings-of-numbers go through
+// int64_to_str / float64_to_str.
+
+let i   = 42;                 // int64
+let hx  = 0x2A;               // int64 (hex) == 42
+let f   = 3.14;               // float64
+let b   = true;               // bool (== int64 at runtime)
+let s   = "text";             // string
+let arr = [1, 2, 3];          // [int64]
+
+println(str_concat("int64   = ", int64_to_str(i)));
+println(str_concat("hex     = ", int64_to_str(hx)));
+println(str_concat("float64 = ", float64_to_str(f)));
+println(str_concat("bool    = ", int64_to_str(b)));   // prints 1
+println(str_concat("string  = ", s));
+println(str_concat("array[1]= ", int64_to_str(arr[1])));
