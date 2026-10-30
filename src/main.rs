@@ -103,14 +103,32 @@ fn main() {
     let runtime_c   = runtime_c_path();
     let runtime_obj  = "/tmp/ionic_model_runtime.o";
 
-    // Backend detection
-    let ort_inc  = ort_include_path();
-    let ort_lib  = ort_lib_path();
+    // Backend detection. Only link a backend the program actually references:
+    // linking unconditionally would make every Ionic binary (including
+    // hello-world) depend on mlx/llama/onnx and pay their init cost at startup.
+    // Mirrors the same usage gate in src/main.ionic.
+    let src = fs::read_to_string(&source_path).unwrap_or_default();
+    let uses_mlx   = src.contains("mlx_");
+    let uses_llama = src.contains("gguf_") || src.contains("load_model");
+    let uses_ort   = src.contains("piper_forward")
+                     || src.contains("model_forward")
+                     || src.contains("load_model");
+
+    let ort_inc  = if uses_ort { ort_include_path() } else { None };
+    let ort_lib  = if uses_ort { ort_lib_path() } else { None };
     let has_ort  = ort_inc.is_some() && ort_lib.is_some();
 
-    let llama_inc = llama_include_path();
-    let llama_lib = llama_lib_path();
+    let llama_inc = if uses_llama { llama_include_path() } else { None };
+    let llama_lib = if uses_llama { llama_lib_path() } else { None };
     let has_llama = llama_inc.is_some() && llama_lib.is_some();
+
+    // MLX is Apple-silicon only. IONIC_NO_MLX=1 forces it off for a
+    // half-installed mlx-c that would otherwise fail the link.
+    let mlx_allowed = cfg!(target_os = "macos")
+        && std::env::var("IONIC_NO_MLX").map(|v| v != "1").unwrap_or(true);
+    let mlx_inc = if uses_mlx && mlx_allowed { mlx_include_path() } else { None };
+    let mlx_lib = if uses_mlx && mlx_allowed { mlx_lib_path() } else { None };
+    let has_mlx = mlx_inc.is_some() && mlx_lib.is_some();
 
     let has_runtime = if let Some(ref rc) = runtime_c {
         let mut compile_args: Vec<String> = vec![
@@ -125,6 +143,12 @@ fn main() {
         if has_llama {
             compile_args.push(format!("-DIONIC_HAVE_LLAMA"));
             if let Some(ref inc) = llama_inc {
+                compile_args.push(format!("-I{}", inc));
+            }
+        }
+        if has_mlx {
+            compile_args.push(format!("-DIONIC_HAVE_MLX"));
+            if let Some(ref inc) = mlx_inc {
                 compile_args.push(format!("-I{}", inc));
             }
         }
@@ -155,6 +179,14 @@ fn main() {
             clang_args.push(format!("-L{}", lib));
             clang_args.push("-lllama".to_string());
             clang_args.push(format!("-Wl,-rpath,{}", lib));
+        }
+    }
+    if has_mlx {
+        if let Some(ref lib) = mlx_lib {
+            // libmlxc records its own dependencies by absolute path, so no
+            // rpath entry is needed here.
+            clang_args.push(format!("-L{}", lib));
+            clang_args.push("-lmlxc".to_string());
         }
     }
 
@@ -293,6 +325,35 @@ fn llama_lib_path() -> Option<String> {
         if Path::new(c).join("libllama.dylib").exists()
             || Path::new(c).join("libllama.so").exists()
         {
+            return Some(c.to_string());
+        }
+    }
+    None
+}
+
+/// Return the MLX (C API) include directory if found. `#include "mlx/c/mlx.h"`
+/// resolves from the prefix root, not from a `mlx/` subdirectory.
+fn mlx_include_path() -> Option<String> {
+    let candidates = [
+        "/opt/homebrew/include",
+        "/usr/local/include",
+    ];
+    for c in &candidates {
+        if Path::new(c).join("mlx/c/mlx.h").exists() {
+            return Some(c.to_string());
+        }
+    }
+    None
+}
+
+/// Return the MLX (C API) library directory if found.
+fn mlx_lib_path() -> Option<String> {
+    let candidates = [
+        "/opt/homebrew/lib",
+        "/usr/local/lib",
+    ];
+    for c in &candidates {
+        if Path::new(c).join("libmlxc.dylib").exists() {
             return Some(c.to_string());
         }
     }

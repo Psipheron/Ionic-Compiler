@@ -240,6 +240,129 @@ terminal UI framework on these.
 | `piper_forward(model m, int64[] phonemes, float64 ns, float64 ls, float64 nw) -> float64[]` | Piper TTS inference |
 | `write_wav(string path, float64[] samples, int64 n, int64 rate)` | Write PCM WAV file |
 
+### MLX tensor backend
+
+Apple-silicon GPU array runtime. Handles are typed `tensor@cpu` — they are
+host-side handles to a lazily-built device graph, so `.toGpu()` is a no-op
+transfer and is only needed to enter a `gpu { }` context. Unlike `load_model`,
+**handles are not RAII-freed**: call `mlx_free()` explicitly.
+
+Backend selection is automatic and per-program: the compiler links `mlx-c` only
+when the source mentions `mlx_*`. On Intel Macs and Linux every function below
+still exists, so a program links — it reports "MLX backend not compiled in" at
+runtime. GGUF/llama.cpp remains the portable path.
+
+The native ARM64 codegen passes `float64` as an IEEE-754 bit pattern in a
+general-purpose register, not in `D0`-`D7`. Every `ionic_mlx_*` entry point is
+therefore declared with `int64_t` in place of `double` for float parameters and
+converts with `i642d()`/`d2i64()`. This is invisible from Ionic — you still pass
+and receive ordinary `float64` values — but it matters if you ever add a new
+entry point: a `double` parameter would read the wrong register bank and receive
+garbage.
+
+Construction (shapes are `[int64]`; dtype is `0`=f32, `1`=f16, `2`=bf16,
+`3`=f64, `4`=i32, `5`=i64, `6`=bool, `7`=u8). Note that **MLX's GPU does not
+support `f64`** — a `3` dtype fails with "float64 is not supported on the GPU"
+and yields a NULL handle. Use `0` (f32) for GPU math; `f64` only works if the
+tensor is never evaluated on Metal.
+
+| Function | Description |
+|----------|-------------|
+| `mlx_zeros(int64[] shape, int64 dtype) -> tensor` | Zero tensor |
+| `mlx_ones(int64[] shape, int64 dtype) -> tensor` | Ones tensor |
+| `mlx_full(int64[] shape, float64 val, int64 dtype) -> tensor` | Filled tensor |
+| `mlx_arange(float64 start, float64 stop, float64 step, int64 dtype) -> tensor` | Range vector |
+| `mlx_eye(int64 n, int64 m, int64 dtype) -> tensor` | Identity matrix |
+| `mlx_random_normal(int64[] shape, float64 loc, float64 scale, int64 dtype) -> tensor` | Normal init |
+| `mlx_random_uniform(int64[] shape, float64 lo, float64 hi, int64 dtype) -> tensor` | Uniform init |
+| `mlx_from_array(float64[] flat, int64[] shape, int64 dtype) -> tensor` | Tensor from an Ionic array |
+
+Lifetime and inspection:
+
+| Function | Description |
+|----------|-------------|
+| `mlx_eval(tensor t) -> int64` | Force the lazy graph to run (0 ok, -1 error) |
+| `mlx_free(tensor t)` | Release the handle |
+| `mlx_to_array(tensor t) -> float64[]` | Copy out as a flat row-major array (evaluates) |
+| `mlx_item(tensor t) -> float64` | Scalar value of a 1-element tensor (any dtype, converted) |
+| `mlx_ndim(tensor t) -> int64` | Rank |
+| `mlx_size(tensor t) -> int64` | Element count |
+| `mlx_dim(tensor t, int64 i) -> int64` | Size of dimension `i` |
+| `mlx_shape(tensor t) -> int64[]` | Shape as an `[int64]` (feeds back into `reshape`) |
+| `mlx_dtype(tensor t) -> int64` | Element dtype code |
+
+Elementwise and linear algebra:
+
+| Function | Description |
+|----------|-------------|
+| `mlx_add` / `mlx_subtract` / `mlx_multiply` / `mlx_divide` | `(tensor, tensor) -> tensor` |
+| `mlx_power` / `mlx_maximum` / `mlx_minimum` | `(tensor, tensor) -> tensor` |
+| `mlx_matmul(tensor a, tensor b) -> tensor` | Matrix multiply |
+| `mlx_negative` / `mlx_square` / `mlx_sqrt` / `mlx_exp` / `mlx_log` | `(tensor) -> tensor` |
+| `mlx_abs` / `mlx_tanh` / `mlx_erf` | `(tensor) -> tensor` |
+| `mlx_contiguous(tensor t) -> tensor` | Materialised contiguous copy |
+| `mlx_concatenate(tensor a, tensor b, int64 axis) -> tensor` | Join along an axis |
+
+Reductions (the `keepdims` argument is `0` or `1`):
+
+| Function | Description |
+|----------|-------------|
+| `mlx_sum` / `mlx_mean` / `mlx_max` / `mlx_min` `(tensor, int64 keepdims)` | Reduce everything |
+| `mlx_sum_axis` / `mlx_mean_axis` / `mlx_argmax` `(tensor, int64 axis, int64 keepdims)` | Reduce one axis (negative = from end) |
+| `mlx_softmax(tensor t, int64 axis) -> tensor` | Softmax |
+| `mlx_log_softmax(tensor t, int64 axis) -> tensor` | `log(softmax(t))` |
+
+Shape manipulation:
+
+| Function | Description |
+|----------|-------------|
+| `mlx_reshape(tensor t, int64[] shape) -> tensor` | Reshape |
+| `mlx_transpose(tensor t, int64[] axes) -> tensor` | Permute dims (`[]` = reverse) |
+| `mlx_astype(tensor t, int64 dtype) -> tensor` | Cast element type |
+| `mlx_slice(tensor t, int64 start, int64 stop, int64 axis) -> tensor` | Half-open slice |
+| `mlx_take(tensor t, int64[] indices, int64 axis) -> tensor` | Gather by index |
+
+NN primitives (fused Metal kernels — building blocks, not a layer stack):
+
+| Function | Description |
+|----------|-------------|
+| `mlx_sdpa(tensor q, tensor k, tensor v, float64 scale, int64 causal) -> tensor` | Scaled dot-product attention |
+| `mlx_rms_norm(tensor x, tensor weight, float64 eps) -> tensor` | RMSNorm |
+| `mlx_layer_norm(tensor x, tensor weight, tensor bias, float64 eps) -> tensor` | LayerNorm |
+| `mlx_rope(tensor x, int64 dims, float64 base, int64 traditional, int64 offset) -> tensor` | Rotary embedding |
+
+Diagnostics and memory:
+
+| Function | Description |
+|----------|-------------|
+| `mlx_available() -> int64` | 1 if the backend is compiled in |
+| `mlx_metal_available() -> int64` | 1 if a Metal device is present |
+| `mlx_last_error() -> string` | Message from the last failed op |
+| `mlx_clear_error()` | Reset the stored error |
+| `mlx_active_memory() -> int64` / `mlx_peak_memory() -> int64` | Live / high-water bytes |
+| `mlx_reset_peak_memory()` / `mlx_clear_cache()` | Reset stats / release cached buffers |
+| `mlx_set_memory_limit(int64 bytes) -> int64` | Cap MLX allocation (0 = no limit) |
+
+Safetensors weights (handles are plain `int64`, not tensors):
+
+| Function | Description |
+|----------|-------------|
+| `mlx_load_safetensors(string path) -> int64` | Load a `.safetensors` file |
+| `mlx_weights_count(int64 w) -> int64` | Number of tensors |
+| `mlx_weights_at(int64 w, int64 i) -> tensor` | Tensor by index (iteration order is MLX's) |
+| `mlx_weights_key_at(int64 w, int64 i) -> string` | Key by index |
+| `mlx_weights_get(int64 w, string name) -> tensor` | Tensor by name |
+| `mlx_save_safetensors(tensor t, string path, string key) -> int64` | Save one tensor |
+| `mlx_weights_free(int64 w)` | Release the weight handle |
+
+> **No training algorithms.** There is no optimizer, loss function, or backward
+> pass in this API — deliberately. What ships is the set of primitives a
+> training loop is assembled *from*, so the algorithm belongs in `.ionic`
+> source rather than baked into the runtime. Gradient computation would need
+> MLX's C closures (`mlx_value_and_grad`), which require first-class function
+> values; Ionic has none yet, so autodiff is a language-surface change rather
+> than a backend gap.
+
 ---
 
 ## CLI flags

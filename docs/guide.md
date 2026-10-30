@@ -306,6 +306,87 @@ fn main() -> int64 {
 
 ONNX models run via ONNX Runtime with CoreML execution provider on Apple Silicon.
 
+### MLX (Apple-silicon tensor runtime)
+
+For model math you write yourself — rather than a model file you load — use the
+MLX backend. It gives you n-dimensional arrays on the GPU with lazy evaluation:
+
+```ionic
+fn main() -> int64 {
+    if (mlx_available() == 0) {
+        println("MLX backend not compiled in on this platform");
+        return 1;
+    }
+
+    // A = [[1,2],[3,4]]
+    let a = mlx_from_array([1.0, 2.0, 3.0, 4.0], [2, 2], 0);
+
+    let c  = mlx_matmul(a, a);           // [[7,10],[15,22]]
+    let v  = mlx_to_array(c);            // evaluates and copies out
+    println(float64_to_str(v[0]));       // 7
+
+    let sm = mlx_softmax(a, -1);         // softmax over the last axis
+    println(float64_to_str(mlx_item(mlx_sum(sm, 0))));   // ~2 (rows sum to 1)
+
+    mlx_free(sm); mlx_free(c); mlx_free(a);
+    return 0;
+}
+```
+
+Key points:
+
+- **Handles are `tensor@cpu`**, not `tensor@gpu`. They are host-side handles to a
+  device graph, so they are usable anywhere; `.toGpu()` is a no-op transfer that
+  only exists to enter a `gpu { }` context.
+- **Nothing computes until you ask.** Ops build a lazy graph; `mlx_eval` runs it,
+  and `mlx_to_array` / `mlx_item` evaluate implicitly. Chain many ops and
+  evaluate once.
+- **No RAII.** Unlike `load_model`, handles are not freed at scope exit — call
+  `mlx_free()` (and `mlx_weights_free()` for a safetensors handle).
+- **Errors return NULL, they don't unwind.** A failed op yields a NULL handle and
+  stores a message readable via `mlx_last_error()`. Check for NULL before use.
+- **Use `f32` (dtype `0`) for GPU math.** MLX's Metal backend rejects `f64`
+  ("float64 is not supported on the GPU") and returns NULL.
+
+Loading pretrained weights:
+
+```ionic
+let w = mlx_load_safetensors("/path/to/model.safetensors");
+println(str_concat("tensors: ", int64_to_str(mlx_weights_count(w))));
+
+let embed = mlx_weights_get(w, "model.embed_tokens.weight");
+println(str_concat("embed shape: ", int64_to_str(mlx_dim(embed, 0))));
+
+mlx_free(embed);
+mlx_weights_free(w);
+```
+
+The fused kernels a transformer needs are exposed as primitives —
+`mlx_rms_norm`, `mlx_layer_norm`, `mlx_sdpa` (attention), `mlx_rope`. There is
+**no layer stack and no training loop** in the API: those are meant to be
+written in Ionic using these building blocks.
+
+### Which backend gets linked
+
+Backends are linked per-program, only when the source references them — a plain
+`ionic hello.ionic` links none of them:
+
+- `mlx_*` → `mlx-c` (Apple silicon only)
+- `gguf_*` / `load_model` → llama.cpp
+- `piper_forward` / `model_forward` / `load_model` → ONNX Runtime
+
+On a platform without the library, the program still **compiles and links**: the
+runtime exports every symbol and reports "not compiled in" at runtime. That
+keeps one source tree portable — MLX on Apple silicon, GGUF/llama.cpp elsewhere.
+
+Overrides:
+
+```sh
+IONIC_NO_MLX=1 ionic model.ionic -o model          # force MLX off
+IONIC_MLX_INCLUDE=/opt/mlx/include \
+IONIC_MLX_LIB=/opt/mlx/lib ionic model.ionic -o model   # non-Homebrew prefix
+```
+
 ---
 
 ## 12. File I/O

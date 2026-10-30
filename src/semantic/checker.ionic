@@ -709,6 +709,94 @@ fn register_builtins() -> int64 {
     register_builtin("gguf_set_top_p",    2, TY_VOID,    "");
     register_builtin("piper_forward",     5, TY_ARRAY,   "");
     register_builtin("write_wav",         4, TY_VOID,    "");
+
+    // ── MLX tensor backend ──────────────────────────────────────────────────
+    // Handles are typed `tensor@cpu` deliberately: they are host-side handles
+    // to a lazily-built device graph, and `tensor@gpu` would make them
+    // unusable outside a `gpu { }` block (the checker forbids that). Use
+    // `.toGpu()` when you want to enter a GPU context; it is a no-op transfer.
+    //
+    // Note: no RAII here. Unlike `load_model`, an mlx handle is not
+    // auto-freed at scope exit — call mlx_free() explicitly.
+    // Construction
+    register_builtin("mlx_zeros",         2, TY_TENSOR_CPU, "");
+    register_builtin("mlx_ones",          2, TY_TENSOR_CPU, "");
+    register_builtin("mlx_full",          3, TY_TENSOR_CPU, "");
+    register_builtin("mlx_arange",        4, TY_TENSOR_CPU, "");
+    register_builtin("mlx_eye",           3, TY_TENSOR_CPU, "");
+    register_builtin("mlx_random_normal", 4, TY_TENSOR_CPU, "");
+    register_builtin("mlx_random_uniform",4, TY_TENSOR_CPU, "");
+    register_builtin("mlx_from_array",    3, TY_TENSOR_CPU, "");
+    // Lifetime / materialisation
+    register_builtin("mlx_free",          1, TY_VOID,    "");
+    register_builtin("mlx_eval",          1, TY_INT64,   "");
+    register_builtin("mlx_to_array",      1, TY_ARRAY,   "");
+    register_builtin("mlx_item",          1, TY_FLOAT64, "");
+    // Inspection
+    register_builtin("mlx_ndim",          1, TY_INT64,   "");
+    register_builtin("mlx_size",          1, TY_INT64,   "");
+    register_builtin("mlx_dim",           2, TY_INT64,   "");
+    register_builtin("mlx_shape",         1, TY_ARRAY,   "");
+    register_builtin("mlx_dtype",         1, TY_INT64,   "");
+    // Elementwise binary
+    register_builtin("mlx_add",           2, TY_TENSOR_CPU, "");
+    register_builtin("mlx_subtract",      2, TY_TENSOR_CPU, "");
+    register_builtin("mlx_multiply",      2, TY_TENSOR_CPU, "");
+    register_builtin("mlx_divide",        2, TY_TENSOR_CPU, "");
+    register_builtin("mlx_power",         2, TY_TENSOR_CPU, "");
+    register_builtin("mlx_maximum",       2, TY_TENSOR_CPU, "");
+    register_builtin("mlx_minimum",       2, TY_TENSOR_CPU, "");
+    register_builtin("mlx_matmul",        2, TY_TENSOR_CPU, "");
+    // Elementwise unary
+    register_builtin("mlx_negative",      1, TY_TENSOR_CPU, "");
+    register_builtin("mlx_square",        1, TY_TENSOR_CPU, "");
+    register_builtin("mlx_sqrt",          1, TY_TENSOR_CPU, "");
+    register_builtin("mlx_exp",           1, TY_TENSOR_CPU, "");
+    register_builtin("mlx_log",           1, TY_TENSOR_CPU, "");
+    register_builtin("mlx_abs",           1, TY_TENSOR_CPU, "");
+    register_builtin("mlx_tanh",          1, TY_TENSOR_CPU, "");
+    register_builtin("mlx_erf",           1, TY_TENSOR_CPU, "");
+    register_builtin("mlx_contiguous",    1, TY_TENSOR_CPU, "");
+    // Reductions
+    register_builtin("mlx_sum",           2, TY_TENSOR_CPU, "");
+    register_builtin("mlx_mean",          2, TY_TENSOR_CPU, "");
+    register_builtin("mlx_max",           2, TY_TENSOR_CPU, "");
+    register_builtin("mlx_min",           2, TY_TENSOR_CPU, "");
+    register_builtin("mlx_sum_axis",      3, TY_TENSOR_CPU, "");
+    register_builtin("mlx_mean_axis",     3, TY_TENSOR_CPU, "");
+    register_builtin("mlx_argmax",        3, TY_TENSOR_CPU, "");
+    register_builtin("mlx_softmax",       2, TY_TENSOR_CPU, "");
+    register_builtin("mlx_log_softmax",   2, TY_TENSOR_CPU, "");
+    // Shape
+    register_builtin("mlx_reshape",       2, TY_TENSOR_CPU, "");
+    register_builtin("mlx_transpose",     2, TY_TENSOR_CPU, "");
+    register_builtin("mlx_astype",        2, TY_TENSOR_CPU, "");
+    register_builtin("mlx_slice",         4, TY_TENSOR_CPU, "");
+    register_builtin("mlx_take",          3, TY_TENSOR_CPU, "");
+    register_builtin("mlx_concatenate",   3, TY_TENSOR_CPU, "");
+    // NN primitives
+    register_builtin("mlx_sdpa",          5, TY_TENSOR_CPU, "");
+    register_builtin("mlx_rms_norm",      3, TY_TENSOR_CPU, "");
+    register_builtin("mlx_layer_norm",    4, TY_TENSOR_CPU, "");
+    register_builtin("mlx_rope",          5, TY_TENSOR_CPU, "");
+    // Diagnostics / memory
+    register_builtin("mlx_available",       0, TY_INT64, "");
+    register_builtin("mlx_metal_available", 0, TY_INT64, "");
+    register_builtin("mlx_last_error",      0, TY_STR,   "");
+    register_builtin("mlx_clear_error",     0, TY_INT64, "");
+    register_builtin("mlx_active_memory",   0, TY_INT64, "");
+    register_builtin("mlx_peak_memory",     0, TY_INT64, "");
+    register_builtin("mlx_reset_peak_memory",0, TY_INT64,"");
+    register_builtin("mlx_clear_cache",     0, TY_INT64, "");
+    register_builtin("mlx_set_memory_limit",1, TY_INT64, "");
+    // Safetensors
+    register_builtin("mlx_load_safetensors", 1, TY_INT64, "");
+    register_builtin("mlx_weights_free",     1, TY_VOID,  "");
+    register_builtin("mlx_weights_count",    1, TY_INT64, "");
+    register_builtin("mlx_weights_at",       2, TY_TENSOR_CPU, "");
+    register_builtin("mlx_weights_key_at",   2, TY_STR,   "");
+    register_builtin("mlx_weights_get",      2, TY_TENSOR_CPU, "");
+    register_builtin("mlx_save_safetensors", 3, TY_INT64, "");
     return 0;
 }
 

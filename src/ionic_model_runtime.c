@@ -49,6 +49,25 @@
 #  include "llama.h"
 #endif
 
+/* ── MLX (Apple-silicon array/tensor runtime) ───────────────────────────────
+ * MLX is an *array* runtime, not a model loader: it gives us n-dim arrays,
+ * lazy graph construction, Metal eval, safetensors I/O and (via C closures)
+ * autodiff primitives. There is deliberately NO training algorithm here —
+ * this is the backend brick, not SGD/Adam. See the "MLX backend" section
+ * below for the public ionic_mlx_* surface.
+ *
+ * Only available on macOS/arm64 (Metal). The GGUF/llama.cpp path stays the
+ * portable fallback: on Linux, MLX is compiled out entirely and every
+ * ionic_mlx_* entry point reports "not compiled in" rather than failing to
+ * link.
+ * ------------------------------------------------------------------------- */
+#if defined(IONIC_HAVE_MLX) && defined(__APPLE__)
+#  include "mlx/c/mlx.h"
+#  define IONIC_MLX_ACTIVE 1
+#else
+#  define IONIC_MLX_ACTIVE 0
+#endif
+
 /* ── Ionic dynamic-array layout ──────────────────────────────────────────────
  *   struct IonicArray { i64 len; i64 cap; void *data; }
  *   data is an array of i64 slots (8 bytes each)
@@ -494,20 +513,25 @@ typedef enum {
     MODEL_FMT_PT,
     MODEL_FMT_H5,
     MODEL_FMT_MLMODEL,
+    MODEL_FMT_SAFETENSORS,
 } ModelFormat;
 
 static ModelFormat detect_format(const char *path) {
     /* Extension check first */
     const char *dot = strrchr(path, '.');
     if (dot) {
-        if (strcmp(dot, ".onnx")    == 0) return MODEL_FMT_ONNX;
-        if (strcmp(dot, ".gguf")    == 0) return MODEL_FMT_GGUF;
-        if (strcmp(dot, ".pt")      == 0) return MODEL_FMT_PT;
-        if (strcmp(dot, ".pth")     == 0) return MODEL_FMT_PT;
-        if (strcmp(dot, ".h5")      == 0) return MODEL_FMT_H5;
-        if (strcmp(dot, ".mlmodel") == 0) return MODEL_FMT_MLMODEL;
+        if (strcmp(dot, ".onnx")        == 0) return MODEL_FMT_ONNX;
+        if (strcmp(dot, ".gguf")        == 0) return MODEL_FMT_GGUF;
+        if (strcmp(dot, ".pt")          == 0) return MODEL_FMT_PT;
+        if (strcmp(dot, ".pth")         == 0) return MODEL_FMT_PT;
+        if (strcmp(dot, ".h5")          == 0) return MODEL_FMT_H5;
+        if (strcmp(dot, ".mlmodel")     == 0) return MODEL_FMT_MLMODEL;
+        if (strcmp(dot, ".safetensors") == 0) return MODEL_FMT_SAFETENSORS;
     }
-    /* Magic-byte fallback for extension-less files (e.g. Ollama blobs) */
+    /* Magic-byte fallback for extension-less files (e.g. Ollama blobs).
+     * Note: safetensors has no magic — its first 8 bytes are the little-endian
+     * length of a JSON header, so it cannot be identified here. Give it an
+     * explicit extension, or load it with mlx_safetensors_open(). */
     FILE *f = fopen(path, "rb");
     if (!f) return MODEL_FMT_UNKNOWN;
     unsigned char magic[8] = {0};
@@ -718,6 +742,1166 @@ static const char *gguf_generate(void *model, const char *prompt, int64_t max_to
 }
 
 #endif /* IONIC_HAVE_LLAMA */
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * MLX tensor backend
+ *
+ * This is the *brick*: a stable, thin, over-complete surface over Apple's MLX
+ * array runtime so an Ionic program can build and run model math on the GPU.
+ * It deliberately contains NO training algorithm — no SGD, no Adam, no loss
+ * functions, no backward pass. What it does contain is every primitive such a
+ * loop is assembled from, so the algorithm can live in ordinary `.ionic`
+ * source instead of being baked into the runtime.
+ *
+ * Design contract
+ * ---------------
+ *  - A tensor is an opaque `MlxTensor*` handle, never a raw `mlx_array`. The
+ *    handle owns exactly one array; `mlx_array` is refcounted, so copies made
+ *    with `mlx_array_set` are cheap and safe.
+ *  - Every op returns a *new* handle. Ops never mutate their inputs, so an
+ *    expression graph is built by chaining. This matches MLX's functional
+ *    model: `c = mlx_matmul(a, b)` leaves `a` and `b` valid and unchanged.
+ *  - MLX is lazy. Nothing is computed until `mlx_eval` (or an op that must
+ *    materialise, like `mlx_to_array`). Chaining 50 ops and evaluating once
+ *    is the fast path; calling `mlx_eval` after every op is correct but slow.
+ *  - Errors do NOT unwind. MLX reports via a callback and returns non-zero,
+ *    leaving the output array *empty*; touching an empty array segfaults. So
+ *    every entry point below funnels through `mlx_ck()`, which turns a failed
+ *    call into a NULL handle (or a 0/NaN return) and never yields a
+ *    half-built tensor that would crash later.
+ *
+ * Availability
+ * ------------
+ * Compiled only when IONIC_HAVE_MLX is defined AND we're on Apple (Metal).
+ * On Linux every entry point is present but returns the "unavailable" value,
+ * so an Ionic program that mentions mlx_* still *links* — it just reports at
+ * runtime that the backend isn't compiled in, exactly like the llama.cpp
+ * path does today. GGUF/llama.cpp remains the portable fallback.
+ * ════════════════════════════════════════════════════════════════════════════ */
+
+#if IONIC_MLX_ACTIVE
+
+/* ── dtype mapping: Ionic int <-> mlx_dtype ───────────────────────────────────
+ * Exposed to Ionic as small integers so dtype can be an int64 argument.
+ * The numbers are our own (stable) ABI; mapping to the real enum happens here.
+ * Do NOT pass mlx_dtype ordinals across the boundary — the enum ordering is
+ * an MLX implementation detail and has already changed between releases. */
+typedef enum {
+    IONIC_DT_F32 = 0,
+    IONIC_DT_F16 = 1,
+    IONIC_DT_BF16 = 2,
+    IONIC_DT_F64 = 3,
+    IONIC_DT_I32 = 4,
+    IONIC_DT_I64 = 5,
+    IONIC_DT_BOOL = 6,
+    IONIC_DT_U8 = 7,
+} IonicDtype;
+
+static mlx_dtype ionic_dtype_to_mlx(int64_t d) {
+    switch (d) {
+        case IONIC_DT_F16:  return MLX_FLOAT16;
+        case IONIC_DT_BF16: return MLX_BFLOAT16;
+        case IONIC_DT_F64:  return MLX_FLOAT64;
+        case IONIC_DT_I32:  return MLX_INT32;
+        case IONIC_DT_I64:  return MLX_INT64;
+        case IONIC_DT_BOOL: return MLX_BOOL;
+        case IONIC_DT_U8:   return MLX_UINT8;
+        case IONIC_DT_F32:
+        default:            return MLX_FLOAT32;
+    }
+}
+
+static int64_t mlx_dtype_to_ionic(mlx_dtype d) {
+    switch (d) {
+        case MLX_FLOAT16:   return IONIC_DT_F16;
+        case MLX_BFLOAT16:  return IONIC_DT_BF16;
+        case MLX_FLOAT64:   return IONIC_DT_F64;
+        case MLX_INT32:     return IONIC_DT_I32;
+        case MLX_INT64:     return IONIC_DT_I64;
+        case MLX_BOOL:      return IONIC_DT_BOOL;
+        case MLX_UINT8:     return IONIC_DT_U8;
+        case MLX_FLOAT32:
+        default:            return IONIC_DT_F32;
+    }
+}
+
+/* ── Error plumbing ─────────────────────────────────────────────────────────
+ * MLX's default handler aborts the process. We install our own once, record
+ * the last message, and let the calling entry point decide what to return.
+ * `g_mlx_err` is sticky-until-read so a failure is diagnosable from Ionic via
+ * mlx_last_error(). */
+static char  g_mlx_err[512] = {0};
+static int   g_mlx_inited = 0;
+static mlx_stream g_mlx_gpu_stream;   /* default GPU stream; created at init */
+
+static void ionic_mlx_error_handler(const char *msg, void *data) {
+    (void)data;
+    snprintf(g_mlx_err, sizeof(g_mlx_err), "%s", msg ? msg : "(unknown MLX error)");
+    /* Trim MLX's build-path suffix so messages read cleanly in Ionic output. */
+    char *at = strstr(g_mlx_err, " at /private/tmp/");
+    if (at) *at = '\0';
+    fprintf(stderr, "[ionic/mlx] %s\n", g_mlx_err);
+}
+
+static void ionic_mlx_init(void) {
+    if (g_mlx_inited) return;
+    mlx_set_error_handler(ionic_mlx_error_handler, NULL, NULL);
+    g_mlx_gpu_stream = mlx_default_gpu_stream_new();
+    g_mlx_inited = 1;
+}
+
+/* Run an MLX call, normalising failure. Returns 0 on success, -1 on error.
+ * On error the caller must NOT use `*out` — MLX leaves it empty/dirty. */
+#define mlx_ck(expr) ( (expr) == 0 ? 0 : -1 )
+
+/* ── Tensor handle ──────────────────────────────────────────────────────────
+ * The first field is NOT ModelFormat: tensors are not models, and keeping the
+ * layouts distinct means a tensor can never be passed to model_free() by
+ * accident (handle_fmt would read garbage). Tensors use their own magic. */
+#define IONIC_MLX_MAGIC 0x4D4C5854  /* "MLXT" */
+
+typedef struct {
+    uint32_t   magic;
+    uint32_t   alive;
+    mlx_array  a;
+} MlxTensor;
+
+static MlxTensor *mlx_tensor_new(mlx_array a) {
+    MlxTensor *t = (MlxTensor *)calloc(1, sizeof(MlxTensor));
+    t->magic = IONIC_MLX_MAGIC;
+    t->alive = 1;
+    t->a     = a;
+    return t;
+}
+
+/* Validate a handle coming from Ionic. A dangling/NULL/mistyped pointer is a
+ * hard programmer error, so we report and return NULL rather than crash. */
+static MlxTensor *mlx_tensor_of(void *h) {
+    if (!h) { fprintf(stderr, "[ionic/mlx] null tensor handle\n"); return NULL; }
+    MlxTensor *t = (MlxTensor *)h;
+    if (t->magic != IONIC_MLX_MAGIC) {
+        fprintf(stderr, "[ionic/mlx] bad tensor handle (not an mlx tensor)\n");
+        return NULL;
+    }
+    if (!t->alive) {
+        fprintf(stderr, "[ionic/mlx] use of a freed tensor\n");
+        return NULL;
+    }
+    return t;
+}
+
+/* Unwrap for ops: returns the mlx_array, or bails out of the enclosing
+ * function with NULL. Every op below is a `void *`-returning entry point, so
+ * this is safe to use uniformly. */
+#define MLX_ARG(h) \
+    MlxTensor *_t = mlx_tensor_of(h); \
+    if (!_t) return NULL; \
+    mlx_array _a = _t->a; \
+    (void)_a
+
+/* ── Shape helper ───────────────────────────────────────────────────────────
+ * Ionic passes shapes as an `[int64]` array. MLX wants `const int*`. Convert
+ * into a caller-provided stack buffer (capped so a malformed input can't
+ * overflow). Returns the number of dims, or -1 on error. */
+#define IONIC_MLX_MAX_DIMS 8
+
+static int mlx_shape_from_arr(void *shape_arr, int *out, size_t *n_out) {
+    if (!shape_arr) { *n_out = 0; return 0; }
+    IonicArray *sa = (IonicArray *)shape_arr;
+    if (sa->len > IONIC_MLX_MAX_DIMS) {
+        fprintf(stderr, "[ionic/mlx] shape has %lld dims, max is %d\n",
+                (long long)sa->len, IONIC_MLX_MAX_DIMS);
+        return -1;
+    }
+    int64_t *slots = (int64_t *)sa->data;
+    for (int64_t i = 0; i < sa->len; i++) out[i] = (int)slots[i];
+    *n_out = (size_t)sa->len;
+    return 0;
+}
+
+/* ── Construction ─────────────────────────────────────────────────────────── */
+
+void *ionic_mlx_zeros(void *shape_arr, int64_t dtype) {
+    ionic_mlx_init();
+    int shape[IONIC_MLX_MAX_DIMS]; size_t n = 0;
+    if (mlx_shape_from_arr(shape_arr, shape, &n) != 0) return NULL;
+    mlx_array r = mlx_array_new();
+    if (mlx_ck(mlx_zeros(&r, shape, n, ionic_dtype_to_mlx(dtype), g_mlx_gpu_stream)) != 0) return NULL;
+    return mlx_tensor_new(r);
+}
+
+void *ionic_mlx_ones(void *shape_arr, int64_t dtype) {
+    ionic_mlx_init();
+    int shape[IONIC_MLX_MAX_DIMS]; size_t n = 0;
+    if (mlx_shape_from_arr(shape_arr, shape, &n) != 0) return NULL;
+    mlx_array r = mlx_array_new();
+    if (mlx_ck(mlx_ones(&r, shape, n, ionic_dtype_to_mlx(dtype), g_mlx_gpu_stream)) != 0) return NULL;
+    return mlx_tensor_new(r);
+}
+
+/* Float arguments arrive as int64 IEEE-754 bit patterns in GP registers, not in
+ * D0-D7: the native codegen has no float register ABI and every other float
+ * builtin in this runtime uses the same convention (see d2i64/i642d above).
+ * Declaring these parameters `double` would read the wrong register bank — the
+ * compiler would pass 4.0 in X1 while the callee looked in D1. */
+void *ionic_mlx_full(void *shape_arr, int64_t val_bits, int64_t dtype) {
+    ionic_mlx_init();
+    int shape[IONIC_MLX_MAX_DIMS]; size_t n = 0;
+    if (mlx_shape_from_arr(shape_arr, shape, &n) != 0) return NULL;
+    mlx_array s = mlx_array_new_float32((float)i642d(val_bits));
+    mlx_array r = mlx_array_new();
+    int rc = mlx_ck(mlx_full(&r, shape, n, s, ionic_dtype_to_mlx(dtype), g_mlx_gpu_stream));
+    mlx_array_free(s);
+    if (rc != 0) return NULL;
+    return mlx_tensor_new(r);
+}
+
+void *ionic_mlx_arange(int64_t start_b, int64_t stop_b, int64_t step_b, int64_t dtype) {
+    ionic_mlx_init();
+    mlx_array r = mlx_array_new();
+    if (mlx_ck(mlx_arange(&r, i642d(start_b), i642d(stop_b), i642d(step_b),
+                          ionic_dtype_to_mlx(dtype), g_mlx_gpu_stream)) != 0) return NULL;
+    return mlx_tensor_new(r);
+}
+
+void *ionic_mlx_eye(int64_t n, int64_t m, int64_t dtype) {
+    ionic_mlx_init();
+    mlx_array r = mlx_array_new();
+    if (mlx_ck(mlx_eye(&r, (int)n, (int)m, 0, ionic_dtype_to_mlx(dtype), g_mlx_gpu_stream)) != 0) return NULL;
+    return mlx_tensor_new(r);
+}
+
+/* Random init — what parameter tensors are seeded with. This is a primitive,
+ * not an initialisation policy: no Xavier/He scaling rule is applied here. */
+void *ionic_mlx_random_normal(void *shape_arr, int64_t loc_b, int64_t scale_b, int64_t dtype) {
+    ionic_mlx_init();
+    int shape[IONIC_MLX_MAX_DIMS]; size_t n = 0;
+    if (mlx_shape_from_arr(shape_arr, shape, &n) != 0) return NULL;
+    mlx_array r = mlx_array_new();
+    if (mlx_ck(mlx_random_normal(&r, shape, n, ionic_dtype_to_mlx(dtype),
+                                 (float)i642d(loc_b), (float)i642d(scale_b), mlx_array_empty,
+                                 g_mlx_gpu_stream)) != 0) return NULL;
+    return mlx_tensor_new(r);
+}
+
+void *ionic_mlx_random_uniform(void *shape_arr, int64_t lo_b, int64_t hi_b, int64_t dtype) {
+    ionic_mlx_init();
+    int shape[IONIC_MLX_MAX_DIMS]; size_t n = 0;
+    if (mlx_shape_from_arr(shape_arr, shape, &n) != 0) return NULL;
+    mlx_array low  = mlx_array_new_float32((float)i642d(lo_b));
+    mlx_array high = mlx_array_new_float32((float)i642d(hi_b));
+    mlx_array r    = mlx_array_new();
+    int rc = mlx_ck(mlx_random_uniform(&r, low, high, shape, n,
+                                       ionic_dtype_to_mlx(dtype), mlx_array_empty,
+                                       g_mlx_gpu_stream));
+    mlx_array_free(low);
+    mlx_array_free(high);
+    if (rc != 0) return NULL;
+    return mlx_tensor_new(r);
+}
+
+/* Build a tensor from a flat [float64] Ionic array plus a shape. This is the
+ * bridge from ordinary Ionic data into GPU math. Values are copied, so the
+ * caller may free/mutate the source array afterwards. */
+void *ionic_mlx_from_array(void *flat_arr, void *shape_arr, int64_t dtype) {
+    ionic_mlx_init();
+    if (!flat_arr) { fprintf(stderr, "[ionic/mlx] from_array: null array\n"); return NULL; }
+    int shape[IONIC_MLX_MAX_DIMS]; size_t n = 0;
+    if (mlx_shape_from_arr(shape_arr, shape, &n) != 0) return NULL;
+
+    IonicArray *fa = (IonicArray *)flat_arr;
+    size_t total = 1;
+    for (size_t i = 0; i < n; i++) total *= (size_t)(shape[i] > 0 ? shape[i] : 0);
+    if ((int64_t)total != fa->len) {
+        fprintf(stderr, "[ionic/mlx] from_array: shape implies %zu elements, array has %lld\n",
+                total, (long long)fa->len);
+        return NULL;
+    }
+
+    int64_t *slots = (int64_t *)fa->data;
+    mlx_dtype mdt = ionic_dtype_to_mlx(dtype);
+    int rc;
+
+    /* Fast path: f32/f64 buffer straight in. Ionic stores float64s as their
+     * bit pattern in i64 slots, so f64 needs no conversion at all. */
+    if (mdt == MLX_FLOAT64) {
+        mlx_array r = mlx_array_new_data(slots, shape, (int)n, MLX_FLOAT64);
+        return mlx_tensor_new(r);
+    }
+    if (mdt == MLX_FLOAT32) {
+        float *buf = (float *)malloc(total * sizeof(float));
+        if (!buf) return NULL;
+        for (size_t i = 0; i < total; i++) {
+            double d; memcpy(&d, &slots[i], 8);
+            buf[i] = (float)d;
+        }
+        mlx_array r = mlx_array_new_data(buf, shape, (int)n, MLX_FLOAT32);
+        free(buf);              /* mlx_array_new_data copies the buffer */
+        return mlx_tensor_new(r);
+    }
+    if (mdt == MLX_INT32 || mdt == MLX_INT64) {
+        /* Integers arrive as plain i64 values (not bit patterns). */
+        if (mdt == MLX_INT64) {
+            mlx_array r = mlx_array_new_data(slots, shape, (int)n, MLX_INT64);
+            return mlx_tensor_new(r);
+        }
+        int32_t *buf = (int32_t *)malloc(total * sizeof(int32_t));
+        if (!buf) return NULL;
+        for (size_t i = 0; i < total; i++) buf[i] = (int32_t)slots[i];
+        mlx_array r = mlx_array_new_data(buf, shape, (int)n, MLX_INT32);
+        free(buf);
+        return mlx_tensor_new(r);
+    }
+
+    /* Generic path: build as f64 then cast. */
+    mlx_array base = mlx_array_new_data(slots, shape, (int)n, MLX_FLOAT64);
+    mlx_array r    = mlx_array_new();
+    rc = mlx_ck(mlx_astype(&r, base, mdt, g_mlx_gpu_stream));
+    mlx_array_free(base);
+    if (rc != 0) return NULL;
+    return mlx_tensor_new(r);
+}
+
+/* ── Materialisation and inspection ───────────────────────────────────────── */
+
+/* Force the graph to run. Idempotent; safe on already-evaluated tensors. */
+int64_t ionic_mlx_eval(void *h) {
+    MlxTensor *t = mlx_tensor_of(h);
+    if (!t) return -1;
+    if (mlx_ck(mlx_array_eval(t->a)) != 0) return -1;
+    return 0;
+}
+
+int64_t ionic_mlx_ndim(void *h) {
+    MlxTensor *t = mlx_tensor_of(h);
+    if (!t) return -1;
+    return (int64_t)mlx_array_ndim(t->a);
+}
+
+/* Element count (product of dims), i.e. what a flattened [float64] needs. */
+int64_t ionic_mlx_size(void *h) {
+    MlxTensor *t = mlx_tensor_of(h);
+    if (!t) return -1;
+    return (int64_t)mlx_array_size(t->a);
+}
+
+/* Dimension `i`, or -1 if out of range. */
+int64_t ionic_mlx_dim(void *h, int64_t i) {
+    MlxTensor *t = mlx_tensor_of(h);
+    if (!t) return -1;
+    int nd = (int)mlx_array_ndim(t->a);
+    if (i < 0 || i >= nd) return -1;
+    return (int64_t)mlx_array_shape(t->a)[i];
+}
+
+/* Shape as an [int64] Ionic array, so the same value can be fed back into
+ * reshape/zeros — the shapes compose. */
+void *ionic_mlx_shape(void *h) {
+    MlxTensor *t = mlx_tensor_of(h);
+    if (!t) return ionic_array_alloc(1);
+    int nd = (int)mlx_array_ndim(t->a);
+    const int *sh = mlx_array_shape(t->a);
+    IonicArray *out = ionic_array_alloc(nd > 0 ? nd : 1);
+    for (int i = 0; i < nd; i++) ionic_array_push_i64(out, (int64_t)sh[i]);
+    return out;
+}
+
+int64_t ionic_mlx_dtype(void *h) {
+    MlxTensor *t = mlx_tensor_of(h);
+    if (!t) return -1;
+    return mlx_dtype_to_ionic(mlx_array_dtype(t->a));
+}
+
+/* Copy the tensor out into a flat [float64] Ionic array (row-major).
+ * Evaluates first. Any dtype is converted to float64; use mlx_dtype() if you
+ * need to know what it was. Note the element order is MLX's row-major order. */
+void *ionic_mlx_to_array(void *h) {
+    MlxTensor *t = mlx_tensor_of(h);
+    if (!t) return ionic_array_alloc(1);
+    if (mlx_ck(mlx_array_eval(t->a)) != 0) return ionic_array_alloc(1);
+
+    size_t total = mlx_array_size(t->a);
+    IonicArray *out = ionic_array_alloc((int64_t)(total > 0 ? total : 1));
+    mlx_dtype dt = mlx_array_dtype(t->a);
+
+    /* Read natively where possible, then widen to double bit patterns. */
+    switch (dt) {
+        case MLX_FLOAT32: {
+            const float *p = mlx_array_data_float32(t->a);
+            if (!p) break;
+            for (size_t i = 0; i < total; i++) ionic_array_push_i64(out, d2i64((double)p[i]));
+            return out;
+        }
+        case MLX_FLOAT64: {
+            const double *p = mlx_array_data_float64(t->a);
+            if (!p) break;
+            for (size_t i = 0; i < total; i++) ionic_array_push_i64(out, d2i64(p[i]));
+            return out;
+        }
+        case MLX_INT64: {
+            const int64_t *p = mlx_array_data_int64(t->a);
+            if (!p) break;
+            for (size_t i = 0; i < total; i++) ionic_array_push_i64(out, d2i64((double)p[i]));
+            return out;
+        }
+        case MLX_INT32: {
+            const int32_t *p = mlx_array_data_int32(t->a);
+            if (!p) break;
+            for (size_t i = 0; i < total; i++) ionic_array_push_i64(out, d2i64((double)p[i]));
+            return out;
+        }
+        case MLX_UINT8: {
+            const uint8_t *p = mlx_array_data_uint8(t->a);
+            if (!p) break;
+            for (size_t i = 0; i < total; i++) ionic_array_push_i64(out, d2i64((double)p[i]));
+            return out;
+        }
+        case MLX_BOOL: {
+            const bool *p = mlx_array_data_bool(t->a);
+            if (!p) break;
+            for (size_t i = 0; i < total; i++) ionic_array_push_i64(out, d2i64(p[i] ? 1.0 : 0.0));
+            return out;
+        }
+        default: break;   /* f16/bf16: go through a cast below */
+    }
+
+    /* Fallback: cast to f32 in-graph, then read. */
+    mlx_array c = mlx_array_new();
+    if (mlx_ck(mlx_astype(&c, t->a, MLX_FLOAT32, g_mlx_gpu_stream)) == 0
+        && mlx_ck(mlx_array_eval(c)) == 0) {
+        const float *p = mlx_array_data_float32(c);
+        if (p) {
+            for (size_t i = 0; i < total; i++) ionic_array_push_i64(out, d2i64((double)p[i]));
+        }
+    }
+    mlx_array_free(c);
+    return out;
+}
+
+/* Scalar extraction for size-1 tensors (a "loss value" read-out). Returns the
+ * float64 bit pattern, matching every other float builtin in this runtime.
+ * Returns 0 for non-scalar input; check mlx_size() first if that matters.
+ *
+ * The dtype must be dispatched on: mlx_array_item_float32() reinterprets the
+ * stored bytes rather than converting, so reading an int32 tensor through it
+ * yields the float whose bit pattern happens to match (argmax's 1 becomes
+ * 1.4e-45) instead of 1.0. */
+int64_t ionic_mlx_item(void *h) {
+    MlxTensor *t = mlx_tensor_of(h);
+    if (!t) return 0;
+    if (mlx_array_size(t->a) != 1) {
+        fprintf(stderr, "[ionic/mlx] item: tensor has %zu elements, not 1\n",
+                mlx_array_size(t->a));
+        return 0;
+    }
+    if (mlx_ck(mlx_array_eval(t->a)) != 0) return 0;
+
+    switch (mlx_array_dtype(t->a)) {
+        case MLX_INT64:  { int64_t v = 0; if (mlx_ck(mlx_array_item_int64(&v, t->a))   != 0) return 0; return d2i64((double)v); }
+        case MLX_INT32:  { int32_t v = 0; if (mlx_ck(mlx_array_item_int32(&v, t->a))   != 0) return 0; return d2i64((double)v); }
+        case MLX_INT16:  { int16_t v = 0; if (mlx_ck(mlx_array_item_int16(&v, t->a))   != 0) return 0; return d2i64((double)v); }
+        case MLX_UINT32: { uint32_t v = 0; if (mlx_ck(mlx_array_item_uint32(&v, t->a)) != 0) return 0; return d2i64((double)v); }
+        case MLX_UINT8:  { uint8_t v = 0; if (mlx_ck(mlx_array_item_uint8(&v, t->a))   != 0) return 0; return d2i64((double)v); }
+        case MLX_BOOL:   { bool v = false; if (mlx_ck(mlx_array_item_bool(&v, t->a))   != 0) return 0; return d2i64(v ? 1.0 : 0.0); }
+        case MLX_FLOAT64: { double v = 0.0; if (mlx_ck(mlx_array_item_float64(&v, t->a)) != 0) return 0; return d2i64(v); }
+        case MLX_FLOAT32: default: {
+            float v = 0.0f;
+            if (mlx_ck(mlx_array_item_float32(&v, t->a)) != 0) return 0;
+            return d2i64((double)v);
+        }
+    }
+}
+
+/* ── Lifetime ─────────────────────────────────────────────────────────────── */
+
+/* Free a tensor. Null-tolerant and idempotent-ish: a second free on the same
+ * handle is caught by the `alive` flag rather than double-freeing the array. */
+void ionic_mlx_free(void *h) {
+    MlxTensor *t = mlx_tensor_of(h);
+    if (!t) return;
+    mlx_array_free(t->a);
+    t->alive = 0;
+    free(t);
+}
+
+/* ── Elementwise binary ops ───────────────────────────────────────────────── */
+
+#define MLX_BINOP_IMPL(fname, mlxfn)                                       \
+    void *fname(void *ha, void *hb) {                                      \
+        ionic_mlx_init();                                                  \
+        MLX_ARG(ha);                                                       \
+        MlxTensor *_tb = mlx_tensor_of(hb);                                \
+        if (!_tb) return NULL;                                             \
+        mlx_array _r = mlx_array_new();                                    \
+        if (mlx_ck(mlxfn(&_r, _a, _tb->a,                                  \
+                         g_mlx_gpu_stream)) != 0) return NULL;             \
+        return mlx_tensor_new(_r);                                         \
+    }
+
+MLX_BINOP_IMPL(ionic_mlx_add,      mlx_add)
+MLX_BINOP_IMPL(ionic_mlx_subtract, mlx_subtract)
+MLX_BINOP_IMPL(ionic_mlx_multiply, mlx_multiply)
+MLX_BINOP_IMPL(ionic_mlx_divide,   mlx_divide)
+MLX_BINOP_IMPL(ionic_mlx_power,    mlx_power)
+MLX_BINOP_IMPL(ionic_mlx_maximum,  mlx_maximum)
+MLX_BINOP_IMPL(ionic_mlx_minimum,  mlx_minimum)
+MLX_BINOP_IMPL(ionic_mlx_matmul,   mlx_matmul)
+
+#undef MLX_BINOP_IMPL
+
+/* ── Elementwise unary ops ────────────────────────────────────────────────── */
+
+#define MLX_UNOP_IMPL(fname, mlxfn)                                        \
+    void *fname(void *h) {                                                 \
+        ionic_mlx_init();                                                  \
+        MLX_ARG(h);                                                        \
+        mlx_array _r = mlx_array_new();                                    \
+        if (mlx_ck(mlxfn(&_r, _a, g_mlx_gpu_stream)) != 0) return NULL;     \
+        return mlx_tensor_new(_r);                                         \
+    }
+
+MLX_UNOP_IMPL(ionic_mlx_negative, mlx_negative)
+MLX_UNOP_IMPL(ionic_mlx_square,   mlx_square)
+MLX_UNOP_IMPL(ionic_mlx_sqrt,     mlx_sqrt)
+MLX_UNOP_IMPL(ionic_mlx_exp,      mlx_exp)
+MLX_UNOP_IMPL(ionic_mlx_log,      mlx_log)
+MLX_UNOP_IMPL(ionic_mlx_abs,      mlx_abs)
+MLX_UNOP_IMPL(ionic_mlx_tanh,     mlx_tanh)
+MLX_UNOP_IMPL(ionic_mlx_erf,      mlx_erf)
+
+#undef MLX_UNOP_IMPL
+
+/* contiguous takes an extra bool in MLX; wrap it so the Ionic surface stays
+ * uniform (one argument). */
+void *ionic_mlx_contiguous(void *h) {
+    ionic_mlx_init();
+    MLX_ARG(h);
+    mlx_array r = mlx_array_new();
+    if (mlx_ck(mlx_contiguous(&r, _a, false, g_mlx_gpu_stream)) != 0) return NULL;
+    return mlx_tensor_new(r);
+}
+
+/* ── Reductions ───────────────────────────────────────────────────────────── */
+
+/* Sum of every element (optionally keeping dims). The classic
+ * "sum the squared errors" ingredient. */
+void *ionic_mlx_sum(void *h, int64_t keepdims) {
+    ionic_mlx_init();
+    MLX_ARG(h);
+    mlx_array r = mlx_array_new();
+    if (mlx_ck(mlx_sum(&r, _a, keepdims != 0, g_mlx_gpu_stream)) != 0) return NULL;
+    return mlx_tensor_new(r);
+}
+
+void *ionic_mlx_mean(void *h, int64_t keepdims) {
+    ionic_mlx_init();
+    MLX_ARG(h);
+    mlx_array r = mlx_array_new();
+    if (mlx_ck(mlx_mean(&r, _a, keepdims != 0, g_mlx_gpu_stream)) != 0) return NULL;
+    return mlx_tensor_new(r);
+}
+
+void *ionic_mlx_max(void *h, int64_t keepdims) {
+    ionic_mlx_init();
+    MLX_ARG(h);
+    mlx_array r = mlx_array_new();
+    if (mlx_ck(mlx_max(&r, _a, keepdims != 0, g_mlx_gpu_stream)) != 0) return NULL;
+    return mlx_tensor_new(r);
+}
+
+void *ionic_mlx_min(void *h, int64_t keepdims) {
+    ionic_mlx_init();
+    MLX_ARG(h);
+    mlx_array r = mlx_array_new();
+    if (mlx_ck(mlx_min(&r, _a, keepdims != 0, g_mlx_gpu_stream)) != 0) return NULL;
+    return mlx_tensor_new(r);
+}
+
+/* Reduction along one axis. axis may be negative (Python-style from the end),
+ * which is what softmax over the last axis needs. */
+void *ionic_mlx_sum_axis(void *h, int64_t axis, int64_t keepdims) {
+    ionic_mlx_init();
+    MLX_ARG(h);
+    mlx_array r = mlx_array_new();
+    if (mlx_ck(mlx_sum_axis(&r, _a, (int)axis, keepdims != 0, g_mlx_gpu_stream)) != 0) return NULL;
+    return mlx_tensor_new(r);
+}
+
+void *ionic_mlx_mean_axis(void *h, int64_t axis, int64_t keepdims) {
+    ionic_mlx_init();
+    MLX_ARG(h);
+    mlx_array r = mlx_array_new();
+    if (mlx_ck(mlx_mean_axis(&r, _a, (int)axis, keepdims != 0, g_mlx_gpu_stream)) != 0) return NULL;
+    return mlx_tensor_new(r);
+}
+
+void *ionic_mlx_argmax(void *h, int64_t axis, int64_t keepdims) {
+    ionic_mlx_init();
+    MLX_ARG(h);
+    mlx_array r = mlx_array_new();
+    if (mlx_ck(mlx_argmax_axis(&r, _a, (int)axis, keepdims != 0, g_mlx_gpu_stream)) != 0) return NULL;
+    return mlx_tensor_new(r);
+}
+
+/* Softmax over an axis — the sampling/logits step of any generator. */
+void *ionic_mlx_softmax(void *h, int64_t axis) {
+    ionic_mlx_init();
+    MLX_ARG(h);
+    mlx_array r = mlx_array_new();
+    if (mlx_ck(mlx_softmax_axis(&r, _a, (int)axis, false, g_mlx_gpu_stream)) != 0) return NULL;
+    return mlx_tensor_new(r);
+}
+
+/* Log-softmax along an axis. MLX has no fused log_softmax, so this composes
+ * softmax -> log on the graph (still lazy, still one eval at the end). Kept as
+ * a named primitive because cross-entropy code reads better for it; it is not
+ * the numerically-stable logsumexp form, which callers can build by hand from
+ * mlx_max / mlx_exp / mlx_sum_axis. */
+void *ionic_mlx_log_softmax(void *h, int64_t axis) {
+    ionic_mlx_init();
+    MLX_ARG(h);
+    mlx_array sm = mlx_array_new();
+    if (mlx_ck(mlx_softmax_axis(&sm, _a, (int)axis, false, g_mlx_gpu_stream)) != 0) return NULL;
+    mlx_array r = mlx_array_new();
+    int rc = mlx_ck(mlx_log(&r, sm, g_mlx_gpu_stream));
+    mlx_array_free(sm);
+    if (rc != 0) return NULL;
+    return mlx_tensor_new(r);
+}
+
+/* ── Shape manipulation ───────────────────────────────────────────────────── */
+
+void *ionic_mlx_reshape(void *h, void *shape_arr) {
+    ionic_mlx_init();
+    MLX_ARG(h);
+    int shape[IONIC_MLX_MAX_DIMS]; size_t n = 0;
+    if (mlx_shape_from_arr(shape_arr, shape, &n) != 0) return NULL;
+    mlx_array r = mlx_array_new();
+    if (mlx_ck(mlx_reshape(&r, _a, shape, n, g_mlx_gpu_stream)) != 0) return NULL;
+    return mlx_tensor_new(r);
+}
+
+/* Transpose given an explicit permutation of dims ([1,0] for a 2-D matrix).
+ * MLX rejects an empty axis list, so a full reversal is the sensible default
+ * when the caller passes no permutation. */
+void *ionic_mlx_transpose(void *h, void *axes_arr) {
+    ionic_mlx_init();
+    MLX_ARG(h);
+    int axes[IONIC_MLX_MAX_DIMS]; size_t n = 0;
+    if (mlx_shape_from_arr(axes_arr, axes, &n) != 0) return NULL;
+
+    int nd = (int)mlx_array_ndim(_a);
+    int rev[IONIC_MLX_MAX_DIMS];
+    if (n == 0) {
+        if (nd <= 0 || nd > IONIC_MLX_MAX_DIMS) {
+            fprintf(stderr, "[ionic/mlx] transpose: bad rank %d\n", nd);
+            return NULL;
+        }
+        for (int i = 0; i < nd; i++) rev[i] = nd - 1 - i;
+        mlx_array r = mlx_array_new();
+        if (mlx_ck(mlx_transpose_axes(&r, _a, rev, (size_t)nd, g_mlx_gpu_stream)) != 0) return NULL;
+        return mlx_tensor_new(r);
+    }
+
+    mlx_array r = mlx_array_new();
+    if (mlx_ck(mlx_transpose_axes(&r, _a, axes, n, g_mlx_gpu_stream)) != 0) return NULL;
+    return mlx_tensor_new(r);
+}
+
+/* Cast element dtype. Kept separate from construction so precision can be
+ * chosen per-step (e.g. f32 activations, bf16 weights). */
+void *ionic_mlx_astype(void *h, int64_t dtype) {
+    ionic_mlx_init();
+    MLX_ARG(h);
+    mlx_array r = mlx_array_new();
+    if (mlx_ck(mlx_astype(&r, _a, ionic_dtype_to_mlx(dtype), g_mlx_gpu_stream)) != 0) return NULL;
+    return mlx_tensor_new(r);
+}
+
+/* Slice: take elements [start, stop) along `axis`, leaving other dims whole.
+ * MLX's raw mlx_slice takes full-rank start/stop/strides vectors, so we build
+ * them here from the single-axis form the Ionic side exposes. */
+void *ionic_mlx_slice(void *h, int64_t start, int64_t stop, int64_t axis) {
+    ionic_mlx_init();
+    MLX_ARG(h);
+    int nd = (int)mlx_array_ndim(_a);
+    if (nd <= 0 || nd > IONIC_MLX_MAX_DIMS) {
+        fprintf(stderr, "[ionic/mlx] slice: bad rank %d\n", nd);
+        return NULL;
+    }
+    int ax = (int)axis;
+    if (ax < 0) ax += nd;
+    if (ax < 0 || ax >= nd) {
+        fprintf(stderr, "[ionic/mlx] slice: axis %lld out of range for rank %d\n",
+                (long long)axis, nd);
+        return NULL;
+    }
+
+    const int *shape = mlx_array_shape(_a);
+    int st[IONIC_MLX_MAX_DIMS], sp[IONIC_MLX_MAX_DIMS], sd[IONIC_MLX_MAX_DIMS];
+    for (int i = 0; i < nd; i++) { st[i] = 0; sp[i] = shape[i]; sd[i] = 1; }
+    st[ax] = (int)start;
+    sp[ax] = (int)stop;
+
+    /* strides must have the same length as start/stop; passing NULL with
+     * strides_num 0 makes MLX reject the call as a rank mismatch. */
+    mlx_array r = mlx_array_new();
+    if (mlx_ck(mlx_slice(&r, _a, st, (size_t)nd, sp, (size_t)nd, sd, (size_t)nd,
+                         g_mlx_gpu_stream)) != 0) return NULL;
+    return mlx_tensor_new(r);
+}
+
+/* Gather rows by index along an axis (embedding lookup / token selection). */
+void *ionic_mlx_take(void *h, void *idx_arr, int64_t axis) {
+    ionic_mlx_init();
+    MLX_ARG(h);
+    if (!idx_arr) { fprintf(stderr, "[ionic/mlx] take: null indices\n"); return NULL; }
+    IonicArray *ia = (IonicArray *)idx_arr;
+    int32_t *buf = (int32_t *)malloc((size_t)(ia->len > 0 ? ia->len : 1) * sizeof(int32_t));
+    if (!buf) return NULL;
+    int64_t *slots = (int64_t *)ia->data;
+    for (int64_t i = 0; i < ia->len; i++) buf[i] = (int32_t)slots[i];
+    int ish[1] = { (int)ia->len };
+    mlx_array idx = mlx_array_new_data(buf, ish, 1, MLX_INT32);
+    free(buf);
+
+    mlx_array r = mlx_array_new();
+    int rc = mlx_ck(mlx_take_axis(&r, _a, idx, (int)axis, g_mlx_gpu_stream));
+    mlx_array_free(idx);
+    if (rc != 0) return NULL;
+    return mlx_tensor_new(r);
+}
+
+/* Concatenate two tensors along an axis. mlx_concatenate() only exists as the
+ * flat (axis 0) convenience form; the explicit-axis variant is a separate
+ * symbol, so don't silently drop the argument. */
+void *ionic_mlx_concatenate(void *ha, void *hb, int64_t axis) {
+    ionic_mlx_init();
+    MLX_ARG(ha);
+    MlxTensor *tb = mlx_tensor_of(hb);
+    if (!tb) return NULL;
+    mlx_array pair[2] = { _a, tb->a };
+    mlx_vector_array va = mlx_vector_array_new_data(pair, 2);
+    mlx_array r = mlx_array_new();
+    int rc = mlx_ck(mlx_concatenate_axis(&r, va, (int)axis, g_mlx_gpu_stream));
+    mlx_vector_array_free(va);
+    if (rc != 0) return NULL;
+    return mlx_tensor_new(r);
+}
+
+/* ── NN primitives ──────────────────────────────────────────────────────────
+ * These are the fused Metal kernels a transformer needs. They are building
+ * blocks: no attention mask policy, no layer stack, no initialisation scheme.
+ * ------------------------------------------------------------------------ */
+
+/* Scaled dot-product attention. `causal` selects MLX's "causal" mask mode,
+ * which is the only mask policy exposed — anything finer-grained should be
+ * built from the tensor ops above. */
+void *ionic_mlx_sdpa(void *q, void *k, void *v, int64_t scale_b, int64_t causal) {
+    ionic_mlx_init();
+    MlxTensor *tq = mlx_tensor_of(q);
+    MlxTensor *tk = mlx_tensor_of(k);
+    MlxTensor *tv = mlx_tensor_of(v);
+    if (!tq || !tk || !tv) return NULL;
+    mlx_array r = mlx_array_new();
+    if (mlx_ck(mlx_fast_scaled_dot_product_attention(
+            &r, tq->a, tk->a, tv->a, (float)i642d(scale_b),
+            causal ? "causal" : "", mlx_array_empty, mlx_array_empty,
+            g_mlx_gpu_stream)) != 0) return NULL;
+    return mlx_tensor_new(r);
+}
+
+/* RMSNorm. `weight` may be NULL for the weightless form. */
+void *ionic_mlx_rms_norm(void *h, void *weight, int64_t eps_b) {
+    ionic_mlx_init();
+    MLX_ARG(h);
+    mlx_array w = mlx_array_empty;
+    MlxTensor *tw = NULL;
+    if (weight) {
+        tw = mlx_tensor_of(weight);
+        if (!tw) return NULL;
+        w = tw->a;
+    }
+    mlx_array r = mlx_array_new();
+    if (mlx_ck(mlx_fast_rms_norm(&r, _a, w, (float)i642d(eps_b), g_mlx_gpu_stream)) != 0) return NULL;
+    return mlx_tensor_new(r);
+}
+
+/* LayerNorm. weight and bias may both be NULL. */
+void *ionic_mlx_layer_norm(void *h, void *weight, void *bias, int64_t eps_b) {
+    ionic_mlx_init();
+    MLX_ARG(h);
+    mlx_array w = mlx_array_empty, b = mlx_array_empty;
+    if (weight) { MlxTensor *t = mlx_tensor_of(weight); if (!t) return NULL; w = t->a; }
+    if (bias)   { MlxTensor *t = mlx_tensor_of(bias);   if (!t) return NULL; b = t->a; }
+    mlx_array r = mlx_array_new();
+    if (mlx_ck(mlx_fast_layer_norm(&r, _a, w, b, (float)i642d(eps_b), g_mlx_gpu_stream)) != 0) return NULL;
+    return mlx_tensor_new(r);
+}
+
+/* Rotary position embedding. `dims` is the number of dimensions to rotate;
+ * `traditional` picks the GPT-NeoX vs. original sign convention. */
+void *ionic_mlx_rope(void *h, int64_t dims, int64_t base_b, int64_t traditional, int64_t offset) {
+    ionic_mlx_init();
+    MLX_ARG(h);
+    mlx_optional_float opt;
+    opt.value = (float)i642d(base_b);
+    opt.has_value = true;
+    mlx_array r = mlx_array_new();
+    if (mlx_ck(mlx_fast_rope(&r, _a, (int)dims, traditional != 0, opt, 1.0f,
+                             (int)offset, mlx_array_empty, g_mlx_gpu_stream)) != 0) return NULL;
+    return mlx_tensor_new(r);
+}
+
+/* ── Autodiff seam (documented, not yet wired) ──────────────────────────────
+ * MLX computes gradients through C closures:
+ *
+ *     mlx_closure loss = mlx_closure_new_func(loss_fn);
+ *     mlx_value_and_grad(&vg, loss, argnums, n);
+ *
+ * `loss_fn` is a C function pointer called by MLX. Ionic has no function
+ * values, so exposing mlx_value_and_grad directly requires teaching codegen to
+ * take the address of a user function (it already emits one defined symbol per
+ * `fn`, so this is mechanical: ADRP+ADD over the existing symbol).
+ *
+ * That bridge is intentionally NOT built here: it changes the language surface
+ * (a new "function reference" value) and deserves its own design pass. Until
+ * then gradient support is absent by design, not by accident — the primitives
+ * above are exactly the set a hand-written forward/backward would use.
+ * ------------------------------------------------------------------------- */
+
+/* ── Diagnostics & memory ─────────────────────────────────────────────────── */
+
+/* Last MLX error message (empty when the last op succeeded). */
+const char *ionic_mlx_last_error(void) { return g_mlx_err; }
+
+int64_t ionic_mlx_clear_error(void) { g_mlx_err[0] = '\0'; return 0; }
+
+/* 1 when the backend is compiled in, 0 otherwise. Lets a program branch
+ * instead of hard-failing on a platform without MLX. */
+int64_t ionic_mlx_available(void) {
+    return 1;
+}
+
+/* 1 when a Metal device is actually present (e.g. 0 under Rosetta / CI). */
+int64_t ionic_mlx_metal_available(void) {
+    ionic_mlx_init();
+    bool avail = false;
+    if (mlx_ck(mlx_metal_is_available(&avail)) != 0) return 0;
+    return avail ? 1 : 0;
+}
+
+/* Bytes of live array memory, and the high-water mark since process start. */
+int64_t ionic_mlx_active_memory(void) {
+    ionic_mlx_init();
+    size_t v = 0;
+    if (mlx_ck(mlx_get_active_memory(&v)) != 0) return -1;
+    return (int64_t)v;
+}
+
+int64_t ionic_mlx_peak_memory(void) {
+    ionic_mlx_init();
+    size_t v = 0;
+    if (mlx_ck(mlx_get_peak_memory(&v)) != 0) return -1;
+    return (int64_t)v;
+}
+
+int64_t ionic_mlx_reset_peak_memory(void) {
+    ionic_mlx_init();
+    return mlx_ck(mlx_reset_peak_memory());
+}
+
+/* Release cached buffers back to the OS. Useful in a loop so the allocator's
+ * cache does not grow without bound (this repo gates on RSS). */
+int64_t ionic_mlx_clear_cache(void) {
+    ionic_mlx_init();
+    return mlx_ck(mlx_clear_cache());
+}
+
+/* Cap how much memory MLX may allocate. 0 means "no limit". */
+int64_t ionic_mlx_set_memory_limit(int64_t bytes) {
+    ionic_mlx_init();
+    size_t prev = 0;
+    return mlx_ck(mlx_set_memory_limit(&prev, (size_t)bytes));
+}
+
+/* ── Safetensors I/O ────────────────────────────────────────────────────────
+ * Load a .safetensors file and expose (a) the number of tensors and (b) the
+ * Nth tensor by index, so Ionic can walk the whole dict without a hash map
+ * crossing the FFI boundary. A named lookup is also provided for the common
+ * "fetch this one weight" case.
+ *
+ * Handles own the underlying map; mlx_weights_free releases everything.
+ * ------------------------------------------------------------------------ */
+
+typedef struct {
+    uint32_t                 magic;
+    mlx_map_string_to_array  params;
+    mlx_map_string_to_string meta;
+} MlxWeights;
+
+#define IONIC_MLX_WEIGHTS_MAGIC 0x4D4C5857  /* "MLXW" */
+
+static MlxWeights *mlx_weights_of(void *h) {
+    if (!h) { fprintf(stderr, "[ionic/mlx] null weights handle\n"); return NULL; }
+    MlxWeights *w = (MlxWeights *)h;
+    if (w->magic != IONIC_MLX_WEIGHTS_MAGIC) {
+        fprintf(stderr, "[ionic/mlx] bad weights handle\n");
+        return NULL;
+    }
+    return w;
+}
+
+void *ionic_mlx_load_safetensors(const char *path) {
+    ionic_mlx_init();
+    MlxWeights *w = (MlxWeights *)calloc(1, sizeof(MlxWeights));
+    w->magic  = IONIC_MLX_WEIGHTS_MAGIC;
+    w->params = mlx_map_string_to_array_new();
+    w->meta   = mlx_map_string_to_string_new();
+
+    if (mlx_ck(mlx_load_safetensors(&w->params, &w->meta, path, g_mlx_gpu_stream)) != 0) {
+        mlx_map_string_to_array_free(w->params);
+        mlx_map_string_to_string_free(w->meta);
+        free(w);
+        return NULL;
+    }
+    fprintf(stderr, "[ionic/mlx] loaded safetensors: %s\n", path);
+    return w;
+}
+
+/* Number of tensors in the file. mlx-c exposes no map size, so we count by
+ * walking the iterator (cheap: it only visits keys, does not materialise
+ * data). */
+static int64_t mlx_weights_count_impl(MlxWeights *w) {
+    mlx_map_string_to_array_iterator it =
+        mlx_map_string_to_array_iterator_new(w->params);
+    const char *key = NULL;
+    mlx_array   val = mlx_array_new();
+    int64_t     n   = 0;
+    while (mlx_map_string_to_array_iterator_next(&key, &val, it) == 0) {
+        mlx_array_free(val);
+        val = mlx_array_new();
+        n++;
+    }
+    mlx_array_free(val);
+    mlx_map_string_to_array_iterator_free(it);
+    return n;
+}
+
+int64_t ionic_mlx_weights_count(void *h) {
+    MlxWeights *w = mlx_weights_of(h);
+    if (!w) return -1;
+    return mlx_weights_count_impl(w);
+}
+
+/* Tensor at index i, or NULL. Iteration order is MLX's map order. */
+void *ionic_mlx_weights_at(void *h, int64_t i) {
+    MlxWeights *w = mlx_weights_of(h);
+    if (!w) return NULL;
+
+    mlx_map_string_to_array_iterator it = mlx_map_string_to_array_iterator_new(w->params);
+    const char *key = NULL;
+    mlx_array   val = mlx_array_new();
+    void       *result = NULL;
+    int64_t     idx = 0;
+
+    while (mlx_map_string_to_array_iterator_next(&key, &val, it) == 0) {
+        if (idx == i) {
+            /* val owns a reference from the iterator; wrap it in a tensor.
+             * The tensor takes the reference over, so it stays valid after
+             * the iterator is freed. */
+            result = mlx_tensor_new(val);
+            val = mlx_array_new();   /* don't free the one we handed off */
+            break;
+        }
+        mlx_array_free(val);
+        val = mlx_array_new();
+        idx++;
+    }
+
+    mlx_array_free(val);
+    mlx_map_string_to_array_iterator_free(it);
+    if (!result) {
+        fprintf(stderr, "[ionic/mlx] weights_at: index %lld out of range (%lld tensors)\n",
+                (long long)i, (long long)mlx_weights_count_impl(w));
+    }
+    return result;
+}
+
+/* Key at index i, or "" — pair with weights_at to walk the dict. */
+const char *ionic_mlx_weights_key_at(void *h, int64_t i) {
+    MlxWeights *w = mlx_weights_of(h);
+    if (!w) return "";
+
+    static char keybuf[512];
+    keybuf[0] = '\0';
+    mlx_map_string_to_array_iterator it = mlx_map_string_to_array_iterator_new(w->params);
+    const char *key = NULL;
+    mlx_array   val = mlx_array_new();
+    int64_t     idx = 0;
+
+    while (mlx_map_string_to_array_iterator_next(&key, &val, it) == 0) {
+        if (idx == i) {
+            snprintf(keybuf, sizeof(keybuf), "%s", key ? key : "");
+            break;
+        }
+        mlx_array_free(val);
+        val = mlx_array_new();
+        idx++;
+    }
+
+    mlx_array_free(val);
+    mlx_map_string_to_array_iterator_free(it);
+    return keybuf;
+}
+
+/* Look up one tensor by name, or NULL when absent. */
+void *ionic_mlx_weights_get(void *h, const char *name) {
+    MlxWeights *w = mlx_weights_of(h);
+    if (!w) return NULL;
+    mlx_array v = mlx_array_new();
+    if (mlx_ck(mlx_map_string_to_array_get(&v, w->params, name)) != 0) return NULL;
+    return mlx_tensor_new(v);
+}
+
+void ionic_mlx_weights_free(void *h) {
+    MlxWeights *w = mlx_weights_of(h);
+    if (!w) return;
+    mlx_map_string_to_array_free(w->params);
+    mlx_map_string_to_string_free(w->meta);
+    w->magic = 0;
+    free(w);
+}
+
+/* Save a single tensor as .safetensors under one key. */
+int64_t ionic_mlx_save_safetensors(void *h, const char *path, const char *key) {
+    ionic_mlx_init();
+    MlxTensor *t = mlx_tensor_of(h);
+    if (!t) return -1;
+    mlx_map_string_to_array  params = mlx_map_string_to_array_new();
+    mlx_map_string_to_string meta   = mlx_map_string_to_string_new();
+    mlx_map_string_to_array_insert(params, key ? key : "tensor", t->a);
+    int rc = mlx_ck(mlx_save_safetensors(path, params, meta));
+    mlx_map_string_to_array_free(params);
+    mlx_map_string_to_string_free(meta);
+    return rc;
+}
+
+#else  /* !IONIC_MLX_ACTIVE — Linux / non-Apple, or MLX not requested */
+
+/* Every MLX entry point exists on every platform so Ionic programs that use
+ * mlx_* still *link* — it just reports at runtime that the backend isn't
+ * compiled in, exactly like the llama.cpp path does today.
+ *
+ * The stub set is generated by hand from the real definitions above; keep the
+ * two in sync when adding an op. A missing stub is a LINK error on Linux, not a
+ * runtime error, which is why this list is exhaustive rather than minimal.
+ *
+ * Return conventions follow the real implementations so callers behave the same
+ * way: `void *` ops yield NULL, count/length ops yield -1, predicates yield 0.
+ */
+static void mlx_unavailable(void) {
+    static int warned = 0;
+    if (warned) return;
+    warned = 1;
+    fprintf(stderr, "[ionic/mlx] MLX backend not compiled in on this platform "
+                    "(Apple silicon + mlx-c required; GGUF/llama.cpp remains "
+                    "available)\n");
+}
+
+/* ── Predicates / diagnostics ─────────────────────────────────────────────── */
+int64_t ionic_mlx_available(void) { return 0; }
+int64_t ionic_mlx_metal_available(void) { return 0; }
+const char *ionic_mlx_last_error(void) { return "MLX backend not compiled in"; }
+int64_t ionic_mlx_clear_error(void) { return 0; }
+int64_t ionic_mlx_active_memory(void) { return -1; }
+int64_t ionic_mlx_peak_memory(void) { return -1; }
+int64_t ionic_mlx_reset_peak_memory(void) { return -1; }
+int64_t ionic_mlx_clear_cache(void) { return 0; }
+int64_t ionic_mlx_set_memory_limit(int64_t b) { (void)b; return -1; }
+
+/* ── Lifetime / inspection ────────────────────────────────────────────────── */
+void    ionic_mlx_free(void *h) { (void)h; }
+int64_t ionic_mlx_eval(void *h) { (void)h; mlx_unavailable(); return -1; }
+int64_t ionic_mlx_ndim(void *h) { (void)h; return -1; }
+int64_t ionic_mlx_size(void *h) { (void)h; return -1; }
+int64_t ionic_mlx_dim(void *h, int64_t i) { (void)h; (void)i; return -1; }
+int64_t ionic_mlx_dtype(void *h) { (void)h; return -1; }
+int64_t ionic_mlx_item(void *h) { (void)h; return 0; }
+void   *ionic_mlx_shape(void *h) { (void)h; return ionic_array_alloc(1); }
+void   *ionic_mlx_to_array(void *h) { (void)h; return ionic_array_alloc(1); }
+
+/* ── Construction ─────────────────────────────────────────────────────────── */
+void *ionic_mlx_zeros(void *shape, int64_t dt)               { (void)shape; (void)dt; mlx_unavailable(); return NULL; }
+void *ionic_mlx_ones(void *shape, int64_t dt)                { (void)shape; (void)dt; mlx_unavailable(); return NULL; }
+void *ionic_mlx_full(void *shape, int64_t v, int64_t dt)     { (void)shape; (void)v; (void)dt; mlx_unavailable(); return NULL; }
+void *ionic_mlx_arange(int64_t a, int64_t b, int64_t c, int64_t dt) { (void)a;(void)b;(void)c;(void)dt; mlx_unavailable(); return NULL; }
+void *ionic_mlx_eye(int64_t n, int64_t m, int64_t dt)        { (void)n; (void)m; (void)dt; mlx_unavailable(); return NULL; }
+void *ionic_mlx_random_normal(void *shape, int64_t l, int64_t s, int64_t dt)  { (void)shape;(void)l;(void)s;(void)dt; mlx_unavailable(); return NULL; }
+void *ionic_mlx_random_uniform(void *shape, int64_t lo, int64_t hi, int64_t dt) { (void)shape;(void)lo;(void)hi;(void)dt; mlx_unavailable(); return NULL; }
+void *ionic_mlx_from_array(void *flat, void *shape, int64_t dt) { (void)flat; (void)shape; (void)dt; mlx_unavailable(); return NULL; }
+
+/* ── Elementwise / linear algebra ─────────────────────────────────────────── */
+void *ionic_mlx_add(void *a, void *b)          { (void)a; (void)b; mlx_unavailable(); return NULL; }
+void *ionic_mlx_subtract(void *a, void *b)     { (void)a; (void)b; mlx_unavailable(); return NULL; }
+void *ionic_mlx_multiply(void *a, void *b)     { (void)a; (void)b; mlx_unavailable(); return NULL; }
+void *ionic_mlx_divide(void *a, void *b)       { (void)a; (void)b; mlx_unavailable(); return NULL; }
+void *ionic_mlx_power(void *a, void *b)        { (void)a; (void)b; mlx_unavailable(); return NULL; }
+void *ionic_mlx_maximum(void *a, void *b)      { (void)a; (void)b; mlx_unavailable(); return NULL; }
+void *ionic_mlx_minimum(void *a, void *b)      { (void)a; (void)b; mlx_unavailable(); return NULL; }
+void *ionic_mlx_matmul(void *a, void *b)       { (void)a; (void)b; mlx_unavailable(); return NULL; }
+void *ionic_mlx_concatenate(void *a, void *b, int64_t ax) { (void)a; (void)b; (void)ax; mlx_unavailable(); return NULL; }
+
+void *ionic_mlx_negative(void *h)   { (void)h; mlx_unavailable(); return NULL; }
+void *ionic_mlx_square(void *h)     { (void)h; mlx_unavailable(); return NULL; }
+void *ionic_mlx_sqrt(void *h)       { (void)h; mlx_unavailable(); return NULL; }
+void *ionic_mlx_exp(void *h)        { (void)h; mlx_unavailable(); return NULL; }
+void *ionic_mlx_log(void *h)        { (void)h; mlx_unavailable(); return NULL; }
+void *ionic_mlx_abs(void *h)        { (void)h; mlx_unavailable(); return NULL; }
+void *ionic_mlx_tanh(void *h)       { (void)h; mlx_unavailable(); return NULL; }
+void *ionic_mlx_erf(void *h)        { (void)h; mlx_unavailable(); return NULL; }
+void *ionic_mlx_contiguous(void *h) { (void)h; mlx_unavailable(); return NULL; }
+
+/* ── Reductions ───────────────────────────────────────────────────────────── */
+void *ionic_mlx_sum(void *h, int64_t kd)   { (void)h; (void)kd; mlx_unavailable(); return NULL; }
+void *ionic_mlx_mean(void *h, int64_t kd)  { (void)h; (void)kd; mlx_unavailable(); return NULL; }
+void *ionic_mlx_max(void *h, int64_t kd)   { (void)h; (void)kd; mlx_unavailable(); return NULL; }
+void *ionic_mlx_min(void *h, int64_t kd)   { (void)h; (void)kd; mlx_unavailable(); return NULL; }
+void *ionic_mlx_sum_axis(void *h, int64_t ax, int64_t kd)  { (void)h;(void)ax;(void)kd; mlx_unavailable(); return NULL; }
+void *ionic_mlx_mean_axis(void *h, int64_t ax, int64_t kd) { (void)h;(void)ax;(void)kd; mlx_unavailable(); return NULL; }
+void *ionic_mlx_argmax(void *h, int64_t ax, int64_t kd)    { (void)h;(void)ax;(void)kd; mlx_unavailable(); return NULL; }
+void *ionic_mlx_softmax(void *h, int64_t ax)      { (void)h; (void)ax; mlx_unavailable(); return NULL; }
+void *ionic_mlx_log_softmax(void *h, int64_t ax)  { (void)h; (void)ax; mlx_unavailable(); return NULL; }
+
+/* ── Shape ────────────────────────────────────────────────────────────────── */
+void *ionic_mlx_reshape(void *h, void *shape)   { (void)h; (void)shape; mlx_unavailable(); return NULL; }
+void *ionic_mlx_transpose(void *h, void *axes)  { (void)h; (void)axes; mlx_unavailable(); return NULL; }
+void *ionic_mlx_astype(void *h, int64_t dt)     { (void)h; (void)dt; mlx_unavailable(); return NULL; }
+void *ionic_mlx_slice(void *h, int64_t a, int64_t b, int64_t ax) { (void)h;(void)a;(void)b;(void)ax; mlx_unavailable(); return NULL; }
+void *ionic_mlx_take(void *h, void *idx, int64_t ax) { (void)h; (void)idx; (void)ax; mlx_unavailable(); return NULL; }
+
+/* ── NN primitives ────────────────────────────────────────────────────────── */
+void *ionic_mlx_sdpa(void *q, void *k, void *v, int64_t sc, int64_t causal) {
+    (void)q; (void)k; (void)v; (void)sc; (void)causal; mlx_unavailable(); return NULL;
+}
+void *ionic_mlx_rms_norm(void *h, void *w, int64_t eps)          { (void)h;(void)w;(void)eps; mlx_unavailable(); return NULL; }
+void *ionic_mlx_layer_norm(void *h, void *w, void *b, int64_t eps) { (void)h;(void)w;(void)b;(void)eps; mlx_unavailable(); return NULL; }
+void *ionic_mlx_rope(void *h, int64_t d, int64_t base, int64_t trad, int64_t off) {
+    (void)h; (void)d; (void)base; (void)trad; (void)off; mlx_unavailable(); return NULL;
+}
+
+/* ── Safetensors ──────────────────────────────────────────────────────────── */
+void      *ionic_mlx_load_safetensors(const char *path) { (void)path; mlx_unavailable(); return NULL; }
+void       ionic_mlx_weights_free(void *h)              { (void)h; }
+int64_t    ionic_mlx_weights_count(void *h)             { (void)h; return -1; }
+void      *ionic_mlx_weights_at(void *h, int64_t i)     { (void)h; (void)i; return NULL; }
+const char *ionic_mlx_weights_key_at(void *h, int64_t i) { (void)h; (void)i; return ""; }
+void      *ionic_mlx_weights_get(void *h, const char *n) { (void)h; (void)n; return NULL; }
+int64_t    ionic_mlx_save_safetensors(void *h, const char *p, const char *k) {
+    (void)h; (void)p; (void)k; return -1;
+}
+
+#endif /* IONIC_MLX_ACTIVE */
 
 /* ════════════════════════════════════════════════════════════════════════════
  * Public API — dispatch on ModelFormat stored in handle
@@ -1177,7 +2361,6 @@ char *ionic_http_urlencode(const char *s) {
 #  include <fcntl.h>
 #  include <sys/select.h>
 #  include <errno.h>
-#  include <signal.h>
 #  include <sys/ioctl.h>
 
 /* KEY_* sentinels (must match lib/tui/term.ionic). */

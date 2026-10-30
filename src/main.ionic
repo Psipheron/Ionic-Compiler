@@ -99,4 +99,172 @@ if (g_target_linux == 1) {
 } else {
     link_cmd = str_concat("clang -mmacosx-version-min=13.0 ", str_concat(obj_path, str_concat(str_concat(" ", rt_src), str_concat(" -o ", out_name))));
 }
+
+// ── Optional ML backend linkage ──────────────────────────────────────────────
+//
+// The runtime (`ionic_model_runtime.c`) compiles every backend behind an
+// IONIC_HAVE_* macro. Without the matching -D and -I, those blocks vanish and
+// `load_model` / `gguf_generate` / `mlx_*` all report "not compiled in" at
+// runtime — which is what used to happen for *every* backend, because this
+// driver never passed any flags. Probing here fixes that.
+//
+// Detection is opportunistic: whatever is installed gets enabled, and a
+// missing library is not an error. That keeps the tarball usable on a machine
+// with no brew packages at all, while an `mlx-c` / `llama.cpp` / `onnxruntime`
+// install silently lights up the corresponding backend.
+//
+// IONIC_MLX_INCLUDE / IONIC_MLX_LIB (and the _LLAMA_/_ORT_ equivalents) override
+// detection for non-Homebrew prefixes. IONIC_NO_MLX=1 forces MLX off, which is
+// useful when a half-installed mlx-c would otherwise fail the link.
+// Backends are linked only when the program actually references them. Linking
+// unconditionally would make every Ionic binary (including hello-world) depend
+// on mlx/llama/onnx and pay their load + init cost at startup, so usage is
+// detected from the source text first. False positives merely cost a link
+// flag; false negatives would silently disable a backend, so the token lists
+// below are the *shortest unambiguous prefix* for each entry point.
+mut uses_mlx   = 0;
+mut uses_llama = 0;
+mut uses_ort   = 0;
+if (str_contains(src_str, "mlx_") == 1)        { uses_mlx = 1; }
+if (str_contains(src_str, "gguf_") == 1)       { uses_llama = 1; }
+if (str_contains(src_str, "piper_forward") == 1) { uses_ort = 1; }
+// `load_model` dispatches on the file extension at runtime, so either backend
+// may be needed; enable both and let the runtime pick. model_forward is ONNX.
+if (str_contains(src_str, "load_model") == 1)  { uses_llama = 1; uses_ort = 1; }
+if (str_contains(src_str, "model_forward") == 1) { uses_ort = 1; }
+
+mut backend_defs = "";
+mut backend_libs = "";
+if (uses_mlx == 1 && g_target_linux == 0) {
+    if (str_eq(getenv("IONIC_NO_MLX"), "") || str_eq(getenv("IONIC_NO_MLX"), "0")) {
+        let mlx_inc = find_mlx_include();
+        let mlx_lib = find_mlx_lib();
+        if (!str_eq(mlx_inc, "") && !str_eq(mlx_lib, "")) {
+            // -D + -I at compile time; -L + -l at link time. libmlxc records its
+            // own dependencies by absolute path, so no -Wl,-rpath is needed.
+            backend_defs = str_concat(" -DIONIC_HAVE_MLX -I", mlx_inc);
+            backend_libs = str_concat(backend_libs, str_concat(" -L", str_concat(mlx_lib, " -lmlxc")));
+        }
+    }
+}
+
+// GGUF/llama.cpp stays the portable path — in particular it is the only ML
+// backend on Linux, so it is probed regardless of target.
+if (uses_llama == 1) {
+    let llama_inc = find_llama_include();
+    let llama_lib = find_llama_lib();
+    if (!str_eq(llama_inc, "") && !str_eq(llama_lib, "")) {
+        backend_defs = str_concat(backend_defs, str_concat(" -DIONIC_HAVE_LLAMA -I", llama_inc));
+        backend_libs = str_concat(backend_libs, str_concat(" -L", str_concat(llama_lib, " -lllama")));
+    }
+}
+
+if (uses_ort == 1) {
+    let ort_inc = find_ort_include();
+    let ort_lib = find_ort_lib();
+    if (!str_eq(ort_inc, "") && !str_eq(ort_lib, "")) {
+        backend_defs = str_concat(backend_defs, str_concat(" -DIONIC_HAVE_ORT -I", ort_inc));
+        backend_libs = str_concat(backend_libs, str_concat(" -L", str_concat(ort_lib, " -lonnxruntime")));
+    }
+}
+
+if (str_len(backend_defs) > 0) {
+    link_cmd = str_concat(link_cmd, backend_defs);
+}
+if (str_len(backend_libs) > 0) {
+    link_cmd = str_concat(link_cmd, backend_libs);
+}
+
 system(link_cmd);
+
+// ── Optional-backend discovery ───────────────────────────────────────────────
+//
+// Probes are plain file reads rather than `system("test -f ...")`: the path is
+// never interpolated into a shell command, so spaces and quoting cannot break
+// detection, and no subprocess is spawned per candidate.
+
+// Non-empty read ⇒ readable regular file. file_read() returns "" when the path
+// is missing or unreadable, so this doubles as an existence check.
+fn file_present(string path) -> int64 {
+    if (str_len(file_read(path)) > 0) { return 1; }
+    return 0;
+}
+
+// First candidate whose `rel` file exists. `""` when none match.
+fn probe_include(string env_name, [string] candidates, int64 n, string rel) -> string {
+    let env = getenv(env_name);
+    if (str_len(env) > 0 && file_present(str_concat(env, str_concat("/", rel))) == 1) {
+        return env;
+    }
+    mut i = 0;
+    while (i < n) {
+        let dir = candidates[i];
+        if (file_present(str_concat(dir, str_concat("/", rel))) == 1) { return dir; }
+        i = i + 1;
+    }
+    return "";
+}
+
+// MLX headers live under <prefix>/mlx/c/, so the include root is the prefix
+// itself (not the mlx/ directory) — `#include "mlx/c/mlx.h"` needs that.
+fn find_mlx_include() -> string {
+    mut c = [""];
+    arr_reset(c);
+    push(c, "/opt/homebrew/include");
+    push(c, "/usr/local/include");
+    return probe_include("IONIC_MLX_INCLUDE", c, 2, "mlx/c/mlx.h");
+}
+
+fn find_mlx_lib() -> string {
+    mut c = [""];
+    arr_reset(c);
+    push(c, "/opt/homebrew/lib");
+    push(c, "/usr/local/lib");
+    return probe_include("IONIC_MLX_LIB", c, 2, "libmlxc.dylib");
+}
+
+fn find_llama_include() -> string {
+    mut c = [""];
+    arr_reset(c);
+    push(c, "/opt/homebrew/include");
+    push(c, "/usr/local/include");
+    return probe_include("IONIC_LLAMA_INCLUDE", c, 2, "llama.h");
+}
+
+// libllama is versioned on some installs (libllama.0.dylib) and unversioned on
+// others, and Homebrew's keg symlinks the unversioned name into /opt/homebrew/lib.
+fn find_llama_lib() -> string {
+    mut c = [""];
+    arr_reset(c);
+    push(c, "/opt/homebrew/lib");
+    push(c, "/usr/local/lib");
+    let env = getenv("IONIC_LLAMA_LIB");
+    if (str_len(env) > 0) {
+        if (file_present(str_concat(env, "/libllama.dylib")) == 1) { return env; }
+        if (file_present(str_concat(env, "/libllama.so")) == 1) { return env; }
+    }
+    mut i = 0;
+    while (i < 2) {
+        let dir = c[i];
+        if (file_present(str_concat(dir, "/libllama.dylib")) == 1) { return dir; }
+        if (file_present(str_concat(dir, "/libllama.so")) == 1) { return dir; }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn find_ort_include() -> string {
+    mut c = [""];
+    arr_reset(c);
+    push(c, "/opt/homebrew/include/onnxruntime");
+    push(c, "/usr/local/include/onnxruntime");
+    return probe_include("IONIC_ORT_INCLUDE", c, 2, "onnxruntime_c_api.h");
+}
+
+fn find_ort_lib() -> string {
+    mut c = [""];
+    arr_reset(c);
+    push(c, "/opt/homebrew/lib");
+    push(c, "/usr/local/lib");
+    return probe_include("IONIC_ORT_LIB", c, 2, "libonnxruntime.dylib");
+}

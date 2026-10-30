@@ -193,6 +193,120 @@ jobs:
           ./ionic_new examples/hw_tag_error.ionic -o /tmp/hw_tag_err 2>&1 \
             | grep -q "CPU-only I/O" || (echo "missing GPU-context diagnostic"; exit 1)
 
+      # ── ML backends: MLX surface + graceful degradation ──────────────────
+      # Two things must hold regardless of what is installed on the runner:
+      #   1. The runtime compiles with and without IONIC_HAVE_MLX.
+      #   2. Both variants export the *same* set of ionic_mlx_* symbols, so an
+      #      Ionic program that mentions mlx_* links on every platform and
+      #      degrades to "not compiled in" at runtime rather than failing to
+      #      link. A missing stub is a link error, hence the parity check.
+      - name: MLX runtime compiles both ways with identical symbol sets
+        run: |
+          clang -c src/ionic_model_runtime.c -o /tmp/rt_stub.o
+          nm -gU /tmp/rt_stub.o | awk '{print $3}' | grep '^_ionic_mlx_' | sort > /tmp/syms_stub.txt
+
+          if [ -f /opt/homebrew/include/mlx/c/mlx.h ] || [ -f /usr/local/include/mlx/c/mlx.h ]; then
+            clang -c src/ionic_model_runtime.c -DIONIC_HAVE_MLX \
+              -I/opt/homebrew/include -I/usr/local/include -o /tmp/rt_mlx.o
+            nm -gU /tmp/rt_mlx.o | awk '{print $3}' | grep '^_ionic_mlx_' | sort > /tmp/syms_mlx.txt
+            if ! diff -u /tmp/syms_mlx.txt /tmp/syms_stub.txt; then
+              echo "MLX stub and real builds export different symbol sets"; exit 1
+            fi
+            echo "MLX available: symbol sets match ($(wc -l < /tmp/syms_mlx.txt | tr -d ' ') symbols)"
+          else
+            echo "mlx-c not installed on this runner; stub-only check"
+          fi
+
+          # The stub must actually link and degrade, not crash.
+          cat > /tmp/mlx_degrade.c <<'EOF'
+          #include <stdio.h>
+          #include <stdint.h>
+          extern int64_t ionic_mlx_available(void);
+          extern void *ionic_mlx_matmul(void*, void*);
+          int main(void) {
+            if (ionic_mlx_available() != 0) return 1;
+            if (ionic_mlx_matmul(0, 0) != 0) return 1;
+            return 0;
+          }
+          EOF
+          clang /tmp/mlx_degrade.c /tmp/rt_stub.o -lm -o /tmp/mlx_degrade
+          /tmp/mlx_degrade 2>/dev/null || (echo "MLX stub did not degrade cleanly"; exit 1)
+
+      # End-to-end: when mlx-c is present, compile and run real GPU math from
+      # Ionic source (through the self-hosted compiler).
+      - name: MLX end-to-end (self-hosted compiler, Apple silicon)
+        run: |
+          if [ ! -f /opt/homebrew/include/mlx/c/mlx.h ]; then
+            echo "mlx-c not installed; skipping end-to-end MLX test"; exit 0
+          fi
+          cat > /tmp/mlx_e2e.ionic <<'EOF'
+          fn main() -> int64 {
+              if (mlx_available() == 0) { println("unavailable"); return 1; }
+              let a = mlx_arange(0.0, 4.0, 1.0, 0);
+              let b = mlx_reshape(a, [2, 2]);
+              let c = mlx_matmul(b, b);
+              let out = mlx_to_array(c);
+              println(float64_to_str(out[0]));
+              println(float64_to_str(out[3]));
+              mlx_free(c); mlx_free(b); mlx_free(a);
+              return 0;
+          }
+          EOF
+          ./ionic_new /tmp/mlx_e2e.ionic -o /tmp/mlx_e2e
+          /tmp/mlx_e2e > /tmp/mlx_e2e.out
+          # [[0,1],[2,3]]^2 = [[2,3],[6,11]]
+          grep -qx "2" /tmp/mlx_e2e.out || (echo "wrong matmul output"; cat /tmp/mlx_e2e.out; exit 1)
+          grep -qx "11" /tmp/mlx_e2e.out || (echo "wrong matmul output"; cat /tmp/mlx_e2e.out; exit 1)
+
+      # Regression guard for the float-argument ABI and for the ops that take a
+      # scalar or an axis. Ionic passes float64 as a bit pattern in a GP
+      # register, so an entry point declared with `double` silently reads the
+      # wrong register and produces garbage (mlx_arange used to fail with
+      # "step must be nonzero"). These values are exact in f32, so equality is
+      # a fair check.
+      - name: MLX scalar-argument and axis ops
+        run: |
+          if [ ! -f /opt/homebrew/include/mlx/c/mlx.h ]; then
+            echo "mlx-c not installed; skipping scalar-argument test"; exit 0
+          fi
+          cat > /tmp/mlx_scalar.ionic <<'EOF'
+          fn main() -> int64 {
+              if (mlx_available() == 0) { println("unavailable"); return 1; }
+              // scalar float args (mlx_full / mlx_arange / mlx_rms_norm)
+              let f = mlx_full([2], 3.5, 0);
+              println(float64_to_str(mlx_item(mlx_slice(f, 1, 2, 0))));
+              println(int64_to_str(mlx_size(mlx_arange(0.0, 6.0, 1.0, 0))));
+              // axis args (mlx_concatenate / mlx_argmax)
+              let a = mlx_reshape(mlx_arange(0.0, 4.0, 1.0, 0), [2, 2]);
+              println(int64_to_str(mlx_dim(mlx_concatenate(a, a, 1), 1)));
+              let m = mlx_reshape(mlx_from_array([1.0, 9.0, 3.0], [3], 0), [1, 3]);
+              println(float64_to_str(mlx_item(mlx_argmax(m, 1, 0))));
+              mlx_free(f); mlx_free(a); mlx_free(m);
+              return 0;
+          }
+          EOF
+          ./ionic_new /tmp/mlx_scalar.ionic -o /tmp/mlx_scalar
+          /tmp/mlx_scalar > /tmp/mlx_scalar.out
+          expect() {
+            grep -qx "$1" /tmp/mlx_scalar.out || {
+              echo "expected '$1' ($2)"; cat /tmp/mlx_scalar.out; exit 1
+            }
+          }
+          expect 3.5 "mlx_full/mlx_slice scalar float arg"
+          expect 6   "mlx_arange float args"
+          expect 4   "mlx_concatenate axis arg (2x2 ++ 2x2 on axis 1)"
+          expect 1   "mlx_argmax + mlx_item dtype dispatch"
+
+      # Backends must be linked only on demand: hello-world must not drag in
+      # mlx/llama/onnx (that would add load + init cost to every binary).
+      - name: Backend linkage is usage-gated
+        run: |
+          ./ionic_new examples/hello.ionic -o /tmp/hello_gate
+          n=$(otool -L /tmp/hello_gate | grep -Eic 'mlx|llama|onnx')
+          if [ "$n" != "0" ]; then
+            echo "hello-world unexpectedly links $n ML libs"; otool -L /tmp/hello_gate; exit 1
+          fi
+
       # ── Tree-sitter grammar ──────────────────────────────────────────────
       # The grammar/queries are derived from the language; make sure the
       # committed parser is in sync with grammar.js and that everything still

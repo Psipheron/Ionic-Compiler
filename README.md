@@ -42,7 +42,7 @@ fib(10) = 55
 - **Standard library** — `std.math`, `std.str`, `std.array`, `std.io`, `std.data`, `std.text`, `std.http` live under `lib/std/`
 - **Web request primitives** — `http_get`, `http_post`, `http_status`, `http_body`, `http_urlencode` (HTTP/1.1 client via raw sockets, no TLS) plus a `std.http` wrapper module
 - **Hardware-aware types & placement tags** — `tensor@cpu` and `tensor@gpu` are distinct types; `@gpu fn` / `@cpu fn` pin code to a device, and the checker enforces the boundary (no accidental cross-device ops, no CPU-only I/O inside GPU code)
-- **Real ML backends** — GGUF models via llama.cpp with Metal GPU; ONNX/CoreML; Piper TTS
+- **Real ML backends** — an MLX tensor runtime for Apple-silicon GPU math (arrays, matmul, softmax, attention/norm/rope kernels, safetensors); GGUF models via llama.cpp with Metal GPU; ONNX/CoreML; Piper TTS. Backends are linked per-program and only when the source references them, so a plain program has no ML dependencies. On platforms without a backend the program still links and reports "not compiled in" at runtime
 - **Human-readable errors** — multi-error reporting, source-line carets, column tracking, panic-mode recovery, enclosing-function context, "did you mean…" suggestions, clickable `path:line:col` jump links, ANSI colors that auto-disable when not a TTY
 - **Optimizer** — a self-hosted optimization pipeline (fold, inline, unroll, const-propagate) that runs on every compilation before codegen
 - **Modern syntax** — compound assignment (`+=`, `-=`, `*=`, `/=`), block comments `/* ... */`, and panic-mode lexer recovery
@@ -181,6 +181,13 @@ own programs.
 let x = 6 * 7;
 println(int64_to_str(x));   // prints 42
 ```
+
+### Documentation
+
+- [docs/language.md](docs/language.md) — full language and builtin reference
+- [docs/guide.md](docs/guide.md) — task-oriented walkthrough (strings, arrays, tensors, ML backends)
+- [docs/memory-model.md](docs/memory-model.md) — ownership, arrays, handles
+- [docs/stdlib.md](docs/stdlib.md) — standard-library modules
 
 ---
 
@@ -454,6 +461,54 @@ if (status(raw) == 200) {
 
 ---
 
+## ML backends
+
+Ionic ships three optional ML backends. Each is linked into a program **only
+when that program's source references it**, so `ionic hello.ionic` stays
+dependency-free:
+
+- source mentions `mlx_*` → links `mlx-c` (Apple silicon / Metal)
+- source mentions `gguf_*` or `load_model` → links llama.cpp (portable path)
+- source mentions `piper_forward` or `model_forward` → links ONNX Runtime
+
+Install what you need (`brew install mlx-c llama.cpp onnxruntime`). A missing
+library is never a build failure: the runtime exports the full symbol set on
+every platform, so a program that uses `mlx_*` still compiles and links
+everywhere — on a platform without MLX it reports `MLX backend not compiled in`
+at runtime. That keeps one source tree portable: MLX for Apple-silicon tensor
+math, GGUF/llama.cpp everywhere else.
+
+```ionic
+fn main() -> int64 {
+    if (mlx_available() == 0) { println("no MLX here"); return 1; }
+
+    let a = mlx_from_array([1.0, 2.0, 3.0, 4.0], [2, 2], 0);  // [[1,2],[3,4]]
+    let c = mlx_matmul(a, a);                                 // [[7,10],[15,22]]
+    let v = mlx_to_array(c);                                  // evaluate + copy out
+    println(float64_to_str(v[0]));                            // 7
+
+    mlx_free(c); mlx_free(a);
+    return 0;
+}
+```
+
+The MLX surface covers construction, elementwise/linalg ops, reductions,
+softmax, reshape/transpose/slice/take, safetensors I/O, and the fused kernels a
+transformer needs (`mlx_sdpa`, `mlx_rms_norm`, `mlx_layer_norm`, `mlx_rope`).
+There is deliberately **no training algorithm** — no optimizer, loss, or
+backward pass. What ships is the set of primitives such a loop is built from, so
+the algorithm belongs in `.ionic` source. Full API: [docs/language.md](docs/language.md#mlx-tensor-backend).
+
+Backend selection can be overridden per compile:
+
+```sh
+IONIC_NO_MLX=1 ionic model.ionic -o model                       # force MLX off
+IONIC_MLX_INCLUDE=/opt/mlx/include IONIC_MLX_LIB=/opt/mlx/lib \
+    ionic model.ionic -o model                                   # custom prefix
+```
+
+---
+
 ## Optimizations
 
 `src/opt/opt.ionic` is a self-hosted, single-pass optimizer that runs on every
@@ -504,8 +559,9 @@ src/
   diagnostics.ionic  Error reporting with ANSI colors, jump links, did-you-mean
   codegen.rs       Rust LLVM backend (cross-OS bootstrap)
   lexer.rs / parser.rs / ast.rs / semantic.rs / imports.rs / resolve.rs / main.rs  Rust frontend
-  ionic_model_runtime.c   Native runtime: I/O, arrays, strings, math, ML, llama.cpp
+  ionic_model_runtime.c   Native runtime: I/O, arrays, strings, math, ML backends (MLX, llama.cpp, ONNX)
 build.sh           Build script (--verify-self-hosting for regression check)
+docs/              Language reference, guide, memory model, stdlib
 ionic_new          Primary compiler binary (self-hosted)
 ionic_self         Previous-generation compiler (used to build ionic_new)
 tree-sitter-ionic/ Tree-sitter grammar + highlight queries for editors

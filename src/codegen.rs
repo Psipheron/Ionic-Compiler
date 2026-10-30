@@ -14,6 +14,9 @@ pub struct Codegen {
     str_lits: Vec<(String, usize)>,                 // (escaped, raw_byte_count)
     vars: Vec<HashMap<String, (String, Type)>>,     // name -> (alloca_ptr, type)
     fns: HashMap<String, (Vec<Type>, Type)>,
+    /// Built-in signatures (currently the MLX surface). Shared with the checker
+    /// via `semantic::mlx_builtins` so both phases agree on return types.
+    builtins: HashMap<String, (Vec<Type>, Type)>,
     structs: HashMap<String, StructLayout>,
     current_fn_ret: Type,
     label: usize,
@@ -33,6 +36,7 @@ impl Codegen {
             str_lits: Vec::new(),
             vars: vec![HashMap::new()],
             fns: HashMap::new(),
+            builtins: HashMap::new(),
             structs: HashMap::new(),
             current_fn_ret: Type::Void,
             label: 0,
@@ -172,6 +176,8 @@ impl Codegen {
             self.structs.insert(s.name.clone(), StructLayout { fields });
         }
 
+        crate::semantic::mlx_builtins(&mut self.builtins);
+
         // Register function signatures
         for f in &program.fns {
             let pt: Vec<Type> = f.params.iter().map(|p| p.ty.to_type()).collect();
@@ -226,6 +232,35 @@ impl Codegen {
         self.emit("declare void @ionic_gguf_set_temp(ptr, double)");
         self.emit("declare void @ionic_gguf_set_top_p(ptr, double)");
         self.emit("declare ptr  @ionic_fgets_stdin(ptr, i32)");
+        // MLX backend declarations, derived from the shared signature table so
+        // a builtin added there is declared here automatically.
+        let mut mlx_decls: Vec<String> = Vec::new();
+        let mut mlx_names: Vec<String> = self.builtins.keys().cloned().collect();
+        mlx_names.sort();
+        for name in &mlx_names {
+            let (params, ret) = &self.builtins[name];
+            // `mlx_last_error` returns ptr, and a float64 return is actually an
+            // i64 bit pattern that the caller bitcasts back to double.
+            let lret = match ret {
+                Type::Void => "void",
+                Type::Str => "ptr",
+                _ => "i64",
+            };
+            let plist: Vec<&str> = params.iter().map(|p| match p {
+                // float64 crosses the FFI boundary as an IEEE-754 bit pattern in
+                // a GP register (see the same note in ionic_model_runtime.c), so
+                // the declaration must say i64, not double. Declaring `double`
+                // would place the value in a D register while the C side reads
+                // X — the call succeeds and silently returns garbage.
+                Type::Float64 => "i64",
+                Type::Str | Type::Array(_) | Type::Tensor(_) | Type::Model(_) => "ptr",
+                _ => "i64",
+            }).collect();
+            mlx_decls.push(format!("declare {} @ionic_{}({})", lret, name, plist.join(", ")));
+        }
+        for d in &mlx_decls {
+            self.emit(d);
+        }
         self.emit("declare i64  @ionic_file_write_binary(ptr, ptr)");
         self.emit("declare i64  @ionic_arr_reset(ptr)");
         self.emit("declare i64  @str_to_float64_bits(ptr)");  // float literal parser helper
@@ -1200,6 +1235,64 @@ impl Codegen {
                 let (top_p, _) = &args[1];
                 self.emit(&format!("  call void @ionic_gguf_set_top_p(ptr {}, double {})", mdl, top_p));
                 ("0".to_string(), Type::Void)
+            }
+
+            // ── MLX tensor backend ────────────────────────────────────────────
+            // Every mlx_* entry point takes only i64/ptr and returns i64/ptr,
+            // so a single data-driven arm covers the whole surface. The return
+            // type comes from the signature table (src/semantic.rs) rather than
+            // a second hard-coded list, so adding a builtin there is enough to
+            // make it callable here too.
+            //
+            // float64 crosses this boundary as an IEEE-754 *bit pattern* in an
+            // i64 register, matching the native ARM64 codegen and the C
+            // runtime's i642d()/d2i64() helpers. Emitting `double` instead
+            // would put the value in a D register while the callee reads X —
+            // the call returns garbage rather than failing, so the bitcast is
+            // mandatory in both directions.
+            name if name.starts_with("mlx_") => {
+                // Signatures live in one place: semantic::mlx_builtins(). Both
+                // this arm and the checker read that table, so a builtin cannot
+                // be typed in one phase and unknown in the other.
+                let ret_ty = self.builtins.get(name)
+                    .map(|(_, r)| r.clone())
+                    .unwrap_or(Type::Int64);
+                let ret_is_void = ret_ty == Type::Void;
+                let callee = format!("ionic_{}", name);
+
+                let mut args_ir: Vec<String> = Vec::new();
+                for (v, t) in args {
+                    if *t == Type::Float64 {
+                        // double -> i64 bit pattern
+                        let bits = self.fresh_reg();
+                        self.emit(&format!("  {} = bitcast double {} to i64", bits, v));
+                        args_ir.push(format!("i64 {}", bits));
+                    } else {
+                        let llty = match t {
+                            Type::Str | Type::Array(_) | Type::Tensor(_) | Type::Model(_) => "ptr",
+                            _ => "i64",
+                        };
+                        args_ir.push(format!("{} {}", llty, v));
+                    }
+                }
+
+                if ret_is_void {
+                    self.emit(&format!("  call void @{}({})", callee, args_ir.join(", ")));
+                    ("0".to_string(), Type::Void)
+                } else if ret_ty == Type::Float64 {
+                    // i64 bit pattern -> double, so the rest of codegen sees a
+                    // normal float value.
+                    let raw = self.fresh_reg();
+                    self.emit(&format!("  {} = call i64 @{}({})", raw, callee, args_ir.join(", ")));
+                    let r = self.fresh_reg();
+                    self.emit(&format!("  {} = bitcast i64 {} to double", r, raw));
+                    (r, ret_ty)
+                } else {
+                    let llret = Self::llvm_ty(&ret_ty).to_string();
+                    let r = self.fresh_reg();
+                    self.emit(&format!("  {} = call {} @{}({})", r, llret, callee, args_ir.join(", ")));
+                    (r, ret_ty)
+                }
             }
             "fgets_stdin" => {
                 let (max_bytes, _) = &args[0];

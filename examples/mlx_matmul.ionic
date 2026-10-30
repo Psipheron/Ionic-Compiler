@@ -1,0 +1,61 @@
+// MLX backend — GPU array math on Apple silicon.
+//
+// Compile: ./ionic_new examples/mlx_matmul.ionic -o mlx_matmul && ./mlx_matmul
+//
+// `mlx_*` builtins link mlx-c only when the source mentions them, so this file
+// is the only reason a program would depend on MLX. On Linux / Intel the same
+// source still compiles and links; mlx_available() then returns 0 and the
+// runtime reports "MLX backend not compiled in".
+
+fn print_matrix(tensor t, int64 rows, int64 cols) {
+    let v = mlx_to_array(t);              // evaluates the lazy graph
+    mut r = 0;
+    while (r < rows) {
+        mut line = "";
+        mut c = 0;
+        while (c < cols) {
+            if (c > 0) { line = str_concat(line, " "); }
+            line = str_concat(line, float64_to_str(v[r * cols + c]));
+            c += 1;
+        }
+        println(line);
+        r += 1;
+    }
+}
+
+fn main() -> int64 {
+    if (mlx_available() == 0) {
+        println("MLX backend not compiled in on this platform");
+        return 1;
+    }
+
+    // A = [[1,2],[3,4]] built from a flat row-major array.
+    let a = mlx_from_array([1.0, 2.0, 3.0, 4.0], [2, 2], 0);
+    let b = mlx_reshape(mlx_arange(0.0, 4.0, 1.0, 0), [2, 2]);   // [[0,1],[2,3]]
+
+    // Ops build a graph; nothing runs until something is evaluated.
+    let c = mlx_matmul(a, b);             // [[4,7],[8,15]]
+    print_matrix(c, 2, 2);
+
+    // Softmax over the last axis: each row sums to 1.
+    let sm = mlx_softmax(a, -1);
+    let row_sums = mlx_sum(sm, 1);        // keepdims
+    println(str_concat("softmax row sums: ", float64_to_str(mlx_item(mlx_sum(row_sums, 0)))));
+
+    // Elementwise + reduction.
+    let sq = mlx_square(a);
+    println(str_concat("sum of squares: ", float64_to_str(mlx_item(mlx_sum(sq, 0)))));
+
+    // Fused norm kernel, used as a transformer building block.
+    let w = mlx_ones([2], 0);
+    let normed = mlx_rms_norm(a, w, 0.00001);
+    println(str_concat("rms_norm ndim: ", int64_to_str(mlx_ndim(normed))));
+
+    println(str_concat("peak memory (bytes): ", int64_to_str(mlx_peak_memory())));
+
+    // Handles are not RAII-freed.
+    mlx_free(normed); mlx_free(w);
+    mlx_free(sq); mlx_free(row_sums); mlx_free(sm);
+    mlx_free(c); mlx_free(b); mlx_free(a);
+    return 0;
+}

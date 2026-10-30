@@ -43,11 +43,27 @@ class Ionic < Formula
       into libexec/. It resolves its own assets regardless of the current
       working directory, so you can compile from anywhere.
 
-      For ONNX model inference, install ONNX Runtime:
-        brew install onnxruntime
+      ML backends are optional and are linked into the programs you compile,
+      not into `ionic` itself. Install whichever you need:
 
-      For GGUF / LLM inference, install llama.cpp:
-        brew install llama.cpp
+        brew install mlx-c        # Apple-silicon GPU tensor runtime (mlx_* builtins)
+        brew install llama.cpp    # GGUF / LLM inference (gguf_* builtins)
+        brew install onnxruntime  # ONNX inference + Piper TTS (piper_forward)
+
+      Backends are linked only when a program actually references them, so a
+      plain `ionic hello.ionic` stays dependency-free.
+
+      MLX needs Apple silicon and Metal; it is unavailable on Intel Macs and on
+      Linux, where GGUF/llama.cpp is the portable path. On those platforms
+      `mlx_*` programs still compile and link, and report "MLX backend not
+      compiled in" at runtime.
+
+      Overrides, for a non-Homebrew prefix:
+        IONIC_MLX_INCLUDE=/opt/mlx/include IONIC_MLX_LIB=/opt/mlx/lib \
+            ionic model.ionic -o model
+
+      To force a backend off (e.g. a half-installed mlx-c would fail to link):
+        IONIC_NO_MLX=1 ionic model.ionic -o model
     EOS
   end
 
@@ -58,6 +74,20 @@ class Ionic < Formula
         return 0;
       }
     EOF
+    # The MLX surface must at least link on every platform: on Apple silicon it
+    # runs, elsewhere it degrades to "not compiled in". Either way the compiled
+    # program must build and exit 0.
+    (testpath/"mlx_smoke.ionic").write <<~EOF
+      fn main() -> int64 {
+        if (mlx_available() == 0) { return 0; }
+        let a = mlx_zeros([2, 2], 0);
+        mlx_free(a);
+        return 0;
+      }
+    EOF
+    system bin/"ionic", "mlx_smoke.ionic", "-o", testpath/"mlx_smoke"
+    system testpath/"mlx_smoke"
+
     # Run from the throwaway test dir (not the repo) so the repo-relative
     # fallback for lib/ and src/ionic_model_runtime.c cannot mask a broken
     # $IONIC_ROOT layout.

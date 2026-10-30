@@ -20,6 +20,97 @@ pub struct SemanticAnalyzer {
     errors: Vec<String>,
 }
 
+
+/// Signatures for the MLX tensor backend.
+///
+/// Kept as one table that both the checker and the LLVM codegen consult, so a
+/// builtin cannot exist in one compiler phase but not the other. Handles are
+/// `tensor@cpu`: a host-side handle to a lazily-built device graph. Typing them
+/// `tensor@gpu` would make every use outside `gpu { }` a type error.
+pub fn mlx_builtins(m: &mut HashMap<String, (Vec<Type>, Type)>) {
+    // NOTE: codegen emits LLVM `declare` lines by walking this same map, so
+    // every entry here is automatically linkable from generated IR.
+    // ── MLX tensor backend ────────────────────────────────────────────────
+    // Mirrors register_builtins() in src/semantic/checker.ionic. Handles are
+    // `tensor@cpu`: a host-side handle to a lazily-built device graph. Typing
+    // them `tensor@gpu` would make every use outside `gpu { }` a type error.
+    #[allow(unused)]
+    let f   = Type::Float64;
+    let t   = || Type::Tensor(Box::new(HwTarget::Cpu));
+    let i   = Type::Int64;
+    let a   = Type::Array(Box::new(Type::Int64));
+    let af  = Type::Array(Box::new(Type::Float64));
+    let s_  = Type::Str;
+
+    // Construction (shape arg is an [int64] array; dtype is an int)
+    m.insert("mlx_zeros".to_string(), (vec![a.clone(), i.clone()], t()));
+    m.insert("mlx_ones".to_string(),  (vec![a.clone(), i.clone()], t()));
+    // dtype cast / keepdims reductions / axis-wise softmax
+    for name in ["mlx_astype", "mlx_softmax", "mlx_log_softmax"] {
+        m.insert(name.to_string(), (vec![t(), i.clone()], t()));
+    }
+    for name in ["mlx_sum", "mlx_mean", "mlx_max", "mlx_min"] {
+        m.insert(name.to_string(), (vec![t(), i.clone()], t()));
+    }
+    for name in ["mlx_add", "mlx_subtract", "mlx_multiply", "mlx_divide",
+                 "mlx_power", "mlx_maximum", "mlx_minimum", "mlx_matmul"] {
+        m.insert(name.to_string(), (vec![t(), t()], t()));
+    }
+    for name in ["mlx_negative", "mlx_square", "mlx_sqrt", "mlx_exp",
+                 "mlx_log", "mlx_abs", "mlx_tanh", "mlx_erf", "mlx_contiguous"] {
+        m.insert(name.to_string(), (vec![t()], t()));
+    }
+    m.insert("mlx_full".to_string(),    (vec![a.clone(), f.clone(), i.clone()], t()));
+    m.insert("mlx_arange".to_string(),  (vec![f.clone(), f.clone(), f.clone(), i.clone()], t()));
+    m.insert("mlx_eye".to_string(),     (vec![i.clone(), i.clone(), i.clone()], t()));
+    m.insert("mlx_random_normal".to_string(),  (vec![a.clone(), f.clone(), f.clone(), i.clone()], t()));
+    m.insert("mlx_random_uniform".to_string(), (vec![a.clone(), f.clone(), f.clone(), i.clone()], t()));
+    m.insert("mlx_from_array".to_string(), (vec![af.clone(), a.clone(), i.clone()], t()));
+    // Shape manipulation: (tensor, [int64] axes/shape) -> tensor
+    m.insert("mlx_reshape".to_string(),   (vec![t(), a.clone()], t()));
+    m.insert("mlx_transpose".to_string(), (vec![t(), a.clone()], t()));
+    // Lifetime / materialisation
+    m.insert("mlx_free".to_string(),   (vec![t()], Type::Void));
+    m.insert("mlx_eval".to_string(),   (vec![t()], i.clone()));
+    m.insert("mlx_item".to_string(),   (vec![t()], f.clone()));
+    m.insert("mlx_to_array".to_string(), (vec![t()], af.clone()));
+    m.insert("mlx_shape".to_string(),  (vec![t()], a.clone()));
+    // Inspection
+    for name in ["mlx_ndim", "mlx_size", "mlx_dtype"] {
+        m.insert(name.to_string(), (vec![t()], i.clone()));
+    }
+    m.insert("mlx_dim".to_string(), (vec![t(), i.clone()], i.clone()));
+    // Axis reductions
+    for name in ["mlx_sum_axis", "mlx_mean_axis", "mlx_argmax"] {
+        m.insert(name.to_string(), (vec![t(), i.clone(), i.clone()], t()));
+    }
+    // Slicing / gather
+    m.insert("mlx_slice".to_string(),       (vec![t(), i.clone(), i.clone(), i.clone()], t()));
+    m.insert("mlx_take".to_string(),        (vec![t(), a.clone(), i.clone()], t()));
+    m.insert("mlx_concatenate".to_string(), (vec![t(), t(), i.clone()], t()));
+    // NN primitives
+    m.insert("mlx_sdpa".to_string(),       (vec![t(), t(), t(), f.clone(), i.clone()], t()));
+    m.insert("mlx_rms_norm".to_string(),   (vec![t(), t(), f.clone()], t()));
+    m.insert("mlx_layer_norm".to_string(), (vec![t(), t(), t(), f.clone()], t()));
+    m.insert("mlx_rope".to_string(),       (vec![t(), i.clone(), f.clone(), i.clone(), i.clone()], t()));
+    // Diagnostics / memory
+    for name in ["mlx_available", "mlx_metal_available", "mlx_clear_error",
+                 "mlx_active_memory", "mlx_peak_memory", "mlx_reset_peak_memory",
+                 "mlx_clear_cache"] {
+        m.insert(name.to_string(), (vec![], i.clone()));
+    }
+    m.insert("mlx_set_memory_limit".to_string(), (vec![i.clone()], i.clone()));
+    m.insert("mlx_last_error".to_string(), (vec![], s_.clone()));
+    // Safetensors (weight handles are plain int64 — they are not tensors)
+    m.insert("mlx_load_safetensors".to_string(), (vec![s_.clone()], i.clone()));
+    m.insert("mlx_weights_free".to_string(),     (vec![i.clone()], Type::Void));
+    m.insert("mlx_weights_count".to_string(),    (vec![i.clone()], i.clone()));
+    m.insert("mlx_weights_at".to_string(),       (vec![i.clone(), i.clone()], t()));
+    m.insert("mlx_weights_key_at".to_string(),   (vec![i.clone(), i.clone()], s_.clone()));
+    m.insert("mlx_weights_get".to_string(),      (vec![i.clone(), s_.clone()], t()));
+    m.insert("mlx_save_safetensors".to_string(), (vec![t(), s_.clone(), s_.clone()], i.clone()));
+}
+
 impl SemanticAnalyzer {
     pub fn new() -> Self {
         let mut sa = SemanticAnalyzer {
@@ -79,6 +170,8 @@ impl SemanticAnalyzer {
             (vec![Type::Model(Box::new(HwTarget::Cpu)), Type::Float64], Type::Void));
         sa.functions.insert("gguf_set_top_p".to_string(),
             (vec![Type::Model(Box::new(HwTarget::Cpu)), Type::Float64], Type::Void));
+
+        mlx_builtins(&mut sa.functions);
         // File I/O builtins
         sa.functions.insert("file_read".to_string(),  (vec![Type::Str], Type::Str));
         sa.functions.insert("file_write".to_string(), (vec![Type::Str, Type::Str], Type::Bool));

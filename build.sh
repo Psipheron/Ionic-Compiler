@@ -34,6 +34,25 @@ set -e
 IONIC="${IONIC:-./ionic_self}"
 OUT="${OUT:-ionic_new}"
 
+# ── Optional ML backends ────────────────────────────────────────────────────
+# The compiler binary itself never links ML libraries — those are linked into
+# the *programs* it produces, and only when a program's source references them
+# (see the usage gate in src/main.ionic). So there is nothing to configure here
+# for a normal build.
+#
+# What you may want on a machine with a half-installed mlx-c is to force the
+# backend off when compiling a program:
+#
+#   IONIC_NO_MLX=1 ./ionic_new model.ionic -o model
+#
+# or point at a non-Homebrew prefix:
+#
+#   IONIC_MLX_INCLUDE=/opt/mlx/include IONIC_MLX_LIB=/opt/mlx/lib \
+#       ./ionic_new model.ionic -o model
+#
+# The same IONIC_MLX_* / IONIC_LLAMA_* / IONIC_ORT_* overrides are honoured by
+# the Rust bootstrap in src/main.rs.
+
 # Single entry point. Its `import "..."` statements pull in the rest of the
 # tree (resolved relative to src/) and splice the modules in dependency order,
 # so the source order lives in the code instead of here in the build script.
