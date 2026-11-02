@@ -126,8 +126,29 @@ impl Codegen {
 
     // ── Global variable type inference ───────────────────────────────────────
     // Returns (llvm_ty_str, zero_init_str, ast_Type) for a top-level variable.
+    //
+    // The final `_` arm returns `ptr`, so any initializer this match does not
+    // recognise is declared as an LLVM *pointer*. `mut x = -1` is a
+    // UnOp(Neg, IntLit), not an IntLit, so it became `ptr` — and every later
+    // `x >= 0` then emitted `icmp sge ptr %r1, 0`, which is not valid IR. The
+    // whole module failed with "integer constant must have integer type",
+    // reported at the comparison rather than at the declaration. That is what
+    // stopped the Rust backend from compiling the self-hosted sources
+    // (`mut cur_ret_slot = -1` in src/codegen/native.ionic).
+    //
+    // Stripping unary operators before matching covers the constant expressions
+    // that appear here. Anything still unrecognised keeps the old `ptr`
+    // default, which is what every non-numeric global relies on.
     fn infer_global_ty(init: &Expr) -> (&'static str, String, Type) {
-        match init {
+        // Peel operators that preserve both the value's type and its constness.
+        fn strip(init: &Expr) -> &Expr {
+            match init {
+                Expr::UnOp { op: UnOp::Neg | UnOp::BitNot, expr } => strip(expr),
+                other => other,
+            }
+        }
+
+        match strip(init) {
             Expr::IntLit(n)   => ("i64",  n.to_string(),    Type::Int64),
             Expr::BoolLit(b)  => ("i64",  if *b {"1"} else {"0"}.to_string(), Type::Int64),
             Expr::FloatLit(f) => ("double", format!("{:.17e}", f), Type::Float64),
@@ -262,6 +283,7 @@ impl Codegen {
             self.emit(d);
         }
         self.emit("declare i64  @ionic_file_write_binary(ptr, ptr)");
+        self.emit("declare i64  @ionic_file_size(ptr)");
         self.emit("declare i64  @ionic_arr_reset(ptr)");
         self.emit("declare i64  @str_to_float64_bits(ptr)");  // float literal parser helper
         // IEEE-754 bit-pattern float helpers (used by the self-hosted optimizer
@@ -1329,6 +1351,17 @@ impl Codegen {
                 self.emit(&format!("  call i32 @fputs(ptr {}, ptr {})", content, fp));
                 self.emit(&format!("  call i32 @fclose(ptr {})", fp));
                 ("1".to_string(), Type::Int64)
+            }
+            // Byte length of a regular file, or -1 when missing / not a regular
+            // file. The native backend maps this to ionic_file_size; without it
+            // here the call fell through to the generic arm and referenced an
+            // undefined `@file_size`, which stopped the Rust bootstrap from
+            // compiling the self-hosted sources (backend probing uses it).
+            "file_size" => {
+                let (path, _) = &args[0];
+                let r = self.fresh_reg();
+                self.emit(&format!("  {} = call i64 @ionic_file_size(ptr {})", r, path));
+                (r, Type::Int64)
             }
             "file_open_read" => {
                 let (path, _) = &args[0];

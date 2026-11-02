@@ -130,7 +130,21 @@ fn main() {
     let mlx_lib = if uses_mlx && mlx_allowed { mlx_lib_path() } else { None };
     let has_mlx = mlx_inc.is_some() && mlx_lib.is_some();
 
-    let has_runtime = if let Some(ref rc) = runtime_c {
+    // The runtime is mandatory: every generated module defines a `main` that
+    // calls ionic_runtime_init, and the runtime also supplies the string/array
+    // helpers, `str_to_float64_bits` for float literals, and every builtin.
+    // Linking without it can only fail, so say what is actually wrong.
+    let rc_path = match runtime_c {
+        Some(p) => p,
+        None => die(
+            "Cannot find ionic_model_runtime.c.\n\
+             \x20 Looked in IONIC_ROOT, beside the compiler binary, each ancestor of it,\n\
+             \x20 and the current directory. Set IONIC_ROOT to the directory containing\n\
+             \x20 it and re-run."),
+    };
+
+    let has_runtime = {
+        let rc = &rc_path;
         let mut compile_args: Vec<String> = vec![
             "-c".to_string(), rc.clone(), "-o".to_string(), runtime_obj.to_string(),
         ];
@@ -156,9 +170,10 @@ fn main() {
             .args(&compile_args)
             .status()
             .unwrap_or_else(|e| die(&format!("Cannot compile model runtime ({}): {}", rc, e)));
-        st.success()
-    } else {
-        false
+        if !st.success() {
+            die(&format!("[Link Error] compiling the model runtime failed: {}", rc));
+        }
+        true
     };
 
     let mut clang_args: Vec<String> = vec![
@@ -201,13 +216,22 @@ fn main() {
     }
 
     if flags.run {
-        let status = Command::new(format!("./{}", out_bin))
+        // Run the path we were given. Prefixing "./" unconditionally broke
+        // `-o /tmp/x`, which became ".//tmp/x" and could not be executed; a
+        // bare name like "x" still needs the prefix to mean "in the cwd"
+        // rather than "somewhere on PATH".
+        let exe = if Path::new(&out_bin).is_absolute() || out_bin.contains('/') {
+            out_bin.clone()
+        } else {
+            format!("./{}", out_bin)
+        };
+        let status = Command::new(&exe)
             .status()
-            .unwrap_or_else(|e| die(&format!("Cannot run binary: {}", e)));
+            .unwrap_or_else(|e| die(&format!("Cannot run binary '{}': {}", exe, e)));
         std::process::exit(status.code().unwrap_or(0));
     }
 
-    eprintln!("Compiled: {} -> ./{}", source_path, out_bin);
+    eprintln!("Compiled: {} -> {}", source_path, out_bin);
 }
 
 struct Flags {
@@ -264,21 +288,53 @@ fn parse_args(args: &[String]) -> (String, Flags) {
     (source, flags)
 }
 
-/// Find ionic_model_runtime.c relative to the compiler binary or source tree.
+/// Find ionic_model_runtime.c relative to the compiler binary.
+///
+/// The runtime is not optional: the generated `main` wrapper always calls
+/// `ionic_runtime_init`. Resolving it relative to the *current working
+/// directory* was the real problem — `target/release/ionic` has no runtime
+/// beside it (it sits two directories below the repo root), so every
+/// invocation from anywhere except the repo root silently dropped the
+/// runtime from the link and produced
+/// `ld: symbol(s) not found: _ionic_runtime_init`, which looks like a code
+/// generator bug rather than a missing file. Walking the executable's
+/// ancestors finds the source checkout regardless of CWD.
 fn runtime_c_path() -> Option<String> {
-    // 1. Next to the compiler binary
-    if let Ok(exe) = std::env::current_exe() {
-        let candidate = exe.parent()?.join("ionic_model_runtime.c");
-        if candidate.exists() {
-            return Some(candidate.to_string_lossy().into_owned());
+    /// `<dir>/ionic_model_runtime.c` (installed layout: runtime beside the
+    /// binary) and `<dir>/src/ionic_model_runtime.c` (source checkout: runtime
+    /// in `src/`, binary in `target/<profile>/`).
+    fn probe(dir: &Path) -> Option<String> {
+        for rel in ["ionic_model_runtime.c", "src/ionic_model_runtime.c"] {
+            let candidate = dir.join(rel);
+            if candidate.is_file() {
+                return Some(candidate.to_string_lossy().into_owned());
+            }
+        }
+        None
+    }
+
+    // 1. IONIC_ROOT, matching the native compiler's override.
+    if let Ok(root) = std::env::var("IONIC_ROOT") {
+        if !root.is_empty() {
+            if let Some(p) = probe(Path::new(&root)) {
+                return Some(p);
+            }
         }
     }
-    // 2. In the source tree (dev mode)
-    let candidate = Path::new("src/ionic_model_runtime.c");
-    if candidate.exists() {
-        return Some(candidate.to_string_lossy().into_owned());
+
+    // 2. The executable's own directory, then each ancestor.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe) = exe.canonicalize().ok().as_deref() {
+            for dir in exe.ancestors().skip(1) {
+                if let Some(p) = probe(dir) {
+                    return Some(p);
+                }
+            }
+        }
     }
-    None
+
+    // 3. The working directory, last.
+    probe(Path::new("."))
 }
 
 fn find_clang() -> String {
