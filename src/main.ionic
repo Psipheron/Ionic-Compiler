@@ -175,7 +175,27 @@ if (str_len(backend_libs) > 0) {
     link_cmd = str_concat(link_cmd, backend_libs);
 }
 
-system(link_cmd);
+// Propagate the linker's exit status.
+//
+// `system()` returns the wait status from waitpid(2), not the child's exit
+// code: a normal exit is `code << 8`, so exit 1 arrives here as 256, and a
+// signal death is the raw signal number in the low bits. Discarding that value
+// made a failed link indistinguishable from a successful one — clang printed
+// the real diagnosis to stderr and the compiler still exited 0, so
+// `./ionic foo.ionic -o /typo/x` (a missing library, a full disk) looked like a
+// successful build to every script and CI step checking the exit code.
+let link_status = system(link_cmd);
+if (link_status != 0) {
+    mut link_detail = "killed by signal";
+    if ((link_status & 127) == 0) {
+        // Normal exit: recover the child's own code from the high byte.
+        link_detail = str_concat("exit ", int64_to_str(link_status >> 8));
+    }
+    println(str_concat("ionic: link failed (", str_concat(link_detail, ")")));
+    println(str_concat("  command: ", link_cmd));
+    println("  Add --print-link to see the command without running it.");
+    exit(1);
+}
 
 // ── Optional-backend discovery ───────────────────────────────────────────────
 //
