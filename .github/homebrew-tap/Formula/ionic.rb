@@ -47,16 +47,15 @@ class Ionic < Formula
       not into `ionic` itself. Install whichever you need:
 
         brew install mlx-c        # Apple-silicon GPU tensor runtime (mlx_* builtins)
-        brew install llama.cpp    # GGUF / LLM inference (gguf_* builtins)
         brew install onnxruntime  # ONNX inference + Piper TTS (piper_forward)
 
       Backends are linked only when a program actually references them, so a
       plain `ionic hello.ionic` stays dependency-free.
 
       MLX needs Apple silicon and Metal; it is unavailable on Intel Macs and on
-      Linux, where GGUF/llama.cpp is the portable path. On those platforms
-      `mlx_*` programs still compile and link, and report "MLX backend not
-      compiled in" at runtime.
+      Linux. On those platforms `mlx_*` programs still compile and link, and
+      report "MLX backend not compiled in" at runtime. ONNX Runtime is the only
+      model-file backend on every target.
 
       Overrides, for a non-Homebrew prefix:
         IONIC_MLX_INCLUDE=/opt/mlx/include IONIC_MLX_LIB=/opt/mlx/lib \

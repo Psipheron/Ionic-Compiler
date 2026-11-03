@@ -111,6 +111,62 @@ pub fn mlx_builtins(m: &mut HashMap<String, (Vec<Type>, Type)>) {
     m.insert("mlx_save_safetensors".to_string(), (vec![t(), s_.clone(), s_.clone()], i.clone()));
 }
 
+/// Signatures for the non-MLX runtime surface: HTTP client/server, BPE
+/// tokenizer, and the TUI primitives.
+///
+/// Same contract as `mlx_builtins`: one table, read by both the checker and
+/// codegen, so the two phases cannot disagree. These all live in
+/// src/ionic_model_runtime.c and map to `ionic_*` symbols.
+///
+/// Getting the *return* type right is not cosmetic here. An unregistered name
+/// infers as `Type::Unknown`, and codegen's `print` path treats Unknown as an
+/// i64 — so `print(bpe_decode(ids))` would emit `printf("%lld", ptr)` and fail
+/// the LLVM verifier. Registering the string returns fixes that at the source.
+pub fn runtime_builtins(m: &mut HashMap<String, (Vec<Type>, Type)>) {
+    let i  = Type::Int64;
+    let s_ = Type::Str;
+    let a  = Type::Array(Box::new(Type::Int64));
+
+    // ── HTTP client (returns the raw response, headers + body) ───────────────
+    for name in ["http_get", "http_body"] {
+        m.insert(name.to_string(), (vec![s_.clone()], s_.clone()));
+    }
+    m.insert("http_post".to_string(),     (vec![s_.clone(), s_.clone()], s_.clone()));
+    m.insert("http_status".to_string(),   (vec![s_.clone()], i.clone()));
+    m.insert("http_urlencode".to_string(),(vec![s_.clone()], s_.clone()));
+
+    // ── BPE tokenizer ────────────────────────────────────────────────────────
+    m.insert("bpe_load".to_string(),   (vec![s_.clone()], i.clone()));
+    m.insert("bpe_encode".to_string(), (vec![s_.clone(), a.clone(), i.clone()], i.clone()));
+    m.insert("bpe_decode".to_string(), (vec![a.clone()], s_.clone()));
+    for name in ["bpe_bos", "bpe_eos"] {
+        m.insert(name.to_string(), (vec![], i.clone()));
+    }
+    m.insert("arr_push_i64".to_string(), (vec![a.clone(), i.clone()], i.clone()));
+
+    // ── HTTP server ──────────────────────────────────────────────────────────
+    // A request is an opaque int64 handle that owns its connection: `accept`
+    // returns it, and `respond`/`req_done` take that same handle back.
+    m.insert("http_serve".to_string(),    (vec![i.clone()], i.clone()));
+    m.insert("http_accept".to_string(),   (vec![i.clone()], i.clone()));
+    for name in ["http_method", "http_path", "http_req_body"] {
+        m.insert(name.to_string(), (vec![i.clone()], s_.clone()));
+    }
+    m.insert("http_respond".to_string(),
+        (vec![i.clone(), i.clone(), s_.clone(), s_.clone()], i.clone()));
+    for name in ["http_req_done", "http_close"] {
+        m.insert(name.to_string(), (vec![i.clone()], i.clone()));
+    }
+
+    // ── Terminal / TUI ────────────────────────────────────────────────────────
+    for name in ["term_enter", "term_exit", "term_flush", "term_size", "term_key"] {
+        m.insert(name.to_string(), (vec![], i.clone()));
+    }
+    // term_write takes the string to emit; term_poll takes a millisecond timeout.
+    m.insert("term_write".to_string(), (vec![s_.clone()], i.clone()));
+    m.insert("term_poll".to_string(),  (vec![i.clone()],   i.clone()));
+}
+
 impl SemanticAnalyzer {
     pub fn new() -> Self {
         let mut sa = SemanticAnalyzer {
@@ -164,14 +220,9 @@ impl SemanticAnalyzer {
             (vec![Type::Array(Box::new(Type::Int64)), Type::Str], Type::Int64));
         sa.functions.insert("arr_reset".to_string(),
             (vec![Type::Array(Box::new(Type::Int64))], Type::Int64));
-        sa.functions.insert("gguf_generate".to_string(),
-            (vec![Type::Model(Box::new(HwTarget::Cpu)), Type::Str, Type::Int64], Type::Str));
-        sa.functions.insert("gguf_set_temp".to_string(),
-            (vec![Type::Model(Box::new(HwTarget::Cpu)), Type::Float64], Type::Void));
-        sa.functions.insert("gguf_set_top_p".to_string(),
-            (vec![Type::Model(Box::new(HwTarget::Cpu)), Type::Float64], Type::Void));
 
         mlx_builtins(&mut sa.functions);
+        runtime_builtins(&mut sa.functions);
         // File I/O builtins
         sa.functions.insert("file_read".to_string(),  (vec![Type::Str], Type::Str));
         sa.functions.insert("file_write".to_string(), (vec![Type::Str, Type::Str], Type::Bool));

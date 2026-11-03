@@ -602,6 +602,9 @@ fn local_reset() -> int64 {
     n_csr = 0;
     csr_base_slot = 0;
     spill_base = 0;
+    // Cleared here and re-established by ncg_fn_node; ncg_main_wrapper has no
+    // exit block, so it must not inherit the previous function's slot.
+    cur_ret_slot = -1;
     return 0;
 }
 
@@ -726,7 +729,16 @@ fn local_set_model(string name, int64 v) -> int64 {
 }
 
 // Free any model-owning locals still live at scope exit (RAII destructor).
+//
+// The handle is passed in X0 and the call clobbers every caller-saved register,
+// so the caller's return value (also in X0) is spilled to `cur_ret_slot` first
+// when the function has one. Without that, `return 42;` in a function that owns
+// a model would return whatever ionic_model_free left in X0.
 fn ncg_release_models() -> int64 {
+    // Park the return value before the first call clobbers X0.
+    if (cur_ret_slot >= 0) {
+        a64_store_fp(REG_X0, local_offset(cur_ret_slot));
+    }
     mut i = 0;
     while (i < model_count) {
         let nm = model_names[i];
@@ -764,6 +776,30 @@ fn ncg_model_expr(int64 n) -> int64 {
         if (str_eq(nd_sv[n], "load_model")) { return 1; }
     }
     if (k == ND_IDENT) { return local_owns_model(nd_sv[n]); }
+    return 0;
+}
+
+// Does this subtree mention `load_model(...)`? Used to decide, *before* the body
+// is emitted, whether the frame needs the slot that preserves X0 across the
+// destructor. Over-approximating costs one 8-byte stack slot; under-approximating
+// would silently corrupt return values, so the scan is deliberately shallow and
+// broad.
+fn ncg_uses_load_model(int64 n) -> int64 {
+    if (n == 0) { return 0; }
+    let k = nd_kind[n];
+    if (k == ND_CALL && str_eq(nd_sv[n], "load_model")) { return 1; }
+    if (ncg_uses_load_model(nd_i2[n]) == 1) { return 1; }
+    if (ncg_uses_load_model(nd_i3[n]) == 1) { return 1; }
+    if (ncg_uses_load_model(nd_i4[n]) == 1) { return 1; }
+    return 0;
+}
+
+fn ncg_stmts_use_load_model(int64 list) -> int64 {
+    mut c = list;
+    while (c != 0) {
+        if (ncg_uses_load_model(nd_i2[c]) == 1) { return 1; }
+        c = nd_i3[c];
+    }
     return 0;
 }
 
@@ -1353,11 +1389,15 @@ fn ncg_call(int64 node) -> int64 {
 
     // RAII: an explicit model_free(m) consumes the local's ownership, so the
     // implicit destructor must not free it again at scope exit.
+    //
+    // `args` is the CONS cell: nd_i2[args] is the first argument *node*, not a
+    // nested list. (Dereferencing twice here reads nd_i2[ND_IDENT], which is
+    // always 0, so the match never fired and every `model_free(m)` was followed
+    // by the implicit destructor — a double free.)
     if (str_eq(callee, "model_free")) {
-        let a0 = nd_i2[args];
-        if (a0 != 0) {
-            let e0 = nd_i2[a0];
-            if (nd_kind[e0] == ND_IDENT) { local_set_model(nd_sv[e0], 0); }
+        if (args != 0) {
+            let e0 = nd_i2[args];
+            if (e0 != 0 && nd_kind[e0] == ND_IDENT) { local_set_model(nd_sv[e0], 0); }
         }
     }
 
@@ -1435,6 +1475,7 @@ fn ncg_call(int64 node) -> int64 {
     if (str_eq(callee, "file_write"))         { real_callee = "ionic_file_write"; }
     if (str_eq(callee, "file_write_binary")) { real_callee = "ionic_file_write_binary"; }
     if (str_eq(callee, "file_read"))         { real_callee = "ionic_file_read"; }
+    if (str_eq(callee, "file_size"))         { real_callee = "ionic_file_size"; }
     if (str_eq(callee, "system"))            { real_callee = "ionic_system"; }
     if (str_eq(callee, "sqrt"))              { real_callee = "ionic_sqrt"; }
     if (str_eq(callee, "fabs"))              { real_callee = "ionic_fabs"; }
@@ -1458,6 +1499,22 @@ fn ncg_call(int64 node) -> int64 {
     if (str_eq(callee, "http_status"))       { real_callee = "ionic_http_status"; }
     if (str_eq(callee, "http_body"))         { real_callee = "ionic_http_body"; }
     if (str_eq(callee, "http_urlencode"))    { real_callee = "ionic_http_urlencode"; }
+    // HTTP server + BPE tokenizer — the pieces that let a program put a model
+    // behind a socket and actually emit text. See docs/guide.md.
+    if (str_eq(callee, "arr_push_i64"))      { real_callee = "ionic_arr_push_i64"; }
+    if (str_eq(callee, "bpe_load"))          { real_callee = "ionic_bpe_load"; }
+    if (str_eq(callee, "bpe_encode"))        { real_callee = "ionic_bpe_encode"; }
+    if (str_eq(callee, "bpe_decode"))        { real_callee = "ionic_bpe_decode"; }
+    if (str_eq(callee, "bpe_bos"))           { real_callee = "ionic_bpe_bos"; }
+    if (str_eq(callee, "bpe_eos"))           { real_callee = "ionic_bpe_eos"; }
+    if (str_eq(callee, "http_serve"))        { real_callee = "ionic_http_serve"; }
+    if (str_eq(callee, "http_accept"))       { real_callee = "ionic_http_accept"; }
+    if (str_eq(callee, "http_method"))       { real_callee = "ionic_http_method"; }
+    if (str_eq(callee, "http_path"))         { real_callee = "ionic_http_path"; }
+    if (str_eq(callee, "http_req_body"))     { real_callee = "ionic_http_req_body"; }
+    if (str_eq(callee, "http_req_done"))     { real_callee = "ionic_http_req_done"; }
+    if (str_eq(callee, "http_respond"))      { real_callee = "ionic_http_respond"; }
+    if (str_eq(callee, "http_close"))        { real_callee = "ionic_http_close"; }
     // Terminal / alternate-screen TUI primitives
     if (str_eq(callee, "term_enter"))        { real_callee = "ionic_term_enter"; }
     if (str_eq(callee, "term_exit"))         { real_callee = "ionic_term_exit"; }
@@ -1476,9 +1533,6 @@ fn ncg_call(int64 node) -> int64 {
     if (str_eq(callee, "load_model"))        { real_callee = "ionic_load_model"; }
     if (str_eq(callee, "model_free"))        { real_callee = "ionic_model_free"; }
     if (str_eq(callee, "model_forward"))     { real_callee = "ionic_model_forward"; }
-    if (str_eq(callee, "gguf_generate"))     { real_callee = "ionic_gguf_generate"; }
-    if (str_eq(callee, "gguf_set_temp"))     { real_callee = "ionic_gguf_set_temp"; }
-    if (str_eq(callee, "gguf_set_top_p"))    { real_callee = "ionic_gguf_set_top_p"; }
     if (str_eq(callee, "piper_forward"))     { real_callee = "ionic_piper_forward"; }
     if (str_eq(callee, "write_wav"))         { real_callee = "ionic_write_wav"; }
     // MLX tensor backend. Every mlx_* name maps 1:1 onto ionic_mlx_*; the
@@ -1575,6 +1629,9 @@ fn ncg_call(int64 node) -> int64 {
         str_eq(callee, "str_replace")    || str_eq(callee, "format")         ||
         str_eq(callee, "http_get")       || str_eq(callee, "http_post")      ||
         str_eq(callee, "http_body")      || str_eq(callee, "http_urlencode") ||
+        str_eq(callee, "bpe_decode")     ||
+        str_eq(callee, "http_method")    || str_eq(callee, "http_path")     ||
+        str_eq(callee, "http_req_body")  ||
         str_eq(callee, "getenv")) {
         ncg_last_ty = 1;
     }
@@ -1724,6 +1781,30 @@ fn ncg_stmt(int64 node) -> int64 {
     }
 
     // return expr
+    //
+    // The destructor and frame teardown live in ONE block at the end of the
+    // function (see ncg_fn_node). A `return` sets X0 and branches there rather
+    // than duplicating them, which is what keeps the emitted ionic_model_free
+    // reference count equal to the number of live models.
+    //
+    // KNOWN LIMITATION — ownership transfer across branches. `local_set_model`
+    // below is *compile-time* state shared by every runtime path, but a `return`
+    // that transfers ownership only takes one path. So in a function whose
+    // branches transfer *different* models, ownership is cleared for good and the
+    // model still held on the other path leaks. Example:
+    //
+    //     let a = load_model(p);
+    //     let b = load_model(p);
+    //     if (c > 0) { return a; }   // clears `a`, frees `b`
+    //     return b;                  // `b` cleared here too; `a` leaks
+    //
+    // Making this sound needs path-sensitive ownership (a per-path live set, or
+    // per-`return` destructors with a reachability-aware exit block), which the
+    // current single-exit design does not model. Emitting a destructor at each
+    // transferring `return` was tried and does not fix it: the second return
+    // already sees the first transfer's compile-time effect. The common shapes —
+    // one model, one transfer point, multiple models with no transfer — are all
+    // correct and covered by scripts/model_raii_check.sh.
     if (kind == ND_RETURN) {
         let val = nd_i2[node];
         if (val != 0) {
@@ -1735,9 +1816,8 @@ fn ncg_stmt(int64 node) -> int64 {
             a64_mov(REG_X0, r);
             scratch_pop();
         }
-        ncg_release_models();
-        // Epilogue inline (jump to epilogue label would be cleaner but this works)
-        ncg_fn_epilogue();
+        let patch = a64_b(0);          // target patched once the exit block exists
+        push(g_ret_patches, patch);
         return 0;
     }
 
@@ -1893,6 +1973,42 @@ fn ncg_stmts(int64 list) -> int64 {
 
 // ── Function prologue / epilogue ──────────────────────────────────────────────
 mut cur_frame_size = 0;
+// Dedicated frame slot holding the return value across the destructor calls in
+// the exit block. The destructor passes the model handle in X0, so X0 cannot be
+// live across it; -1 means "this function has no exit slot" (no owner locals).
+mut cur_ret_slot   = -1;
+
+// Jump targets for the single destructor + epilogue emitted at the end of each
+// function body. Every `return` appends here; the target address is only known
+// once the whole body has been emitted, so they are recorded and patched after.
+mut g_ret_patches = [0];
+
+fn ncg_reset_patches() -> int64 {
+    g_ret_patches = [0]; arr_reset(g_ret_patches);
+    return 0;
+}
+
+// Emit the single function exit: destructor calls, then the frame teardown.
+// Returns the address so callers can record it as a patch target.
+//
+// This is the *only* place ionic_model_free is emitted for owner locals, which
+// is what makes the reference count in the object equal the number of live
+// models. Emitting it in both the `return` path and the fall-through epilogue
+// (the previous design) produced two references per model, so the second one
+// freed a handle the first had already released.
+//
+// Callers own X0: a `return expr` puts the value there and branches here, and
+// the fall-through path zeroes it before falling in.
+fn ncg_emit_exit() -> int64 {
+    let exit_addr = text_len();
+    ncg_release_models();
+    // Reload the parked return value: the destructor left its last handle in X0.
+    if (cur_ret_slot >= 0) {
+        a64_load_fp(REG_X0, local_offset(cur_ret_slot));
+    }
+    ncg_fn_epilogue();
+    return exit_addr;
+}
 
 fn ncg_fn_prologue(int64 n_locals) -> int64 {
     cur_frame_size = frame_size(n_locals);
@@ -1999,19 +2115,37 @@ fn ncg_fn_node(int64 fn_node) -> int64 {
 
     local_reset();
     scratch_depth = 0;
+    ncg_reset_patches();
 
     // Count params + body locals for frame sizing
     mut n_params = 0;
     mut pc = params;
     while (pc != 0) { n_params = n_params + 1; pc = nd_i3[pc]; }
     let n_body_base = count_locals_deep(body_list);
+
+    // Reserve the exit-block return slot when this body can own a model. The
+    // destructor runs after `return` has put the value in X0, so the value has
+    // to live somewhere else while ionic_model_free uses X0 for the handle.
+    //
+    // Slot indices are assigned in definition order: params take
+    // 0..n_params-1 and body locals take n_params..n_params+n_body_base-1, so
+    // n_params+n_body_base is the first free index. It is reserved by index
+    // (not via local_def) so its name never enters the local table and the
+    // indices below it are unaffected.
+    cur_ret_slot = -1;
+    mut ret_extra = 0;
+    if (ncg_stmts_use_load_model(body_list) == 1) {
+        cur_ret_slot = n_params + n_body_base;
+        ret_extra    = 1;
+    }
+
     // Promote all params (up to 8) to callee-saved regs X19..X(19+n_params-1)
     mut n_prom = n_params;
     if (n_prom > 8) { n_prom = 8; }
     n_csr         = n_prom;
-    csr_base_slot = n_params + n_body_base;      // CSR saves after all locals
-    spill_base    = n_params + n_body_base + 8;  // scratch spills after CSR saves
-    let n_locals  = n_params + n_body_base + 16; // 8 CSR + 8 scratch headroom
+    csr_base_slot = n_params + n_body_base + ret_extra;      // CSR saves after all locals
+    spill_base    = csr_base_slot + 8;                       // scratch spills after CSR saves
+    let n_locals  = n_params + n_body_base + 16 + ret_extra; // 8 CSR + 8 scratch headroom
 
     // Register as defined global symbol
     let fn_addr = text_len();
@@ -2058,10 +2192,21 @@ fn ncg_fn_node(int64 fn_node) -> int64 {
 
     ncg_stmts(body_list);
 
-    // Implicit return 0 at end of function if no explicit return
-    ncg_release_models();
+    // Single exit block: the fall-through path. Every `return` branches here.
+    //
+    // A `return` inside the body already left X0 holding the return value, so
+    // if the body had one the fall-through is unreachable; zeroing X0 here is
+    // still correct and keeps the implicit-return-0 case (a function whose body
+    // falls off the end) working.
     a64_load_imm(REG_X0, 0);
-    ncg_fn_epilogue();
+    let exit_addr = ncg_emit_exit();
+
+    // Patch the `return` branches to land on the destructor, not past it.
+    mut rpi = 0;
+    while (rpi < len(g_ret_patches)) {
+        a64_patch_b(g_ret_patches[rpi], exit_addr);
+        rpi = rpi + 1;
+    }
 
     buf_align(text_buf, 4);
     return 0;

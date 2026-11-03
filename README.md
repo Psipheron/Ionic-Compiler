@@ -42,7 +42,7 @@ fib(10) = 55
 - **Standard library** — `std.math`, `std.str`, `std.array`, `std.io`, `std.data`, `std.text`, `std.http` live under `lib/std/`
 - **Web request primitives** — `http_get`, `http_post`, `http_status`, `http_body`, `http_urlencode` (HTTP/1.1 client via raw sockets, no TLS) plus a `std.http` wrapper module
 - **Hardware-aware types & placement tags** — `tensor@cpu` and `tensor@gpu` are distinct types; `@gpu fn` / `@cpu fn` pin code to a device, and the checker enforces the boundary (no accidental cross-device ops, no CPU-only I/O inside GPU code)
-- **Real ML backends** — an MLX tensor runtime for Apple-silicon GPU math (arrays, matmul, softmax, attention/norm/rope kernels, safetensors); GGUF models via llama.cpp with Metal GPU; ONNX/CoreML; Piper TTS. Backends are linked per-program and only when the source references them, so a plain program has no ML dependencies. On platforms without a backend the program still links and reports "not compiled in" at runtime
+- **Real ML backends** — an MLX tensor runtime for Apple-silicon GPU math (arrays, matmul, softmax, attention/norm/rope kernels, safetensors); ONNX Runtime / CoreML for model files; Piper TTS. Backends are linked per-program and only when the source references them, so a plain program has no ML dependencies. On platforms without a backend the program still links and reports "not compiled in" at runtime
 - **Human-readable errors** — multi-error reporting, source-line carets, column tracking, panic-mode recovery, enclosing-function context, "did you mean…" suggestions, clickable `path:line:col` jump links, ANSI colors that auto-disable when not a TTY
 - **Optimizer** — a self-hosted optimization pipeline (fold, inline, unroll, const-propagate) that runs on every compilation before codegen
 - **Modern syntax** — compound assignment (`+=`, `-=`, `*=`, `/=`), block comments `/* ... */`, and panic-mode lexer recovery
@@ -463,20 +463,25 @@ if (status(raw) == 200) {
 
 ## ML backends
 
-Ionic ships three optional ML backends. Each is linked into a program **only
-when that program's source references it**, so `ionic hello.ionic` stays
+Ionic ships two optional ML backends. Each is linked into a program **only when
+that program's source references it**, so `ionic hello.ionic` stays
 dependency-free:
 
 - source mentions `mlx_*` → links `mlx-c` (Apple silicon / Metal)
-- source mentions `gguf_*` or `load_model` → links llama.cpp (portable path)
-- source mentions `piper_forward` or `model_forward` → links ONNX Runtime
+- source mentions `piper_forward`, `model_forward` or `load_model` → links ONNX Runtime
 
-Install what you need (`brew install mlx-c llama.cpp onnxruntime`). A missing
-library is never a build failure: the runtime exports the full symbol set on
-every platform, so a program that uses `mlx_*` still compiles and links
-everywhere — on a platform without MLX it reports `MLX backend not compiled in`
-at runtime. That keeps one source tree portable: MLX for Apple-silicon tensor
-math, GGUF/llama.cpp everywhere else.
+Install what you need (`brew install mlx-c onnxruntime`). A missing library is
+never a build failure: the runtime exports the full symbol set on every platform,
+so a program that uses `mlx_*` still compiles and links everywhere — on a
+platform without MLX it reports `MLX backend not compiled in` at runtime. That
+keeps one source tree portable: MLX for Apple-silicon tensor math, ONNX Runtime
+for model files on every target.
+
+GGUF support was removed along with llama.cpp. Its only placement control is
+`n_gpu_layers`, one load-time integer for the whole model, which cannot express
+`tensor@cpu` / `tensor@gpu` per value — the placement types would have been
+decorative for the format most people run. `.gguf` is still recognised so the
+error is explicit; export to ONNX, or wait for a low-level ggml path.
 
 ```ionic
 fn main() -> int64 {
@@ -559,7 +564,7 @@ src/
   diagnostics.ionic  Error reporting with ANSI colors, jump links, did-you-mean
   codegen.rs       Rust LLVM backend (cross-OS bootstrap)
   lexer.rs / parser.rs / ast.rs / semantic.rs / imports.rs / resolve.rs / main.rs  Rust frontend
-  ionic_model_runtime.c   Native runtime: I/O, arrays, strings, math, ML backends (MLX, llama.cpp, ONNX)
+  ionic_model_runtime.c   Native runtime: I/O, arrays, strings, math, ML backends (MLX, ONNX)
 build.sh           Build script (--verify-self-hosting for regression check)
 docs/              Language reference, guide, memory model, stdlib
 ionic_new          Primary compiler binary (self-hosted)

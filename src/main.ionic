@@ -10,12 +10,20 @@ mut src_str   = "";
 mut out_name  = "a.out";
 mut src_path  = "<source>";   // populated when a file argument is given
 mut entry_path = "";          // first source file — seeds relative-import dir
+mut target_triple = "";       // --target value; "" means "the host"
+mut target_known  = 1;        // cleared when --target names a triple we can't emit
+mut print_link    = 0;        // --print-link: show the link command, don't run it
 
 mut cur_arg = get_arg(ai);
 while (!str_eq(cur_arg, "")) {
     if (str_eq(cur_arg, "-o")) {
         ai = ai + 1;
         out_name = get_arg(ai);
+    } else if (str_eq(cur_arg, "--target")) {
+        ai = ai + 1;
+        target_triple = get_arg(ai);
+    } else if (str_eq(cur_arg, "--print-link")) {
+        print_link = 1;
     } else {
         let content = file_read(cur_arg);
         src_str = str_concat(src_str, str_concat(content, "\n"));
@@ -25,6 +33,44 @@ while (!str_eq(cur_arg, "")) {
     ai = ai + 1;
     cur_arg = get_arg(ai);
 }
+
+// Resolve --target into the codegen's object-format switch.
+//
+// The host is the default, so an unqualified `ionic foo.ionic` behaves exactly
+// as it always has. Naming a different triple selects the other emitter, which
+// makes it possible to build a Linux binary without sitting on a Linux box —
+// the point of an edge deployment target.
+//
+// Note this is a *cross-compile*: the host cannot link the result, because
+// linking needs a C compiler and that target's libc. When cross-compiling we
+// therefore stop after writing the object file and print the exact commands to
+// run on the target machine.
+let host_linux = target_is_linux();
+mut want_linux = host_linux;
+if (str_len(target_triple) > 0) {
+    if (str_eq(target_triple, "aarch64-linux") ||
+        str_eq(target_triple, "aarch64-unknown-linux-gnu") ||
+        str_eq(target_triple, "aarch64-linux-gnu") ||
+        str_eq(target_triple, "linux")) {
+        want_linux = 1;
+    } else if (str_eq(target_triple, "aarch64-macos") ||
+               str_eq(target_triple, "aarch64-apple-darwin") ||
+               str_eq(target_triple, "macos")) {
+        want_linux = 0;
+    } else {
+        target_known = 0;
+    }
+}
+
+if (target_known == 0) {
+    println(str_concat("ionic: unknown --target '", str_concat(target_triple, "'")));
+    println("  supported: aarch64-linux (aarch64-unknown-linux-gnu), aarch64-macos (aarch64-apple-darwin)");
+    exit(1);
+}
+
+// Emitting for a platform other than the one we are running on.
+mut cross_compiling = 0;
+if (want_linux != host_linux) { cross_compiling = 1; }
 
 // Expand `import` statements: splice in transitively imported library modules
 // and strip the import lines. g_parts holds fragments in dependency order.
@@ -76,7 +122,7 @@ opt_program(fns_list, top_list);
 // (and kept as `<out>.o` in the cwd when -o has no directory), which also makes
 // the --verify-self-hosting recipe predictable.
 mut obj_path = str_concat(out_name, ".o");
-g_target_linux = target_is_linux();
+g_target_linux = want_linux;
 codegen_program(structs_list, fns_list, top_list, obj_path);
 
 // Locate the C runtime (`ionic_model_runtime.c`) relative to the compiler's
@@ -88,6 +134,27 @@ let ionic_root = getenv("IONIC_ROOT");
 if (str_len(ionic_root) > 0) {
     let rt_try = str_concat(ionic_root, "/src/ionic_model_runtime.c");
     if (str_len(file_read(rt_try)) > 0) { rt_src = rt_try; }
+}
+
+// ── Cross-compile: stop at the object file ───────────────────────────────────
+//
+// We just emitted an object for a platform we are not running on, so we cannot
+// link it here: linking needs a C compiler targeting that platform plus its
+// libc and any backend libraries. Rather than invoke the host linker and let it
+// fail with something cryptic, print the commands that will work on the target.
+if (cross_compiling == 1) {
+    println(str_concat("ionic: emitted ", str_concat(obj_path, " for aarch64-linux")));
+    println("");
+    println("This object cannot be linked on this machine. Copy it, the runtime,");
+    println("and any backend libraries to the target, then link there:");
+    println("");
+    println(str_concat("  clang ", str_concat(obj_path,
+        str_concat(" ", str_concat(rt_src, str_concat(" -o ", str_concat(out_name, " -lm")))))));
+    println("");
+    println("Add -DIONIC_HAVE_ORT -I<dir> -L<dir> -lonnxruntime at that link if the");
+    println("program uses ONNX inference. Backend discovery runs on the machine");
+    println("that links, not the one that compiles.");
+    exit(0);
 }
 
 mut link_cmd = "";
@@ -104,33 +171,31 @@ if (g_target_linux == 1) {
 //
 // The runtime (`ionic_model_runtime.c`) compiles every backend behind an
 // IONIC_HAVE_* macro. Without the matching -D and -I, those blocks vanish and
-// `load_model` / `gguf_generate` / `mlx_*` all report "not compiled in" at
+// `load_model` / `piper_forward` / `mlx_*` all report "not compiled in" at
 // runtime — which is what used to happen for *every* backend, because this
 // driver never passed any flags. Probing here fixes that.
 //
 // Detection is opportunistic: whatever is installed gets enabled, and a
 // missing library is not an error. That keeps the tarball usable on a machine
-// with no brew packages at all, while an `mlx-c` / `llama.cpp` / `onnxruntime`
-// install silently lights up the corresponding backend.
+// with no brew packages at all, while an `mlx-c` / `onnxruntime` install
+// silently lights up the corresponding backend.
 //
-// IONIC_MLX_INCLUDE / IONIC_MLX_LIB (and the _LLAMA_/_ORT_ equivalents) override
+// IONIC_MLX_INCLUDE / IONIC_MLX_LIB (and the _ORT_ equivalents) override
 // detection for non-Homebrew prefixes. IONIC_NO_MLX=1 forces MLX off, which is
 // useful when a half-installed mlx-c would otherwise fail the link.
 // Backends are linked only when the program actually references them. Linking
 // unconditionally would make every Ionic binary (including hello-world) depend
-// on mlx/llama/onnx and pay their load + init cost at startup, so usage is
-// detected from the source text first. False positives merely cost a link
-// flag; false negatives would silently disable a backend, so the token lists
-// below are the *shortest unambiguous prefix* for each entry point.
-mut uses_mlx   = 0;
-mut uses_llama = 0;
-mut uses_ort   = 0;
-if (str_contains(src_str, "mlx_") == 1)        { uses_mlx = 1; }
-if (str_contains(src_str, "gguf_") == 1)       { uses_llama = 1; }
+// on mlx/onnx and pay their load + init cost at startup, so usage is detected
+// from the source text first. False positives merely cost a link flag; false
+// negatives would silently disable a backend, so the token lists below are the
+// *shortest unambiguous prefix* for each entry point.
+mut uses_mlx = 0;
+mut uses_ort = 0;
+if (str_contains(src_str, "mlx_") == 1)          { uses_mlx = 1; }
 if (str_contains(src_str, "piper_forward") == 1) { uses_ort = 1; }
-// `load_model` dispatches on the file extension at runtime, so either backend
-// may be needed; enable both and let the runtime pick. model_forward is ONNX.
-if (str_contains(src_str, "load_model") == 1)  { uses_llama = 1; uses_ort = 1; }
+// `load_model` dispatches on the file extension at runtime; ONNX is the only
+// backend with a loader. model_forward is ONNX too.
+if (str_contains(src_str, "load_model") == 1)    { uses_ort = 1; }
 if (str_contains(src_str, "model_forward") == 1) { uses_ort = 1; }
 
 mut backend_defs = "";
@@ -148,17 +213,8 @@ if (uses_mlx == 1 && g_target_linux == 0) {
     }
 }
 
-// GGUF/llama.cpp stays the portable path — in particular it is the only ML
-// backend on Linux, so it is probed regardless of target.
-if (uses_llama == 1) {
-    let llama_inc = find_llama_include();
-    let llama_lib = find_llama_lib();
-    if (!str_eq(llama_inc, "") && !str_eq(llama_lib, "")) {
-        backend_defs = str_concat(backend_defs, str_concat(" -DIONIC_HAVE_LLAMA -I", llama_inc));
-        backend_libs = str_concat(backend_libs, str_concat(" -L", str_concat(llama_lib, " -lllama")));
-    }
-}
-
+// ONNX Runtime is the only model-loader backend, and it is probed regardless of
+// target: on Linux it is the only ML path at all.
 if (uses_ort == 1) {
     let ort_inc = find_ort_include();
     let ort_lib = find_ort_lib();
@@ -175,18 +231,28 @@ if (str_len(backend_libs) > 0) {
     link_cmd = str_concat(link_cmd, backend_libs);
 }
 
+// --print-link: emit the command and stop, so a CI job can assert what a build
+// would have linked against (e.g. that a plain program links no backends).
+if (print_link == 1) {
+    println(link_cmd);
+    exit(0);
+}
+
 // Propagate the linker's exit status.
 //
 // `system()` returns the wait status from waitpid(2), not the child's exit
 // code: a normal exit is `code << 8`, so exit 1 arrives here as 256, and a
 // signal death is the raw signal number in the low bits. Discarding that value
-// made a failed link indistinguishable from a successful one — clang printed
-// the real diagnosis to stderr and the compiler still exited 0, so
+// made a failed link indistinguishable from a successful one — the compiler
+// printed whatever the linker said to stderr and then exited 0, so
 // `./ionic foo.ionic -o /typo/x` (a missing library, a full disk) looked like a
-// successful build to every script and CI step checking the exit code.
+// successful build to every script and CI step that checked the exit code.
+//
+// clang has already printed the real diagnosis to stderr by this point; all
+// that is left is to not claim success.
 let link_status = system(link_cmd);
 if (link_status != 0) {
-    mut link_detail = "killed by signal";
+    mut link_detail = "signal";
     if ((link_status & 127) == 0) {
         // Normal exit: recover the child's own code from the high byte.
         link_detail = str_concat("exit ", int64_to_str(link_status >> 8));
@@ -199,19 +265,28 @@ if (link_status != 0) {
 
 // ── Optional-backend discovery ───────────────────────────────────────────────
 //
-// Probes are plain file reads rather than `system("test -f ...")`: the path is
-// never interpolated into a shell command, so spaces and quoting cannot break
+// Probes are `file_size` and `getenv`, never `system("test -f ...")`: paths are
+// not interpolated into a shell command, so spaces and quoting cannot break
 // detection, and no subprocess is spawned per candidate.
+//
+// `file_size` rather than `file_read`: existence checks used to call
+// file_read() and test for a non-empty string, which mallocs the entire file.
+// On a shared library that is tens to hundreds of megabytes allocated and
+// leaked (Ionic strings are never freed) on every probe, of which there are
+// several dozen per compile. file_size() is a single stat(2) and allocates
+// nothing.
 
-// Non-empty read ⇒ readable regular file. file_read() returns "" when the path
-// is missing or unreadable, so this doubles as an existence check.
+// A regular file exists. file_size() returns -1 for a missing path or a
+// non-regular file, and >= 0 for a real one — including an empty file, which is
+// why this is >= 0 and not > 0.
 fn file_present(string path) -> int64 {
-    if (str_len(file_read(path)) > 0) { return 1; }
+    if (file_size(path) >= 0) { return 1; }
     return 0;
 }
 
-// First candidate whose `rel` file exists. `""` when none match.
-fn probe_include(string env_name, [string] candidates, int64 n, string rel) -> string {
+// First candidate directory containing `rel`. `""` when none match, so callers
+// can treat a miss as "backend unavailable" rather than an error.
+fn probe_dir(string env_name, [string] candidates, int64 n, string rel) -> string {
     let env = getenv(env_name);
     if (str_len(env) > 0 && file_present(str_concat(env, str_concat("/", rel))) == 1) {
         return env;
@@ -225,66 +300,103 @@ fn probe_include(string env_name, [string] candidates, int64 n, string rel) -> s
     return "";
 }
 
-// MLX headers live under <prefix>/mlx/c/, so the include root is the prefix
-// itself (not the mlx/ directory) — `#include "mlx/c/mlx.h"` needs that.
-fn find_mlx_include() -> string {
-    mut c = [""];
-    arr_reset(c);
-    push(c, "/opt/homebrew/include");
-    push(c, "/usr/local/include");
-    return probe_include("IONIC_MLX_INCLUDE", c, 2, "mlx/c/mlx.h");
-}
-
-fn find_mlx_lib() -> string {
-    mut c = [""];
-    arr_reset(c);
-    push(c, "/opt/homebrew/lib");
-    push(c, "/usr/local/lib");
-    return probe_include("IONIC_MLX_LIB", c, 2, "libmlxc.dylib");
-}
-
-fn find_llama_include() -> string {
-    mut c = [""];
-    arr_reset(c);
-    push(c, "/opt/homebrew/include");
-    push(c, "/usr/local/include");
-    return probe_include("IONIC_LLAMA_INCLUDE", c, 2, "llama.h");
-}
-
-// libllama is versioned on some installs (libllama.0.dylib) and unversioned on
-// others, and Homebrew's keg symlinks the unversioned name into /opt/homebrew/lib.
-fn find_llama_lib() -> string {
-    mut c = [""];
-    arr_reset(c);
-    push(c, "/opt/homebrew/lib");
-    push(c, "/usr/local/lib");
-    let env = getenv("IONIC_LLAMA_LIB");
+// First directory containing ANY of several alternative filenames.
+// Platform-specific names (libmlxc.dylib vs libmlxc.so, libonnxruntime.dylib vs
+// libonnxruntime.so) need this; a single fixed filename silently misses them.
+//
+// Iteration is directory-outer, filename-inner: every candidate name must be
+// tried in the env override before falling through to the search path, or an
+// override directory holding a differently-named library is skipped in favour
+// of a system copy that has the name we happened to test first.
+fn probe_dir_any(string env_name, [string] candidates, int64 n, [string] names, int64 nn) -> string {
+    let env = getenv(env_name);
     if (str_len(env) > 0) {
-        if (file_present(str_concat(env, "/libllama.dylib")) == 1) { return env; }
-        if (file_present(str_concat(env, "/libllama.so")) == 1) { return env; }
+        mut k0 = 0;
+        while (k0 < nn) {
+            if (file_present(str_concat(env, str_concat("/", names[k0]))) == 1) { return env; }
+            k0 = k0 + 1;
+        }
     }
     mut i = 0;
-    while (i < 2) {
-        let dir = c[i];
-        if (file_present(str_concat(dir, "/libllama.dylib")) == 1) { return dir; }
-        if (file_present(str_concat(dir, "/libllama.so")) == 1) { return dir; }
+    while (i < n) {
+        let dir = candidates[i];
+        mut k = 0;
+        while (k < nn) {
+            if (file_present(str_concat(dir, str_concat("/", names[k]))) == 1) { return dir; }
+            k = k + 1;
+        }
         i = i + 1;
     }
     return "";
 }
 
+// Directories searched first for headers: the Homebrew prefix (Apple silicon),
+// the Intel Homebrew / manual-install prefix, then the standard Unix system
+// locations. /usr/include is where Debian/Ubuntu put distro-packaged headers,
+// and it is the path that used to be missing, which made backend detection fail
+// on exactly the platform this compiler targets.
+fn include_dirs() -> [string] {
+    mut c = [""];
+    arr_reset(c);
+    push(c, "/opt/homebrew/include");
+    push(c, "/usr/local/include");
+    push(c, "/usr/include");
+    return c;
+}
+
+// Library search roots. aarch64-linux-gnu is Debian/Ubuntu's multiarch libdir;
+// /usr/lib64 is Fedora/openSUSE; /usr/lib is generic Unix.
+fn lib_dirs() -> [string] {
+    mut c = [""];
+    arr_reset(c);
+    push(c, "/opt/homebrew/lib");
+    push(c, "/usr/local/lib");
+    push(c, "/usr/lib/aarch64-linux-gnu");
+    push(c, "/usr/lib64");
+    push(c, "/usr/lib");
+    return c;
+}
+
+fn include_dir_count() -> int64 { return 3; }
+fn lib_dir_count()     -> int64 { return 5; }
+
+// ── MLX (Apple silicon only) ──────────────────────────────────────────────────
+// Headers live under <prefix>/mlx/c/, so the include root is the prefix itself
+// (not the mlx/ directory) — `#include "mlx/c/mlx.h"` needs that.
+fn find_mlx_include() -> string {
+    return probe_dir("IONIC_MLX_INCLUDE", include_dirs(), include_dir_count(), "mlx/c/mlx.h");
+}
+
+fn find_mlx_lib() -> string {
+    mut names = [""];
+    arr_reset(names);
+    push(names, "libmlxc.dylib");
+    push(names, "libmlxc.so");
+    return probe_dir_any("IONIC_MLX_LIB", lib_dirs(), lib_dir_count(), names, 2);
+}
+
+// ── ONNX Runtime ─────────────────────────────────────────────────────────────
+// Two layouts exist: <prefix>/include/onnxruntime/onnxruntime_c_api.h (brew) and
+// <prefix>/include/onnxruntime_c_api.h (a manual install from the release zip).
+// Try the nested form first, then the flat one.
 fn find_ort_include() -> string {
     mut c = [""];
     arr_reset(c);
     push(c, "/opt/homebrew/include/onnxruntime");
     push(c, "/usr/local/include/onnxruntime");
-    return probe_include("IONIC_ORT_INCLUDE", c, 2, "onnxruntime_c_api.h");
+    push(c, "/usr/include/onnxruntime");
+    push(c, "/opt/homebrew/include");
+    push(c, "/usr/local/include");
+    push(c, "/usr/include");
+    return probe_dir("IONIC_ORT_INCLUDE", c, 6, "onnxruntime_c_api.h");
 }
 
 fn find_ort_lib() -> string {
-    mut c = [""];
-    arr_reset(c);
-    push(c, "/opt/homebrew/lib");
-    push(c, "/usr/local/lib");
-    return probe_include("IONIC_ORT_LIB", c, 2, "libonnxruntime.dylib");
+    mut names = [""];
+    arr_reset(names);
+    push(names, "libonnxruntime.dylib");
+    push(names, "libonnxruntime.so");
+    return probe_dir_any("IONIC_ORT_LIB", lib_dirs(), lib_dir_count(), names, 2);
 }
+
+

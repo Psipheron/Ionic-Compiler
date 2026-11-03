@@ -50,8 +50,10 @@ OUT="${OUT:-ionic_new}"
 #   IONIC_MLX_INCLUDE=/opt/mlx/include IONIC_MLX_LIB=/opt/mlx/lib \
 #       ./ionic_new model.ionic -o model
 #
-# The same IONIC_MLX_* / IONIC_LLAMA_* / IONIC_ORT_* overrides are honoured by
-# the Rust bootstrap in src/main.rs.
+# These overrides are read by the self-hosted compiler (src/main.ionic,
+# probe_dir/probe_dir_any). The dev-only Rust bootstrap in src/main.rs has its
+# own hardcoded candidate list and does NOT consult them — it only understands
+# IONIC_NO_MLX=1.
 
 # Single entry point. Its `import "..."` statements pull in the rest of the
 # tree (resolved relative to src/) and splice the modules in dependency order,

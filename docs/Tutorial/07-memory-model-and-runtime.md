@@ -46,7 +46,7 @@ Read `src/ionic_model_runtime.c`:
 - Floats: everything uses an **int64 bit-pattern convention** — float values and
   float args/returns are passed as raw IEEE-754 bits in integer slots.
 - Models: `ionic_load_model`, `ionic_model_forward`, `ionic_model_free`,
-  `gguf_*`, `piper_forward`, `write_wav`.
+  `piper_forward`, `write_wav`.
 
 `ionic_array_get` (`:472`) is the bounds check behind `ionic: index out of bounds`.
 

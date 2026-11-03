@@ -100,6 +100,150 @@ jobs:
           name: multitarget-elf
           path: elf.out
 
+  # ── Cross-compile: emit a Linux object while running on macOS ─────────────
+  # The deployment story for this compiler is "build on your Mac, run on the
+  # edge box". That needs `--target aarch64-linux`, which used to be impossible:
+  # the object format was selected from the *host*, so an Apple laptop could only
+  # ever produce Mach-O. This job asserts the flag exists, emits the other
+  # format, and checks the object is genuinely a linkable AArch64 ELF — without
+  # which the `elf` job above only ever tests self-compilation on Linux.
+  cross_compile:
+    name: Cross-compile to Linux (from macOS)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Make bootstrap executable
+        run: chmod +x ionic_self
+
+      - name: Build self-hosted compiler
+        run: ./build.sh
+
+      - name: Emit an ELF object for aarch64-linux
+        run: |
+          ./ionic_new examples/multitarget_test.ionic -o /tmp/xelf --target aarch64-linux
+          # Cross-compiling must NOT try to link: the host linker cannot consume
+          # a foreign object, and a cryptic ld error here would look like a bug
+          # in the emitter rather than an unsupported operation.
+          test -f /tmp/xelf.o || (echo "no object emitted"; exit 1)
+          test ! -f /tmp/xelf   || (echo "cross-compile tried to link a foreign object"; exit 1)
+
+      - name: Object is a valid AArch64 ELF relocatable
+        run: |
+          file /tmp/xelf.o | tee /tmp/file.txt
+          grep -q 'ELF 64-bit LSB relocatable, ARM aarch64' /tmp/file.txt \
+            || (echo "emitted object is not ELF/AArch64"; exit 1)
+
+      - name: Object carries AArch64 relocations, not Mach-O ones
+        run: |
+          otool -tv /tmp/xelf.o >/dev/null 2>&1 && (echo "otool parsed it: still Mach-O?"; exit 1) || true
+          # Mach-O objects name external symbols with a leading underscore.
+          # An ELF object must not, or the Linux link would fail on every symbol.
+          if strings /tmp/xelf.o | grep -q '^_ionic_'; then
+            echo "found Mach-O-mangled symbol names in an ELF object"; exit 1
+          fi
+          strings /tmp/xelf.o | grep -q 'ionic_str_concat' \
+            || (echo "runtime symbols missing from the ELF symbol table"; exit 1)
+
+      - name: Unknown targets are rejected, not silently miscompiled
+        run: |
+          if ./ionic_new examples/hello.ionic -o /tmp/bad --target sparc 2>/dev/null; then
+            echo "accepted an unsupported --target"; exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cross-compiled-elf
+          path: /tmp/xelf.o
+
+  # ── Linux arm64: ONNX backend discovery ──────────────────────────────────
+  #
+  # The `elf` job above proves the emitter works, using std.math and bitwise ops.
+  # That says nothing about the compiler's one remaining model backend.
+  #
+  # ONNX Runtime is not in apt for arm64 and its release tarball is ~500 MB, so
+  # this job does NOT download it. It fabricates a prefix shaped exactly like a
+  # real ORT install (header at <prefix>/include/onnxruntime/onnxruntime_c_api.h,
+  # library at <prefix>/lib/libonnxruntime.so) and points the compiler at it via
+  # the documented env overrides. That is precisely the surface under test —
+  # the probe functions in src/main.ionic — with none of the download cost.
+  #
+  # This is the only job that would notice if ONNX discovery regressed on
+  # Linux, now that GGUF/llama.cpp is gone and there is no second backend to
+  # fall back on.
+  onnx_discovery:
+    name: ONNX discovery (Linux arm64)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust and build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang curl build-essential
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Bootstrap the self-hosted compiler
+        run: |
+          cargo build --release
+          ./target/release/ionic src/main.ionic -o ionic_new
+
+      - name: Fabricate an ONNX Runtime prefix
+        run: |
+          # Brew's layout: <prefix>/include/onnxruntime/onnxruntime_c_api.h.
+          # IONIC_ORT_INCLUDE names the directory that *directly contains* the
+          # header — probe_dir() tests "$env/onnxruntime_c_api.h" — so it is the
+          # .../include/onnxruntime leaf, not .../include. Pointing it at the
+          # parent silently misses and discovery falls through to the system
+          # paths, which is why this step would fail on a runner with no brew.
+          mkdir -p /tmp/ort/include/onnxruntime /tmp/ort/lib
+          : > /tmp/ort/include/onnxruntime/onnxruntime_c_api.h
+          : > /tmp/ort/lib/libonnxruntime.so
+          find /tmp/ort -type f | sort
+
+      - name: A program that uses ONNX gets the backend flags
+        run: |
+          cat > /tmp/onnx_user.ionic <<'EOF'
+          fn main() -> int64 {
+              let m = load_model("/tmp/model.onnx");
+              model_free(m);
+              return 0;
+          }
+          EOF
+          IONIC_ORT_INCLUDE=/tmp/ort/include/onnxruntime \
+          IONIC_ORT_LIB=/tmp/ort/lib \
+            ./ionic_new /tmp/onnx_user.ionic -o /tmp/onnx_user --print-link | tee /tmp/link.txt
+          grep -q -- '-DIONIC_HAVE_ORT'   /tmp/link.txt || (echo "ONNX backend not enabled"; exit 1)
+          grep -q -- '-I/tmp/ort/include/onnxruntime' /tmp/link.txt \
+            || (echo "ORT include dir not propagated"; exit 1)
+          grep -q -- '-L/tmp/ort/lib'     /tmp/link.txt || (echo "ORT lib dir not propagated"; exit 1)
+          grep -q -- '-lonnxruntime'      /tmp/link.txt || (echo "libonnxruntime not linked"; exit 1)
+
+      - name: A program that does not use ONNX links no backend
+        run: |
+          # Usage-gating is the property that keeps hello-world free of ML
+          # dependencies; a backend that leaks into every binary is a startup
+          # cost and a deployment liability on the target box.
+          ./ionic_new examples/hello.ionic -o /tmp/plain --print-link > /tmp/plain.txt
+          cat /tmp/plain.txt
+          if grep -q -- '-DIONIC_HAVE_ORT' /tmp/plain.txt; then
+            echo "plain program enabled the ONNX backend"; exit 1
+          fi
+          if grep -q -- '-lonnxruntime' /tmp/plain.txt; then
+            echo "plain program linked libonnxruntime"; exit 1
+          fi
+
+      - name: GGUF is rejected rather than silently mis-handled
+        run: |
+          # llama.cpp was removed because n_gpu_layers cannot express per-value
+          # residency. detect_format() still recognises .gguf so the failure is
+          # a clear message instead of "unknown format".
+          if grep -rq -- 'ionic_gguf_generate\|IONIC_HAVE_LLAMA' src/ ; then
+            echo "llama.cpp references survived the removal"; exit 1
+          fi
+          test ! -f src/gguf_demo.ionic || (echo "gguf_demo.ionic still present"; exit 1)
+
   # ── The actual assertion: Mach-O output == ELF output ─────────────────────
   compare:
     name: Mach-O vs ELF identical

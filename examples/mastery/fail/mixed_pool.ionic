@@ -1,0 +1,22 @@
+// Mastery EXERCISE 04.6 — mixed-pool operands; must be REJECTED.
+//
+// Pool polymorphism means a builtin accepts a tensor from either pool, but a
+// single call still computes in exactly one pool. `mlx_add(cpu_tensor,
+// gpu_tensor)` has no pool to run in, and the backend will not catch it:
+// MLX's mixed-device paths silently return wrong data rather than failing, so
+// the compiler has to reject the program.
+//
+//   [error] mixed memory pools in call to 'mlx_add': operand 1 is tensor@cpu,
+//           but operand 2 is tensor@gpu (move both operands to the same pool
+//           first)
+//
+//   NO_COLOR=1 ./ionic_new examples/mastery/fail/mixed_pool.ionic -o /tmp/x
+
+fn main() -> int64 {
+    let dev = mlx_ones([2, 2], 0).toGpu();   // tensor@gpu
+    gpu {
+        // Operand 1 is built in SRAM, operand 2 lives in VRAM.
+        let bad = mlx_add(mlx_zeros([2, 2], 0), dev);
+    }
+    return 0;
+}

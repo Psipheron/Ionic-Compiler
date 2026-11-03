@@ -19,7 +19,7 @@ system**. It is C-style, allocation-heavy, and reclamation-free by design:
 - **Arrays** use a 24-byte header `[len:i64][cap:i64][data_ptr]` plus a separate
   `malloc`/`realloc`'d data region (`IonicArray`, `src/ionic_model_runtime.c`).
 - **The only explicit free** is `model_free(m)`, which releases ML model
-  resources (ONNX / llama.cpp handles) via `ionic_model_free`.
+  resources (ONNX Runtime handles) via `ionic_model_free`.
 
 The runtime states the policy directly:
 
@@ -48,7 +48,7 @@ The memory model must respect the language's defining traits, not fight them.
 - **GPU placement (`@cpu` / `@gpu`).** Tensor and model memory crosses a device
   boundary. Reclamation of device memory must be *deterministic* — a delayed
   collector pause during inference is unacceptable.
-- **C / library interop** (`llama.cpp`, ONNX Runtime, POSIX sockets) hands out
+- **C / library interop** (ONNX Runtime, POSIX sockets) hands out
   raw pointers that are indistinguishable at runtime from managed pointers.
 - **A shared ABI of bare pointers.** A string is one `i64`; there is no header or
   type tag at runtime. Foreign pointers and compile-time literals are both
@@ -179,7 +179,7 @@ the reason Ionic can be leak-free *without* a general-purpose collector.
 - **Reference cycles among counted objects.** Prevented by design (§6), not
   collected. If a cycle is ever constructed, the participating objects leak.
 - **C-runtime buffers not routed through `rc_alloc`.** Anything `malloc`'d inside
-  `src/ionic_model_runtime.c` (for example the `gguf_generate` result buffer, the
+  `src/ionic_model_runtime.c` (for example the `piper_forward` samples array, the
   `http_get` body) is invisible to the scheme until it is re-routed. These are
   fixed individually.
 - **Interior / foreign pointers.** A pointer stashed where the compiler cannot see
@@ -227,6 +227,37 @@ This document records the decision and plan.
   ownership, so it is not freed a second time at scope exit. Explicit `model_free`
   remains available. Zero effect on programs that do not use `model`
   (byte-identical object output).
+
+  Two invariants make the emitted code correct, and both are covered by
+  `scripts/model_raii_check.sh`:
+
+  1. **One destructor emit point.** Every `return` stores its value and branches
+     to a single exit block; the destructor runs there and nowhere else. Emitting
+     it both at the `return` and at the fall-through epilogue (the original
+     design) produced two `ionic_model_free` references per model, i.e. a double
+     free.
+  2. **The return value is parked across the destructor.** `ionic_model_free`
+     takes the handle in `X0` and clobbers every caller-saved register, so a
+     function that owns a model spills its return value to a dedicated frame slot
+     before the free and reloads it afterwards. Without that, `return 42;` in
+     such a function returned whatever the free left in `X0`.
+
+  **Known limitation — ownership transfer is path-insensitive.** `return m`
+  clears `m`'s ownership in compile-time state that every runtime path shares.
+  A function that transfers a *different* model from each of two branches
+  therefore leaks: the first `return` clears its local, and the second path
+  still owns a handle the exit block no longer frees.
+
+      let a = load_model(p); let b = load_model(p);
+      if (c > 0) { return a; }   // frees b, clears a
+      return b;                  // clears b; a is never freed
+
+  Making this sound needs a per-path live set, or per-`return` destructors in a
+  reachability-aware exit block — neither fits the current single-exit design.
+  (Emitting a destructor at each transferring `return` was tried and reverted:
+  it widens the static free count without fixing the leak above.) The supported
+  shapes are one owner, one transfer point, and several owners with no transfer.
+  See the `ND_RETURN` note in `src/codegen/native.ionic`.
 - **Slice 2 (RC for strings/arrays) — prototyped and REVERTED.** See §10 for the
   implementation log and the prerequisite it exposed.
 

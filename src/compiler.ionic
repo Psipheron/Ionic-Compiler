@@ -1906,22 +1906,6 @@ fn cg_call_dispatch(string callee) -> int64 {
         emit(str_concat("  call void @ionic_write_wav(ptr ", str_concat(path, str_concat(", ptr ", str_concat(arr, str_concat(", i64 ", str_concat(ns2, str_concat(", i64 ", str_concat(sr, ")")))))))));
         cg_val = "0"; cg_ty = TY_VOID; return 0;
     }
-    if (str_eq(callee, "gguf_generate")) {
-        let mdl = ev_vals[1]; let prompt = ev_vals[2]; let maxt = ev_vals[3];
-        let r = fresh_reg();
-        emit(str_concat("  ", str_concat(r, str_concat(" = call ptr @ionic_gguf_generate(ptr ", str_concat(mdl, str_concat(", ptr ", str_concat(prompt, str_concat(", i64 ", str_concat(maxt, ")")))))))));
-        cg_val = r; cg_ty = TY_STR; return 0;
-    }
-    if (str_eq(callee, "gguf_set_temp")) {
-        let mdl = ev_vals[1]; let temp = ev_vals[2];
-        emit(str_concat("  call void @ionic_gguf_set_temp(ptr ", str_concat(mdl, str_concat(", double ", str_concat(temp, ")")))));
-        cg_val = "0"; cg_ty = TY_VOID; return 0;
-    }
-    if (str_eq(callee, "gguf_set_top_p")) {
-        let mdl = ev_vals[1]; let top_p = ev_vals[2];
-        emit(str_concat("  call void @ionic_gguf_set_top_p(ptr ", str_concat(mdl, str_concat(", double ", str_concat(top_p, ")")))));
-        cg_val = "0"; cg_ty = TY_VOID; return 0;
-    }
     if (str_eq(callee, "file_read")) {
         let path = ev_vals[1];
         let r = fresh_reg();
@@ -2649,9 +2633,6 @@ fn emit_preamble() -> int64 {
     emit("declare void @ionic_model_free(ptr)");
     emit("declare ptr  @ionic_piper_forward(ptr, ptr, double, double, double)");
     emit("declare void @ionic_write_wav(ptr, ptr, i64, i64)");
-    emit("declare ptr  @ionic_gguf_generate(ptr, ptr, i64)");
-    emit("declare void @ionic_gguf_set_temp(ptr, double)");
-    emit("declare void @ionic_gguf_set_top_p(ptr, double)");
     emit("declare void @ionic_runtime_init(i32, ptr)");
     emit("declare ptr  @ionic_get_arg(i64)");
     emit("declare i64  @ionic_cpu_core_count()");

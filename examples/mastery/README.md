@@ -24,6 +24,8 @@ the self-hosted compiler and prints labelled, deterministic output.
 - `03_args.ionic` — CLI argument + exit code (ex. 03.3)
 - `03_file_io.ionic` — `file_write`/`file_read` round trip (ex. 03.4)
 - `04_placement_types.ionic` — `@cpu`/`@gpu` functions that compile (ex. 04.4)
+- `04_pool_polymorphism.ionic` — builtins accept both pools; results infer their
+  pool from the operands (ex. 04.5)
 - `05_selective.ionic` — wildcard import, selective at codegen (ex. 05.1)
 - `05_rel/` — relative import demo (ex. 05.3); compile `main.ionic`
 - `07_leak.ionic` — string churn, unbounded RSS (ex. 07.1)
@@ -38,5 +40,7 @@ any build.
 - `fail/multi_error.ionic` — several errors in one pass (unit 03 §7)
 - `fail/string_array_print.ionic` — compiles+runs but prints a pointer (ex. 02.5)
 - `fail/tensor_mismatch.ionic` — tensor@gpu where tensor@cpu expected (ex. 04.1)
+- `fail/mixed_pool.ionic` — one operand in SRAM, one in VRAM, in a single builtin
+  call (ex. 04.6)
 - `fail/gpu_cpu_io.ionic` — contradicting `@gpu fn (@cpu …)` annotation (ex. 04.3)
 - `fail/resolution_miss.ionic` — unresolvable `import std.nosuch` (ex. 05.5)

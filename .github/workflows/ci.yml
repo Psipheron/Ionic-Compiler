@@ -127,6 +127,37 @@ jobs:
           /tmp/stdlib_test2 | grep -q "arr_sum = 100" || (echo "arr_sum check failed"; exit 1)
           /tmp/stdlib_test2 | grep -q "contains: ok"  || (echo "contains check failed"; exit 1)
 
+      # ── model RAII: exactly one free per owned model ─────────────────────
+      # The destructor must have a single emit point. Emitting it both at the
+      # scope-exit path and in the fall-through epilogue produced two
+      # ionic_model_free references per model, so the second freed a handle the
+      # first had already released. The counts below are the invariant; the
+      # runtime half of scripts/model_raii_check.sh is skipped here because CI
+      # has no ONNX model file.
+      - name: Model RAII emits one free per owned model
+        run: |
+          fail=0
+          check() {
+            name=$1; expected=$2; body=$3
+            printf 'fn main() -> int64 {\n%s\n    return 0;\n}\n' "$body" > /tmp/raii.ionic
+            rm -f /tmp/raii /tmp/raii.o
+            ./ionic_new /tmp/raii.ionic -o /tmp/raii >/tmp/raii.log 2>&1 || {
+              echo "COMPILE-FAIL $name"; cat /tmp/raii.log; fail=1; return; }
+            actual=$(nm -u /tmp/raii.o | grep -c '_ionic_model_free')
+            if [ "$actual" != "$expected" ]; then
+              echo "FAIL $name: expected $expected frees, got $actual"; fail=1
+            else
+              echo "ok   $name ($actual)"
+            fi
+          }
+          check "implicit RAII"  1 '    let m = load_model("x.onnx");'
+          check "explicit free"  1 '    let m = load_model("x.onnx");
+              model_free(m);'
+          check "two models"     2 '    let a = load_model("a.onnx");
+              let b = load_model("b.onnx");'
+          check "no model"       0 '    println("hi");'
+          exit $fail
+
       # ── Packaging: the released tarball must be standalone ───────────────
       # Mirrors release.yml's packaging step, then extracts to a throwaway
       # directory and compiles a program importing std.* from an unrelated
@@ -192,6 +223,37 @@ jobs:
           fi
           ./ionic_new examples/hw_tag_error.ionic -o /tmp/hw_tag_err 2>&1 \
             | grep -q "CPU-only I/O" || (echo "missing GPU-context diagnostic"; exit 1)
+
+      # ── Pool-polymorphic builtins (placement Stage B1) ───────────────────
+      # Builtins accept a tensor from either memory pool and produce their
+      # result in the pool their operands live in, so `tensor@gpu` finally has
+      # operations that can consume it. User functions stay strictly
+      # placement-typed — that is why tensor_mismatch.ionic must still fail.
+      #
+      # These run without any accelerator: the checks are purely static.
+      - name: Pool polymorphism — builtins accept tensor@gpu
+        run: |
+          ./ionic_new examples/mastery/04_pool_polymorphism.ionic -o /tmp/poolpoly
+          /tmp/poolpoly | grep -q "pool polymorphism: ok" \
+            || (echo "pool-polymorphism program failed"; exit 1)
+
+      - name: Pool polymorphism — user functions stay strict
+        run: |
+          if ./ionic_new examples/mastery/fail/tensor_mismatch.ionic -o /tmp/tm 2>/dev/null; then
+            echo "Expected tensor_mismatch.ionic to be rejected, but it compiled"; exit 1
+          fi
+          NO_COLOR=1 ./ionic_new examples/mastery/fail/tensor_mismatch.ionic -o /tmp/tm 2>&1 \
+            | grep -q "expected tensor@cpu, got tensor@gpu" \
+            || (echo "tensor_mismatch lost its placement diagnostic"; exit 1)
+
+      - name: Pool polymorphism — mixed-pool operands rejected
+        run: |
+          if ./ionic_new examples/mastery/fail/mixed_pool.ionic -o /tmp/mp 2>/dev/null; then
+            echo "Expected mixed_pool.ionic to be rejected, but it compiled"; exit 1
+          fi
+          NO_COLOR=1 ./ionic_new examples/mastery/fail/mixed_pool.ionic -o /tmp/mp 2>&1 \
+            | grep -q "mixed memory pools in call to 'mlx_add'" \
+            || (echo "missing mixed-pool diagnostic"; exit 1)
 
       # ── ML backends: MLX surface + graceful degradation ──────────────────
       # Two things must hold regardless of what is installed on the runner:
@@ -297,12 +359,129 @@ jobs:
           expect 4   "mlx_concatenate axis arg (2x2 ++ 2x2 on axis 1)"
           expect 1   "mlx_argmax + mlx_item dtype dispatch"
 
+      # ── BPE tokenizer: text <-> token ids ────────────────────────────────
+      # Exercises the JSON parser, the vocab hash table, the merge-rank pass and
+      # the byte-fallback path against a checked-in fixture, so this runs with no
+      # model download. `l y` -> `ly` in the fixture's merges proves the merge
+      # rank lookup works, not just single-token vocab hits.
+      - name: BPE tokenizer round-trips (self-hosted compiler)
+        run: |
+          cat > /tmp/bpe.ionic <<'EOF'
+          fn main() -> int64 {
+              let n = bpe_load("testdata/tokenizer_mini.json");
+              println(str_concat("vocab=", int64_to_str(n)));
+              println(str_concat("bos=",   int64_to_str(bpe_bos())));
+
+              let ids = [0]; arr_reset(ids);
+              bpe_encode("hello world", ids, 1);
+              mut i = 0;
+              while (i < len(ids)) { print(int64_to_str(ids[i])); print(" "); i = i + 1; }
+              println("");
+              println(str_concat("decoded=[", str_concat(bpe_decode(ids), "]")));
+
+              let ids2 = [0]; arr_reset(ids2);
+              bpe_encode("ly", ids2, 0);          // only reachable via the merge rule
+              mut j = 0;
+              while (j < len(ids2)) { print(int64_to_str(ids2[j])); print(" "); j = j + 1; }
+              println("");
+              return 0;
+          }
+          EOF
+          ./ionic_new /tmp/bpe.ionic -o /tmp/bpe
+          ( cd . && /tmp/bpe > /tmp/bpe.out 2>/dev/null )
+          cat /tmp/bpe.out
+          expect_line() {
+            grep -Fqx "$1" /tmp/bpe.out || (echo "expected '$1' ($2)"; exit 1)
+          }
+          expect_line "vocab=358"            "bpe_load returned the vocab size"
+          expect_line "bos=1"                "bpe_bos resolved <s>"
+          expect_line "1 355 356 "           "encode: BOS + ▁hello + ▁world"
+          expect_line "decoded=[ hello world]" "decode round-trips"
+          expect_line "3 357 "               "merge rule l+y -> ly applied"
+
+      # ── HTTP server: unified request handle, end to end over a real socket ──
+      # `http_accept` returns a request that owns its connection; `http_respond`
+      # and `http_req_done` take that same handle back. This drives it with curl
+      # and also checks the "client hangs up without sending" path, which used to
+      # double-close a recycled fd.
+      - name: HTTP server serves, 404s and survives a dropped connection
+        run: |
+          cat > /tmp/srv.ionic <<'EOF'
+          fn main() -> int64 {
+              let fd = http_serve(8097);
+              if (fd < 0) { println("serve failed"); return 1; }
+              mut served = 0;
+              while (served < 3) {
+                  let req = http_accept(fd);
+                  if (req >= 0) {
+                      served = served + 1;
+                      let path = http_path(req);
+                      if (str_eq(path, "/health")) {
+                          http_respond(req, 200, "text/plain", "ok");
+                      } else if (str_eq(path, "/echo")) {
+                          http_respond(req, 200, "application/json", http_req_body(req));
+                      } else {
+                          http_respond(req, 404, "application/json", "{\"error\":\"not found\"}");
+                      }
+                      http_req_done(req);
+                  }
+              }
+              http_close(fd);
+              return 0;
+          }
+          EOF
+          ./ionic_new /tmp/srv.ionic -o /tmp/srv
+          /tmp/srv & SRV=$!
+          sleep 1
+          # Drive all three requests from python so the check does not depend on
+          # `nc` being installed. The first socket sends nothing and disconnects
+          # immediately: http_accept must return -1 for it and keep serving.
+          python3 - <<'PY'
+          import socket, sys
+
+          def exchange(payload, expect_status):
+              s = socket.create_connection(("127.0.0.1", 8097), timeout=5)
+              s.sendall(payload)
+              data = b""
+              while True:
+                  c = s.recv(65536)
+                  if not c: break
+                  data += c
+              s.close()
+              head, _, body = data.partition(b"\r\n\r\n")
+              if not head.startswith(expect_status):
+                  print("bad status line:", head.split(b"\r\n")[0]); sys.exit(1)
+              return body
+
+          # 1. connect and hang up without sending a request
+          socket.create_connection(("127.0.0.1", 8097), timeout=5).close()
+
+          # 2. GET /health
+          body = exchange(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n", b"HTTP/1.1 200")
+          assert body == b"ok", body
+
+          # 3. POST /echo with a body larger than one recv() (5 KB)
+          big = b"x" * 5000
+          req = (b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n\r\n" % len(big)) + big
+          got = exchange(req, b"HTTP/1.1 200")
+          assert got == big, "echo truncated: %d of %d" % (len(got), len(big))
+          print("http server ok")
+          PY
+          # The server exits by itself after 3 served requests; don't hang if it
+          # did not (a failed check above exits before this line anyway).
+          for _ in 1 2 3 4 5 6 7 8 9 10; do
+            kill -0 $SRV 2>/dev/null || break
+            sleep 0.3
+          done
+          kill $SRV 2>/dev/null || true
+          wait $SRV 2>/dev/null || true
+
       # Backends must be linked only on demand: hello-world must not drag in
-      # mlx/llama/onnx (that would add load + init cost to every binary).
+      # mlx/onnx (that would add load + init cost to every binary).
       - name: Backend linkage is usage-gated
         run: |
           ./ionic_new examples/hello.ionic -o /tmp/hello_gate
-          n=$(otool -L /tmp/hello_gate | grep -Eic 'mlx|llama|onnx')
+          n=$(otool -L /tmp/hello_gate | grep -Eic 'mlx|onnx')
           if [ "$n" != "0" ]; then
             echo "hello-world unexpectedly links $n ML libs"; otool -L /tmp/hello_gate; exit 1
           fi

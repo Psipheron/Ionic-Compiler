@@ -279,11 +279,25 @@ mut fn_ret_svs = [""];
 mut fn_pcounts = [0];
 mut fn_pstarts = [0];
 mut fn_hws     = [0];   // hw annotation node per fn (0 = none) — for @cpu/@gpu checks
+mut fn_is_builtin = [0]; // 1 for registered builtins, 0 for user functions
+mut fn_pool_poly = [0];  // 1 = result pool is inferred from the first tensor arg
 mut fn_count   = 0;
 // Flat param table
 mut fp_tys   = [0];
 mut fp_svs   = [""];
 mut fp_count = 0;
+// Parallel to fp_tys: 1 when the parameter accepts a tensor of *any* placement.
+//
+// Builtins are the operations of the pool model, so they must work on whichever
+// pool their operands live in — `mlx_add(gpu_a, gpu_b)` is the whole reason
+// `tensor@gpu` exists. User functions are different: a `@cpu fn(tensor@cpu x)`
+// is a promise about where the work happens, and violating it is the error
+// placement types exist to catch. Keeping the two kinds of call apart is what
+// preserves `examples/mastery/fail/tensor_mismatch.ionic`.
+//
+// This is deliberately NOT folded into `ty_compat`, which stays strict for
+// every call. Only the builtin argument check consults this table.
+mut fp_anyplace = [0];
 
 fn fn_find(string name) -> int64 {
     mut i = 1;
@@ -478,6 +492,18 @@ fn is_tensor_ty(int64 ty) -> bool {
 fn tensor_convert_hint(int64 got, int64 want) -> string {
     if (got == TY_TENSOR_CPU && want == TY_TENSOR_GPU) { return " (call .toGpu() to convert)"; }
     if (got == TY_TENSOR_GPU && want == TY_TENSOR_CPU) { return " (call .toCpu() to convert)"; }
+    // Numeric types are NOT implicitly widened. `sqrt(4)` is not sqrt of four:
+    // float parameters travel as raw IEEE-754 bit patterns in general-purpose
+    // registers (see ionic_model_runtime.c — every float builtin takes
+    // int64_t and converts with i642d), so an integer argument is reinterpreted
+    // as a denormal near zero and the program silently returns the wrong
+    // answer. Rejecting it is the only safe choice; the fix is one call away.
+    if ((got == TY_INT64 || got == TY_BOOL) && want == TY_FLOAT64) {
+        return " (write 4.0, or convert with int64_to_float64(n))";
+    }
+    if (got == TY_FLOAT64 && (want == TY_INT64 || want == TY_BOOL)) {
+        return " (convert with float64_to_int64(x))";
+    }
     return "";
 }
 
@@ -573,11 +599,15 @@ fn register_fn_node(int64 node) -> int64 {
         fn_ret_tys[fn_count] = ret_ty;
         fn_ret_svs[fn_count] = ret_sv;
         fn_hws[fn_count]     = hw_node;
+        fn_is_builtin[fn_count] = 0;
+        fn_pool_poly[fn_count]  = 0;
     } else {
         push(fn_names,   name);
         push(fn_ret_tys, ret_ty);
         push(fn_ret_svs, ret_sv);
         push(fn_hws,     hw_node);
+        push(fn_is_builtin, 0);
+        push(fn_pool_poly,  0);
     }
     let pstart = fp_count + 1;
     if (fn_count < len(fn_pstarts)) { fn_pstarts[fn_count] = pstart; }
@@ -589,8 +619,13 @@ fn register_fn_node(int64 node) -> int64 {
         let pty   = node_ty_to_int(nd_i2[param]);
         let ptsv  = node_ty_val_sv(nd_i2[param]);
         fp_count = fp_count + 1;
-        if (fp_count < len(fp_tys)) { fp_tys[fp_count] = pty; fp_svs[fp_count] = ptsv; }
-        else { push(fp_tys, pty); push(fp_svs, ptsv); }
+        if (fp_count < len(fp_tys)) {
+            fp_tys[fp_count] = pty; fp_svs[fp_count] = ptsv;
+            fp_anyplace[fp_count] = 0;
+        } else {
+            push(fp_tys, pty); push(fp_svs, ptsv);
+            push(fp_anyplace, 0);
+        }
         pcount = pcount + 1;
         pnode  = nd_i3[pnode];
     }
@@ -606,6 +641,54 @@ fn pre_pass_fns(int64 fns_list) -> int64 {
 }
 
 // ── Built-in function registration ────────────────────────────────────────────
+
+// Declare the type of one parameter of the built-in registered most recently.
+// Call it immediately after register_builtin:
+//
+//     register_builtin("mlx_zeros", 2, TY_TENSOR_CPU, "");
+//     bparam(1, TY_ARRAY);      // shape
+//     bparam(2, TY_INT64);      // dtype
+//
+// Until this existed every builtin parameter was TY_UNKNOWN, which means the
+// checker accepted literally any argument: `mlx_zeros(2, 2)` and
+// `str_len(42)` both typechecked and then segfaulted in the runtime. A type
+// checker that cannot reject a wrong-typed call into its own standard library
+// is not enforcing anything, and it makes any *placement* rule built on top of
+// it unsound — you cannot enforce where a value lives if you never established
+// what the value is.
+//
+// Parameters left unspecified stay TY_UNKNOWN, which ty_compat treats as
+// "matches anything". That is the right default for genuinely polymorphic
+// builtins (`format` takes a variable number of strings; `len`/`push` work on
+// every array element type), and a deliberate escape hatch everywhere else.
+fn bparam(int64 idx, int64 ty) -> int64 {
+    let base = fn_pstarts[fn_count];
+    fp_tys[base + idx - 1] = ty;
+    // A tensor parameter of a *builtin* accepts either pool. Builtins are the
+    // operations of the pool model, so they must work on whichever pool their
+    // operands live in — `mlx_add(gpu_a, gpu_b)` is the entire reason
+    // `tensor@gpu` exists. User functions are different: a
+    // `@cpu fn(tensor@cpu x)` is a promise about where the work happens, and
+    // violating it is the error placement types exist to catch.
+    //
+    // Marking it here rather than at each call site means the whole
+    // registration table is covered by one rule, and a builtin cannot be
+    // forgotten. `bparams_tensor` funnels through here too.
+    if (ty == TY_TENSOR_CPU || ty == TY_TENSOR_GPU) {
+        fp_anyplace[base + idx - 1] = 1;
+    }
+    return 0;
+}
+
+// Convenience: declare the first `n` parameters as tensor handles of either
+// pool. MLX's entry points are overwhelmingly of the form (tensor, tensor, ...)
+// so this keeps the registration table readable.
+fn bparams_tensor(int64 n) -> int64 {
+    mut i = 1;
+    while (i <= n) { bparam(i, TY_TENSOR_CPU); i = i + 1; }
+    return 0;
+}
+
 fn register_builtin(string name, int64 pcount, int64 ret_ty, string ret_sv) -> int64 {
     fn_count = fn_count + 1;
     if (fn_count < len(fn_names)) {
@@ -614,12 +697,16 @@ fn register_builtin(string name, int64 pcount, int64 ret_ty, string ret_sv) -> i
         fn_ret_svs[fn_count] = ret_sv;
         fn_pcounts[fn_count] = pcount;
         fn_hws[fn_count]     = 0;
+        fn_is_builtin[fn_count] = 1;
+        fn_pool_poly[fn_count]  = 0;
     } else {
         push(fn_names,   name);
         push(fn_ret_tys, ret_ty);
         push(fn_ret_svs, ret_sv);
         push(fn_pcounts, pcount);
         push(fn_hws,     0);
+        push(fn_is_builtin, 1);
+        push(fn_pool_poly,  0);
     }
     let pstart = fp_count + 1;
     if (fn_count < len(fn_pstarts)) { fn_pstarts[fn_count] = pstart; }
@@ -628,55 +715,88 @@ fn register_builtin(string name, int64 pcount, int64 ret_ty, string ret_sv) -> i
     mut pi = 0;
     while (pi < pcount) {
         fp_count = fp_count + 1;
-        if (fp_count < len(fp_tys)) { fp_tys[fp_count] = TY_UNKNOWN; fp_svs[fp_count] = ""; }
-        else { push(fp_tys, TY_UNKNOWN); push(fp_svs, ""); }
+        if (fp_count < len(fp_tys)) {
+            fp_tys[fp_count] = TY_UNKNOWN; fp_svs[fp_count] = "";
+            fp_anyplace[fp_count] = 0;
+        } else {
+            push(fp_tys, TY_UNKNOWN); push(fp_svs, "");
+            push(fp_anyplace, 0);
+        }
         pi = pi + 1;
     }
     return 0;
 }
 
 fn register_builtins() -> int64 {
+    // print/println/format stay polymorphic: they accept int64, float64,
+    // string, and arrays, and the codegen picks the variant from the argument
+    // type. Leaving their parameter TY_UNKNOWN is what lets that dispatch work.
     register_builtin("print",             1, TY_VOID,    "");
     register_builtin("println",           1, TY_VOID,    "");
-    register_builtin("int64_to_str",      1, TY_STR,     "");
-    register_builtin("float64_to_str",    1, TY_STR,     "");
-    register_builtin("char_to_str",       1, TY_STR,     "");
-    register_builtin("str_concat",        2, TY_STR,     "");
-    register_builtin("str_len",           1, TY_INT64,   "");
-    register_builtin("str_eq",            2, TY_INT64,   "");
-    register_builtin("str_index",         2, TY_INT64,   "");
+    register_builtin("format",           -1, TY_STR,     "");
+    // len/push/arr_reset are polymorphic over the element type ([int64],
+    // [string], [float64] are all distinct runtime-visible types).
     register_builtin("len",               1, TY_INT64,   "");
     register_builtin("push",              2, TY_VOID,    "");
     register_builtin("arr_reset",         1, TY_VOID,    "");
-    register_builtin("get_arg",           1, TY_STR,     "");
-    register_builtin("file_read",         1, TY_STR,     "");
-    register_builtin("file_write",        2, TY_VOID,    "");
-    register_builtin("file_write_binary", 2, TY_VOID,    "");
-    register_builtin("system",            1, TY_INT64,   "");
-    register_builtin("sqrt",              1, TY_FLOAT64, "");
-    register_builtin("fabs",              1, TY_FLOAT64, "");
-    register_builtin("int64_to_float64",  1, TY_FLOAT64, "");
-    register_builtin("float64_to_int64",  1, TY_INT64,   "");
-    register_builtin("str_hash",          1, TY_INT64,   "");
+    register_builtin("arr_push_i64",      2, TY_INT64,   "");
+    bparam(2, TY_INT64);
+    // Conversion and strings — every parameter here has exactly one type.
+    register_builtin("int64_to_str",      1, TY_STR,     ""); bparam(1, TY_INT64);
+    register_builtin("float64_to_str",    1, TY_STR,     ""); bparam(1, TY_FLOAT64);
+    register_builtin("char_to_str",       1, TY_STR,     ""); bparam(1, TY_INT64);
+    register_builtin("str_concat",        2, TY_STR,     "");
+    bparam(1, TY_STR); bparam(2, TY_STR);
+    register_builtin("str_len",           1, TY_INT64,   ""); bparam(1, TY_STR);
+    register_builtin("str_eq",            2, TY_INT64,   "");
+    bparam(1, TY_STR); bparam(2, TY_STR);
+    register_builtin("str_index",         2, TY_INT64,   "");
+    bparam(1, TY_STR); bparam(2, TY_INT64);
+    register_builtin("str_slice",         3, TY_STR,     "");
+    bparam(1, TY_STR); bparam(2, TY_INT64); bparam(3, TY_INT64);
+    register_builtin("str_contains",      2, TY_INT64,   "");
+    bparam(1, TY_STR); bparam(2, TY_STR);
+    register_builtin("str_starts_with",   2, TY_INT64,   "");
+    bparam(1, TY_STR); bparam(2, TY_STR);
+    register_builtin("str_ends_with",     2, TY_INT64,   "");
+    bparam(1, TY_STR); bparam(2, TY_STR);
+    register_builtin("str_replace",       3, TY_STR,     "");
+    bparam(1, TY_STR); bparam(2, TY_STR); bparam(3, TY_STR);
+    register_builtin("str_to_int64",      1, TY_INT64,   ""); bparam(1, TY_STR);
+    register_builtin("get_arg",           1, TY_STR,     ""); bparam(1, TY_INT64);
+    register_builtin("exit",              1, TY_VOID,    ""); bparam(1, TY_INT64);
+    register_builtin("getenv",            1, TY_STR,     ""); bparam(1, TY_STR);
+    // Math. abs() is int64 (see the runtime: ionic_abs takes int64_t); fabs()
+    // is the float one. docs/language.md used to document abs as float64,
+    // which was wrong.
+    register_builtin("sqrt",              1, TY_FLOAT64, ""); bparam(1, TY_FLOAT64);
+    register_builtin("fabs",              1, TY_FLOAT64, ""); bparam(1, TY_FLOAT64);
+    register_builtin("pow",               2, TY_FLOAT64, "");
+    bparam(1, TY_FLOAT64); bparam(2, TY_FLOAT64);
+    register_builtin("floor",             1, TY_FLOAT64, ""); bparam(1, TY_FLOAT64);
+    register_builtin("ceil",              1, TY_FLOAT64, ""); bparam(1, TY_FLOAT64);
+    register_builtin("abs",               1, TY_INT64,   ""); bparam(1, TY_INT64);
+    register_builtin("int64_to_float64",  1, TY_FLOAT64, ""); bparam(1, TY_INT64);
+    register_builtin("float64_to_int64",  1, TY_INT64,   ""); bparam(1, TY_FLOAT64);
+    register_builtin("min",               2, TY_INT64,   "");
+    bparam(1, TY_INT64); bparam(2, TY_INT64);
+    register_builtin("max",               2, TY_INT64,   "");
+    bparam(1, TY_INT64); bparam(2, TY_INT64);
+    register_builtin("str_hash",          1, TY_INT64,   ""); bparam(1, TY_STR);
     register_builtin("cpu_core_count",    0, TY_INT64,   "");
     register_builtin("target_is_linux",   0, TY_INT64,   "");
-    register_builtin("exit",              1, TY_VOID,    "");
-    register_builtin("getenv",            1, TY_STR,     "");
-    register_builtin("str_to_int64",      1, TY_INT64,   "");
     register_builtin("read_line",         0, TY_STR,     "");
-    register_builtin("str_slice",         3, TY_STR,     "");
-    register_builtin("str_contains",      2, TY_INT64,   "");
-    register_builtin("str_starts_with",   2, TY_INT64,   "");
-    register_builtin("str_ends_with",     2, TY_INT64,   "");
-    register_builtin("str_replace",       3, TY_STR,     "");
-    register_builtin("str_to_float64_bits", 1, TY_INT64, "");
-    register_builtin("min",               2, TY_INT64,   "");
-    register_builtin("max",               2, TY_INT64,   "");
-    register_builtin("abs",               1, TY_INT64,   "");
-    register_builtin("pow",               2, TY_FLOAT64, "");
-    register_builtin("floor",             1, TY_FLOAT64, "");
-    register_builtin("ceil",              1, TY_FLOAT64, "");
-    register_builtin("fadd_bits",         2, TY_INT64,   "");
+    // File I/O — paths and contents are strings.
+    register_builtin("file_read",         1, TY_STR,     ""); bparam(1, TY_STR);
+    register_builtin("file_write",        2, TY_VOID,    "");
+    bparam(1, TY_STR); bparam(2, TY_STR);
+    register_builtin("file_write_binary", 2, TY_VOID,    ""); bparam(2, TY_STR);
+    register_builtin("file_size",         1, TY_INT64,   ""); bparam(1, TY_STR);
+    register_builtin("system",            1, TY_INT64,   ""); bparam(1, TY_STR);
+    // The *_bits helpers are the compile-time float path: they take and return
+    // raw IEEE-754 bit patterns in int64 slots.
+    register_builtin("str_to_float64_bits", 1, TY_INT64, ""); bparam(1, TY_STR);
+    register_builtin("fadd_bits",         2, TY_INT64,   ""); bparams_tensor(0);
     register_builtin("fsub_bits",         2, TY_INT64,   "");
     register_builtin("fmul_bits",         2, TY_INT64,   "");
     register_builtin("fdiv_bits",         2, TY_INT64,   "");
@@ -685,30 +805,47 @@ fn register_builtins() -> int64 {
     register_builtin("floor_bits",        1, TY_INT64,   "");
     register_builtin("ceil_bits",         1, TY_INT64,   "");
     register_builtin("int_to_fbits",      1, TY_INT64,   "");
-    register_builtin("format",           -1, TY_STR,     "");
     // Web request primitives
-    register_builtin("http_get",         1, TY_STR,     "");
+    register_builtin("http_get",         1, TY_STR,     ""); bparam(1, TY_STR);
     register_builtin("http_post",        2, TY_STR,     "");
-    register_builtin("http_status",      1, TY_INT64,   "");
-    register_builtin("http_body",        1, TY_STR,     "");
-    register_builtin("http_urlencode",   1, TY_STR,     "");
+    bparam(1, TY_STR); bparam(2, TY_STR);
+    register_builtin("http_status",      1, TY_INT64,   ""); bparam(1, TY_STR);
+    register_builtin("http_body",        1, TY_STR,     ""); bparam(1, TY_STR);
+    register_builtin("http_urlencode",   1, TY_STR,     ""); bparam(1, TY_STR);
+    // HTTP server + BPE tokenizer (see the "Local inference server" section of
+    // docs/guide.md). The server is single-request-at-a-time by design; the
+    // tokenizer is what turns token ids into text and back.
+    register_builtin("bpe_load",         1, TY_INT64,   ""); bparam(1, TY_STR);
+    register_builtin("bpe_encode",       3, TY_INT64,   "");
+    bparam(1, TY_STR); bparam(3, TY_INT64);
+    register_builtin("bpe_decode",       1, TY_STR,     "");
+    register_builtin("bpe_bos",          0, TY_INT64,   "");
+    register_builtin("bpe_eos",          0, TY_INT64,   "");
+    register_builtin("http_serve",       1, TY_INT64,   ""); bparam(1, TY_INT64);
+    register_builtin("http_accept",      1, TY_INT64,   ""); bparam(1, TY_INT64);
+    register_builtin("http_method",      1, TY_STR,     ""); bparam(1, TY_INT64);
+    register_builtin("http_path",        1, TY_STR,     ""); bparam(1, TY_INT64);
+    register_builtin("http_req_body",    1, TY_STR,     ""); bparam(1, TY_INT64);
+    register_builtin("http_req_done",    1, TY_INT64,   ""); bparam(1, TY_INT64);
+    register_builtin("http_respond",     4, TY_INT64,   "");
+    bparam(1, TY_INT64); bparam(2, TY_INT64); bparam(3, TY_STR); bparam(4, TY_STR);
+    register_builtin("http_close",       1, TY_INT64,   ""); bparam(1, TY_INT64);
     // Terminal / alternate-screen TUI primitives
     register_builtin("term_enter",        0, TY_INT64,   "");
     register_builtin("term_exit",         0, TY_INT64,   "");
-    register_builtin("term_write",        1, TY_INT64,   "");
+    register_builtin("term_write",        1, TY_INT64,   ""); bparam(1, TY_STR);
     register_builtin("term_flush",        0, TY_INT64,   "");
     register_builtin("term_size",         0, TY_INT64,   "");
-    register_builtin("term_poll",         1, TY_INT64,   "");
+    register_builtin("term_poll",         1, TY_INT64,   ""); bparam(1, TY_INT64);
     register_builtin("term_key",          0, TY_INT64,   "");
     // ML / model inference
-    register_builtin("load_model",        1, TY_MODEL_CPU,"");
-    register_builtin("model_free",        1, TY_VOID,    "");
-    register_builtin("model_forward",     2, TY_TENSOR_CPU,"");
-    register_builtin("gguf_generate",     3, TY_STR,     "");
-    register_builtin("gguf_set_temp",     2, TY_VOID,    "");
-    register_builtin("gguf_set_top_p",    2, TY_VOID,    "");
+    register_builtin("load_model",        1, TY_MODEL_CPU,""); bparam(1, TY_STR);
+    register_builtin("model_free",        1, TY_VOID,    ""); bparam(1, TY_MODEL_CPU);
+    register_builtin("model_forward",     2, TY_TENSOR_CPU,""); bparam(1, TY_MODEL_CPU);
     register_builtin("piper_forward",     5, TY_ARRAY,   "");
+    bparam(1, TY_MODEL_CPU);
     register_builtin("write_wav",         4, TY_VOID,    "");
+    bparam(1, TY_STR); bparam(3, TY_INT64); bparam(4, TY_INT64);
 
     // ── MLX tensor backend ──────────────────────────────────────────────────
     // Handles are typed `tensor@cpu` deliberately: they are host-side handles
@@ -718,67 +855,111 @@ fn register_builtins() -> int64 {
     //
     // Note: no RAII here. Unlike `load_model`, an mlx handle is not
     // auto-freed at scope exit — call mlx_free() explicitly.
+    //
+    // Parameter types are declared, not left TY_UNKNOWN. That is what makes
+    // the placement rules meaningful: `mlx_matmul(42, x)` is now rejected at
+    // compile time instead of reaching the runtime and dereferencing an
+    // integer. Integer parameters (dtype, axis, keepdims, index) are typed
+    // too, so `mlx_dim(a, "0")` is an error rather than a call that silently
+    // reads a string pointer as an index.
     // Construction
     register_builtin("mlx_zeros",         2, TY_TENSOR_CPU, "");
+    bparam(1, TY_ARRAY); bparam(2, TY_INT64);
     register_builtin("mlx_ones",          2, TY_TENSOR_CPU, "");
+    bparam(1, TY_ARRAY); bparam(2, TY_INT64);
     register_builtin("mlx_full",          3, TY_TENSOR_CPU, "");
+    bparam(1, TY_ARRAY); bparam(2, TY_FLOAT64); bparam(3, TY_INT64);
     register_builtin("mlx_arange",        4, TY_TENSOR_CPU, "");
+    bparam(1, TY_FLOAT64); bparam(2, TY_FLOAT64); bparam(3, TY_FLOAT64); bparam(4, TY_INT64);
     register_builtin("mlx_eye",           3, TY_TENSOR_CPU, "");
+    bparam(1, TY_INT64); bparam(2, TY_INT64); bparam(3, TY_INT64);
     register_builtin("mlx_random_normal", 4, TY_TENSOR_CPU, "");
+    bparam(1, TY_ARRAY); bparam(2, TY_FLOAT64); bparam(3, TY_FLOAT64); bparam(4, TY_INT64);
     register_builtin("mlx_random_uniform",4, TY_TENSOR_CPU, "");
+    bparam(1, TY_ARRAY); bparam(2, TY_FLOAT64); bparam(3, TY_FLOAT64); bparam(4, TY_INT64);
     register_builtin("mlx_from_array",    3, TY_TENSOR_CPU, "");
+    bparam(1, TY_ARRAY); bparam(2, TY_ARRAY); bparam(3, TY_INT64);
     // Lifetime / materialisation
     register_builtin("mlx_free",          1, TY_VOID,    "");
+    bparam(1, TY_TENSOR_CPU);
     register_builtin("mlx_eval",          1, TY_INT64,   "");
+    bparam(1, TY_TENSOR_CPU);
     register_builtin("mlx_to_array",      1, TY_ARRAY,   "");
+    bparam(1, TY_TENSOR_CPU);
     register_builtin("mlx_item",          1, TY_FLOAT64, "");
+    bparam(1, TY_TENSOR_CPU);
     // Inspection
     register_builtin("mlx_ndim",          1, TY_INT64,   "");
+    bparam(1, TY_TENSOR_CPU);
     register_builtin("mlx_size",          1, TY_INT64,   "");
+    bparam(1, TY_TENSOR_CPU);
     register_builtin("mlx_dim",           2, TY_INT64,   "");
+    bparam(1, TY_TENSOR_CPU); bparam(2, TY_INT64);
     register_builtin("mlx_shape",         1, TY_ARRAY,   "");
+    bparam(1, TY_TENSOR_CPU);
     register_builtin("mlx_dtype",         1, TY_INT64,   "");
+    bparam(1, TY_TENSOR_CPU);
     // Elementwise binary
-    register_builtin("mlx_add",           2, TY_TENSOR_CPU, "");
-    register_builtin("mlx_subtract",      2, TY_TENSOR_CPU, "");
-    register_builtin("mlx_multiply",      2, TY_TENSOR_CPU, "");
-    register_builtin("mlx_divide",        2, TY_TENSOR_CPU, "");
-    register_builtin("mlx_power",         2, TY_TENSOR_CPU, "");
-    register_builtin("mlx_maximum",       2, TY_TENSOR_CPU, "");
-    register_builtin("mlx_minimum",       2, TY_TENSOR_CPU, "");
-    register_builtin("mlx_matmul",        2, TY_TENSOR_CPU, "");
+    register_builtin("mlx_add",           2, TY_TENSOR_CPU, ""); bparams_tensor(2);
+    register_builtin("mlx_subtract",      2, TY_TENSOR_CPU, ""); bparams_tensor(2);
+    register_builtin("mlx_multiply",      2, TY_TENSOR_CPU, ""); bparams_tensor(2);
+    register_builtin("mlx_divide",        2, TY_TENSOR_CPU, ""); bparams_tensor(2);
+    register_builtin("mlx_power",         2, TY_TENSOR_CPU, ""); bparams_tensor(2);
+    register_builtin("mlx_maximum",       2, TY_TENSOR_CPU, ""); bparams_tensor(2);
+    register_builtin("mlx_minimum",       2, TY_TENSOR_CPU, ""); bparams_tensor(2);
+    register_builtin("mlx_matmul",        2, TY_TENSOR_CPU, ""); bparams_tensor(2);
     // Elementwise unary
-    register_builtin("mlx_negative",      1, TY_TENSOR_CPU, "");
-    register_builtin("mlx_square",        1, TY_TENSOR_CPU, "");
-    register_builtin("mlx_sqrt",          1, TY_TENSOR_CPU, "");
-    register_builtin("mlx_exp",           1, TY_TENSOR_CPU, "");
-    register_builtin("mlx_log",           1, TY_TENSOR_CPU, "");
-    register_builtin("mlx_abs",           1, TY_TENSOR_CPU, "");
-    register_builtin("mlx_tanh",          1, TY_TENSOR_CPU, "");
-    register_builtin("mlx_erf",           1, TY_TENSOR_CPU, "");
-    register_builtin("mlx_contiguous",    1, TY_TENSOR_CPU, "");
+    register_builtin("mlx_negative",      1, TY_TENSOR_CPU, ""); bparams_tensor(1);
+    register_builtin("mlx_square",        1, TY_TENSOR_CPU, ""); bparams_tensor(1);
+    register_builtin("mlx_sqrt",          1, TY_TENSOR_CPU, ""); bparams_tensor(1);
+    register_builtin("mlx_exp",           1, TY_TENSOR_CPU, ""); bparams_tensor(1);
+    register_builtin("mlx_log",           1, TY_TENSOR_CPU, ""); bparams_tensor(1);
+    register_builtin("mlx_abs",           1, TY_TENSOR_CPU, ""); bparams_tensor(1);
+    register_builtin("mlx_tanh",          1, TY_TENSOR_CPU, ""); bparams_tensor(1);
+    register_builtin("mlx_erf",           1, TY_TENSOR_CPU, ""); bparams_tensor(1);
+    register_builtin("mlx_contiguous",    1, TY_TENSOR_CPU, ""); bparams_tensor(1);
     // Reductions
     register_builtin("mlx_sum",           2, TY_TENSOR_CPU, "");
+    bparam(1, TY_TENSOR_CPU); bparam(2, TY_INT64);
     register_builtin("mlx_mean",          2, TY_TENSOR_CPU, "");
+    bparam(1, TY_TENSOR_CPU); bparam(2, TY_INT64);
     register_builtin("mlx_max",           2, TY_TENSOR_CPU, "");
+    bparam(1, TY_TENSOR_CPU); bparam(2, TY_INT64);
     register_builtin("mlx_min",           2, TY_TENSOR_CPU, "");
+    bparam(1, TY_TENSOR_CPU); bparam(2, TY_INT64);
     register_builtin("mlx_sum_axis",      3, TY_TENSOR_CPU, "");
+    bparam(1, TY_TENSOR_CPU); bparam(2, TY_INT64); bparam(3, TY_INT64);
     register_builtin("mlx_mean_axis",     3, TY_TENSOR_CPU, "");
+    bparam(1, TY_TENSOR_CPU); bparam(2, TY_INT64); bparam(3, TY_INT64);
     register_builtin("mlx_argmax",        3, TY_TENSOR_CPU, "");
+    bparam(1, TY_TENSOR_CPU); bparam(2, TY_INT64); bparam(3, TY_INT64);
     register_builtin("mlx_softmax",       2, TY_TENSOR_CPU, "");
+    bparam(1, TY_TENSOR_CPU); bparam(2, TY_INT64);
     register_builtin("mlx_log_softmax",   2, TY_TENSOR_CPU, "");
+    bparam(1, TY_TENSOR_CPU); bparam(2, TY_INT64);
     // Shape
     register_builtin("mlx_reshape",       2, TY_TENSOR_CPU, "");
+    bparam(1, TY_TENSOR_CPU); bparam(2, TY_ARRAY);
     register_builtin("mlx_transpose",     2, TY_TENSOR_CPU, "");
+    bparam(1, TY_TENSOR_CPU); bparam(2, TY_ARRAY);
     register_builtin("mlx_astype",        2, TY_TENSOR_CPU, "");
+    bparam(1, TY_TENSOR_CPU); bparam(2, TY_INT64);
     register_builtin("mlx_slice",         4, TY_TENSOR_CPU, "");
+    bparam(1, TY_TENSOR_CPU); bparam(2, TY_INT64); bparam(3, TY_INT64); bparam(4, TY_INT64);
     register_builtin("mlx_take",          3, TY_TENSOR_CPU, "");
+    bparam(1, TY_TENSOR_CPU); bparam(2, TY_ARRAY); bparam(3, TY_INT64);
     register_builtin("mlx_concatenate",   3, TY_TENSOR_CPU, "");
+    bparam(1, TY_TENSOR_CPU); bparam(2, TY_TENSOR_CPU); bparam(3, TY_INT64);
     // NN primitives
     register_builtin("mlx_sdpa",          5, TY_TENSOR_CPU, "");
+    bparams_tensor(3); bparam(4, TY_FLOAT64); bparam(5, TY_INT64);
     register_builtin("mlx_rms_norm",      3, TY_TENSOR_CPU, "");
+    bparam(1, TY_TENSOR_CPU); bparam(2, TY_TENSOR_CPU); bparam(3, TY_FLOAT64);
     register_builtin("mlx_layer_norm",    4, TY_TENSOR_CPU, "");
+    bparams_tensor(3); bparam(4, TY_FLOAT64);
     register_builtin("mlx_rope",          5, TY_TENSOR_CPU, "");
+    bparam(1, TY_TENSOR_CPU); bparam(2, TY_INT64); bparam(3, TY_FLOAT64);
+    bparam(4, TY_INT64); bparam(5, TY_INT64);
     // Diagnostics / memory
     register_builtin("mlx_available",       0, TY_INT64, "");
     register_builtin("mlx_metal_available", 0, TY_INT64, "");
@@ -789,14 +970,59 @@ fn register_builtins() -> int64 {
     register_builtin("mlx_reset_peak_memory",0, TY_INT64,"");
     register_builtin("mlx_clear_cache",     0, TY_INT64, "");
     register_builtin("mlx_set_memory_limit",1, TY_INT64, "");
+    bparam(1, TY_INT64);
     // Safetensors
     register_builtin("mlx_load_safetensors", 1, TY_INT64, "");
     register_builtin("mlx_weights_free",     1, TY_VOID,  "");
     register_builtin("mlx_weights_count",    1, TY_INT64, "");
     register_builtin("mlx_weights_at",       2, TY_TENSOR_CPU, "");
+    bparam(2, TY_INT64);
     register_builtin("mlx_weights_key_at",   2, TY_STR,   "");
+    bparam(2, TY_INT64);
     register_builtin("mlx_weights_get",      2, TY_TENSOR_CPU, "");
+    bparam(2, TY_STR);
     register_builtin("mlx_save_safetensors", 3, TY_INT64, "");
+    bparam(1, TY_TENSOR_CPU); bparam(2, TY_STR); bparam(3, TY_STR);
+    finalize_pool_poly();
+    return 0;
+}
+
+// Mark the builtins whose *result* pool is inferred from their operands.
+//
+// A builtin that takes a tensor and returns a tensor computes in whichever
+// pool its operands live in: `mlx_add(gpu_a, gpu_b)` produces a GPU-resident
+// result, and `mlx_add(cpu_a, cpu_b)` an SRAM-resident one. The builtin is
+// the operation of the pool model, not a promise about one particular pool.
+//
+// The rule is derived from the registration table rather than restated per
+// builtin, so it cannot drift:
+//
+//   pool-polymorphic  ⇔  builtin ∧ returns a tensor ∧ takes a tensor operand
+//
+// Builtins that *construct* a tensor (mlx_zeros, mlx_ones, mlx_from_array,
+// …) take no tensor operand, so there is nothing to infer from and they
+// allocate in SRAM. Transferring into the accelerator pool is an explicit
+// `.toGpu()`, which is the operation the pool budget is charged for.
+//
+// Builtins that take a model (model_forward) keep their declared result pool:
+// the model is SRAM-resident, so the result is SRAM-resident.
+fn finalize_pool_poly() -> int64 {
+    mut i = 1;
+    while (i <= fn_count) {
+        if (fn_is_builtin[i] == 1) {
+            let ret = fn_ret_tys[i];
+            if (ret == TY_TENSOR_CPU || ret == TY_TENSOR_GPU) {
+                let base = fn_pstarts[i];
+                let np   = fn_pcounts[i];
+                mut j = 1;
+                while (j <= np && fn_pool_poly[i] == 0) {
+                    if (fp_anyplace[base + j - 1] == 1) { fn_pool_poly[i] = 1; }
+                    j = j + 1;
+                }
+            }
+        }
+        i = i + 1;
+    }
     return 0;
 }
 
@@ -943,6 +1169,14 @@ fn sc_expr(int64 node) -> int64 {
                            str_concat(", got ", int64_to_str(got_argc))));
         }
 
+        // Track the pools of the tensor operands. `first_pool` is the pool of
+        // the first tensor operand — the one a pool-polymorphic builtin's
+        // result lives in. `other_pool` / `other_idx` record a disagreeing
+        // operand so the diagnostic can name both sides.
+        mut first_pool  = 0;
+        mut first_idx   = 0;
+        mut other_pool  = 0;
+        mut other_idx   = 0;
         mut anode = args_list;
         mut pidx  = 1;
         while (anode != 0) {
@@ -952,7 +1186,26 @@ fn sc_expr(int64 node) -> int64 {
                 let base = fn_pstarts[fi];
                 let paty = fp_tys[base + pidx - 1];
                 let pasv = fp_svs[base + pidx - 1];
-                if (!ty_compat(arg_ty, paty)) {
+                if (fp_anyplace[base + pidx - 1] == 1) {
+                    // A builtin tensor operand. It may live in either pool —
+                    // that is the whole point of pool polymorphism — but every
+                    // operand of one call must agree, because the operation
+                    // runs in a single pool.
+                    if (arg_ty == TY_TENSOR_CPU || arg_ty == TY_TENSOR_GPU) {
+                        if (first_pool == 0) {
+                            first_pool = arg_ty;
+                            first_idx  = pidx;
+                        } else if (arg_ty != first_pool && other_pool == 0) {
+                            other_pool = arg_ty;
+                            other_idx  = pidx;
+                        }
+                    } else if (arg_ty != TY_UNKNOWN) {
+                        sc_error_at(str_concat("type error in arg ", str_concat(int64_to_str(pidx), str_concat(" of '", str_concat(callee, "'")))),
+                            str_concat(str_concat(str_concat("expected ", ty_name(paty, pasv)),
+                                                  str_concat(", got ", ty_name(arg_ty, ""))),
+                                       tensor_convert_hint(arg_ty, paty)));
+                    }
+                } else if (!ty_compat(arg_ty, paty)) {
                     sc_error_at(str_concat("type error in arg ", str_concat(int64_to_str(pidx), str_concat(" of '", str_concat(callee, "'")))),
                         str_concat(str_concat(str_concat("expected ", ty_name(paty, pasv)),
                                               str_concat(", got ", ty_name(arg_ty, ""))),
@@ -963,8 +1216,32 @@ fn sc_expr(int64 node) -> int64 {
             pidx  = pidx + 1;
         }
 
+        // Mixed-pool operands. This is not an extra restriction invented on
+        // top of pool polymorphism — it is what makes the result-pool
+        // inference below well defined. `mlx_add(cpu_a, gpu_b)` has no
+        // single pool to compute in, and the backend would not check: the
+        // MLX probes showed that a mixed-device addition returns silently
+        // wrong data rather than failing. The compiler has to catch it.
+        if (other_pool != 0) {
+            // Point at the call, not at whichever operand happened to be
+            // visited last.
+            sc_active_node = node;
+            sc_error_at(str_concat("mixed memory pools in call to '", str_concat(callee, "'")),
+                str_concat(str_concat(str_concat("operand ", str_concat(int64_to_str(first_idx), " is ")),
+                                      ty_name(first_pool, "")),
+                           str_concat(str_concat(", but operand ", str_concat(int64_to_str(other_idx), " is ")),
+                                      str_concat(ty_name(other_pool, ""), " (move both operands to the same pool first)"))));
+        }
+
         sc_ty  = fn_ret_tys[fi];
         sc_sv  = fn_ret_svs[fi];
+        // A pool-polymorphic builtin produces its result in the pool its
+        // operands live in: `mlx_add(gpu_a, gpu_b)` is GPU-resident,
+        // `mlx_add(cpu_a, cpu_b)` is SRAM-resident. The builtin is the
+        // operation of the pool model, not a promise about one pool.
+        if (fn_pool_poly[fi] == 1 && first_pool != 0) {
+            sc_ty = first_pool;
+        }
         return 0;
     }
 

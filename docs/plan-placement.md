@@ -1,6 +1,6 @@
 # Functional Hardware-Placement Awareness
 
-Status: **plan, not yet implemented** — revised 2026-11-03
+Status: **Stage A complete, Stage B1 complete, B2–B6 pending** — revised 2026-11-03
 Author: audit + design pass
 Scope: `src/semantic/checker.ionic`, `src/ionic_model_runtime.c`,
 `src/codegen/native.ionic`, `docs/`
@@ -119,6 +119,9 @@ the values fit.
 
 ### 3.3 The blocking finding: `tensor@gpu` is a dead type
 
+> **Fixed in Stage B1.** See §3.3a. The audit below is kept because it is the
+> reason B1 exists and the shape of the fix follows from it.
+
 - **No builtin accepts `tensor@gpu`.** 70 `mlx_*` builtins are registered
   (`checker.ionic:821-940`); 47 declare `TY_TENSOR_CPU` as their return type,
   and the rest take tensor parameters via `bparams_tensor` (`:650-654`), which
@@ -129,6 +132,45 @@ the values fit.
 
 A `tensor@gpu` can be created, passed to `@gpu` functions, and returned — and
 nothing can consume it.
+
+### 3.3a Stage B1: builtins are pool-polymorphic *(implemented 2026-11-03)*
+
+The dead type is fixed by one rule, derived from the registration table rather
+than restated per builtin:
+
+    pool-polymorphic  ⇔  builtin ∧ returns a tensor ∧ takes a tensor operand
+
+Concretely, in `src/semantic/checker.ionic`:
+
+- `fp_anyplace[]` is parallel to `fp_tys[]`. `bparam()` sets it for any tensor
+  parameter of a builtin, so `bparams_tensor()` and every explicit
+  `bparam(..., TY_TENSOR_CPU)` are covered by one edit rather than 48. A user
+  function's parameters are never marked, which is what preserves strictness.
+- `fn_pool_poly[]` is computed by `finalize_pool_poly()` after registration. It
+  marks the builtins whose *result* pool is inferred from their operands.
+- At a call site the checker tracks the pool of the first tensor operand and
+  reports any operand that disagrees. The result type becomes the first
+  operand's pool when `fn_pool_poly` is set.
+
+`ty_compat` is deliberately untouched: it stays strict for every call, and only
+the builtin argument check consults `fp_anyplace`. That is why
+`examples/mastery/fail/tensor_mismatch.ionic` still fails with the identical
+diagnostic — it calls a *user* function.
+
+Two consequences worth noting:
+
+- **Constructors stay SRAM.** `mlx_zeros`, `mlx_ones`, `mlx_from_array` and
+  friends take no tensor operand, so there is nothing to infer from and they
+  allocate in SRAM. Entering VRAM is an explicit `.toGpu()`, which is also the
+  operation a capacity budget would be charged for.
+- **Mixed-pool operands are rejected** (§6.2.1). This is not an added
+  restriction; it is what makes result-pool inference well defined. MLX does
+  not check it — a mixed-device add returns silently wrong data — so the
+  compiler must.
+
+Regression coverage: `examples/mastery/04_pool_polymorphism.ionic` (compiles and
+runs) and `examples/mastery/fail/mixed_pool.ionic` (rejected with exactly one
+diagnostic, the intended one).
 
 ### 3.4 The runtime is inverted
 
@@ -288,13 +330,15 @@ lands is archaeology.
 
 **Files:** `src/semantic/checker.ionic`
 
-1. **Placement-polymorphic builtins.** Builtins accept any tensor pool; user
-   `@cpu`/`@gpu` functions stay strict. This keeps
+1. **Placement-polymorphic builtins.** ✅ **Done, see §3.3a.** Builtins accept
+   any tensor pool; user `@cpu`/`@gpu` functions stay strict. This keeps
    `examples/mastery/fail/tensor_mismatch.ionic` failing (it uses a *user*
    function) while giving `tensor@gpu` something to do.
-   - ~48 edit sites: 21 lines use `bparams_tensor`, 27 use explicit
-     `bparam(..., TY_TENSOR_CPU)`.
-   - Builtin results infer their pool from the first tensor argument.
+   - The audit predicted ~48 edit sites. Folding the rule into `bparam()`
+     reduced it to one: a parallel `fp_anyplace[]` table marked there covers
+     both `bparams_tensor` and every explicit `bparam(..., TY_TENSOR_CPU)`.
+   - Builtin results infer their pool from the first tensor argument
+     (`fn_pool_poly[]`, computed by `finalize_pool_poly()`).
 2. **Pool declaration and budget scope** (§6.1). The pool size is declared
    once at top level; `@gpu(f)` narrows a scope to a fraction of it.
 
@@ -321,11 +365,12 @@ lands is archaeology.
    unbounded (decision 4: reject).
 5. **Use-after-move** for transfers (§4.3), per decision 1.
 6. **Mixed-pool operands** are a compile error when both placements are known
-   (§6.2).
+   (§6.2). ✅ **Done** — it is also required for B1's result-pool inference to
+   be well defined, so it landed with B1 rather than after it.
 
-**Verify:** `tensor_mismatch.ionic` still fails with the same message;
-`04_placement_types.ionic` still compiles; a new over-budget program is
-rejected with the arithmetic shown.
+**Verify:** `tensor_mismatch.ionic` still fails with the same message ✅;
+`04_placement_types.ionic` still compiles ✅; a new over-budget program is
+rejected with the arithmetic shown — **pending** (needs B2/B4).
 
 **Risk:** the biggest checker change in the project's history. It is also the
 highest-value part, because it is the part that is portable and testable

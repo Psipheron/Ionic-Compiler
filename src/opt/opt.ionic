@@ -367,6 +367,13 @@ fn opt_subst_general(int64 node, string var, int64 rep) -> int64 {
         nd_i2[node] = opt_subst_general(nd_i2[node], var, rep);
     } else if (k == ND_FIELD_INIT) {
         nd_i2[node] = opt_subst_general(nd_i2[node], var, rep);
+    } else if (k == ND_CONS) {
+        // Struct-literal field lists, array elements and call arguments are all
+        // cons cells. Without this the walk stops at the list head and the
+        // parameter identifiers survive into the caller, which then fails to
+        // link against a non-existent __g_<param> global.
+        nd_i2[node] = opt_subst_general(nd_i2[node], var, rep);
+        nd_i3[node] = opt_subst_general(nd_i3[node], var, rep);
     } else if (k == ND_TO_GPU || k == ND_TO_CPU) {
         nd_i2[node] = opt_subst_general(nd_i2[node], var, rep);
     }

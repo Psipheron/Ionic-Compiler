@@ -1,0 +1,69 @@
+// Mastery 07.2 — `model` ownership: the destructor must not eat the result.
+//
+// A local bound to `load_model(...)` owns an ONNX Runtime handle, and the
+// compiler emits `ionic_model_free` for it at scope exit. Two things have to
+// hold for that to be correct, and this file exercises both:
+//
+//   1. Exactly one free per live model, whichever path leaves the function.
+//      `early` returns from inside an `if`; `two` owns two models at once.
+//      (Emitting the destructor at both the return and the fall-through
+//      epilogue was a double free — this test fails loudly if that returns.)
+//
+//   2. The return value survives the destructor. `ionic_model_free` takes the
+//      handle in X0 and clobbers caller-saved registers, so the value must be
+//      parked in the frame before the free. Without that, the int cases below
+//      print heap addresses instead of 42 / 7 / 11 / 22.
+//
+// Run with the compiled binary; `nm -u` on the .o should show one undefined
+// reference to ionic_model_free per owning local that is not transferred away:
+// early 1, fsum 1, two 2, take 0 — four — plus the explicit free in `main`.
+//
+//   ./ionic_new examples/mastery/07_model_raii.ionic -o /tmp/model_raii
+//   /tmp/model_raii
+//   nm -u /tmp/model_raii.o | grep -c ionic_model_free    # -> 5
+//
+// SCAFFOLDING LIMIT — ownership transfer is tracked at compile time, so a
+// function cannot transfer a *different* model from each of two branches (the
+// second `return` sees the first transfer's effect and the other handle leaks).
+// See the KNOWN LIMITATION note on ND_RETURN in src/codegen/native.ionic. `take`
+// below is the supported shape: one owner, one transfer point.
+//
+// Requires models/en_US-amy-low.onnx (the repository ships it).
+
+fn early(string path, int64 n) -> int64 {
+    let m = load_model(path);
+    if (n > 0) { return 42; }     // return from inside a branch
+    return 7;                     // return from the fall-through
+}
+
+fn fsum(string path, int64 n) -> float64 {
+    let m = load_model(path);
+    if (n > 0) { return 1.5; }    // float returns go through X0 too
+    return 2.5;
+}
+
+fn two(string path, int64 n) -> int64 {
+    let a = load_model(path);
+    let b = load_model(path);     // two live handles at the same exit block
+    if (n > 0) { return 11; }
+    return 22;
+}
+
+fn take(string path) -> model {
+    let m = load_model(path);
+    return m;                     // ownership transferred — caller frees it
+}
+
+fn main() -> int64 {
+    println(early("models/en_US-amy-low.onnx", 1));   // 42
+    println(early("models/en_US-amy-low.onnx", 0));   // 7
+    println(fsum("models/en_US-amy-low.onnx", 1));    // 1.5
+    println(fsum("models/en_US-amy-low.onnx", 0));    // 2.5
+    println(two("models/en_US-amy-low.onnx", 1));     // 11
+    println(two("models/en_US-amy-low.onnx", 0));     // 22
+
+    let t = take("models/en_US-amy-low.onnx");        // caller owns `t`
+    println("take ok");
+    model_free(t);                                    // ...so the caller frees it
+    return 0;
+}

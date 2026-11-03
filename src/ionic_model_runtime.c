@@ -3,10 +3,13 @@
  *
  * Supported backends:
  *   .onnx              — ONNX Runtime (CoreML GPU on macOS)
- *   .gguf              — llama.cpp (Metal GPU on macOS)
  *   .pt / .pth         — stub (LibTorch not yet linked)
  *   .h5                — stub (Keras/HDF5 not yet linked)
  *   .mlmodel           — stub (CoreML direct load not yet linked)
+ *
+ * .gguf is recognised by detect_format() but has no runner: GGUF support was
+ * removed with llama.cpp (see the note above the MLX section) and will return
+ * via a low-level ggml path.
  *
  * Public API:
  *   ionic_load_model(path)                                 -> opaque handle
@@ -14,9 +17,6 @@
  *   ionic_model_forward(model, input)                      -> tensor ptr (ONNX single-input)
  *   ionic_piper_forward(model, phoneme_arr, ns, ls, nw)    -> float64 array
  *   ionic_write_wav(path, arr, n_samples, sample_rate)     -> void
- *   ionic_gguf_generate(model, prompt, max_tokens)         -> string (char*)
- *   ionic_gguf_set_temp(model, temp)                       -> void
- *   ionic_gguf_set_top_p(model, top_p)                     -> void
  */
 
 #include <stdio.h>
@@ -34,6 +34,7 @@
 #  ifdef __APPLE__
 #    include <mach-o/dyld.h>
 #  endif
+#  include <sys/stat.h>
 #endif
 
 /* ── ONNX Runtime ─────────────────────────────────────────────────────────── */
@@ -45,9 +46,11 @@
 #endif
 
 /* ── llama.cpp (GGUF) ─────────────────────────────────────────────────────── */
-#ifdef IONIC_HAVE_LLAMA
-#  include "llama.h"
-#endif
+/* Removed. GGUF text generation ran through llama.cpp's high-level API, whose
+ * only placement control is n_gpu_layers — a single load-time integer with no
+ * per-tensor residency. That could not back the language's tensor@cpu /
+ * tensor@gpu distinction without pretending, so inference is ONNX Runtime only
+ * until a low-level ggml path lands. See docs/language.md. */
 
 /* ── MLX (Apple-silicon array/tensor runtime) ───────────────────────────────
  * MLX is an *array* runtime, not a model loader: it gives us n-dim arrays,
@@ -56,10 +59,9 @@
  * this is the backend brick, not SGD/Adam. See the "MLX backend" section
  * below for the public ionic_mlx_* surface.
  *
- * Only available on macOS/arm64 (Metal). The GGUF/llama.cpp path stays the
- * portable fallback: on Linux, MLX is compiled out entirely and every
- * ionic_mlx_* entry point reports "not compiled in" rather than failing to
- * link.
+ * Only available on macOS/arm64 (Metal). On Linux, MLX is compiled out
+ * entirely and every ionic_mlx_* entry point reports "not compiled in" rather
+ * than failing to link.
  * ------------------------------------------------------------------------- */
 #if defined(IONIC_HAVE_MLX) && defined(__APPLE__)
 #  include "mlx/c/mlx.h"
@@ -245,6 +247,20 @@ char *ionic_file_read(const char *path) {
 }
 
 int64_t ionic_system(const char *cmd) { return (int64_t)system(cmd); }
+
+/* Byte length of a regular file, or -1 when the path is missing or is not a
+   regular file. This exists so the compiler's backend discovery can ask "is
+   libonnxruntime.so here?" cheaply. ionic_file_read() would do, but it mallocs
+   the whole file and Ionic strings are never freed — probing a multi-hundred-
+   megabyte shared library that way leaks all of it, once per probe attempt per
+   compile. */
+int64_t ionic_file_size(const char *path) {
+    if (!path || !path[0]) return -1;
+    struct stat st;
+    if (stat(path, &st) != 0) return -1;
+    if (!S_ISREG(st.st_mode)) return -1;
+    return (int64_t)st.st_size;
+}
 
 /* ── Basic I/O builtins ───────────────────────────────────────────────────── */
 
@@ -529,9 +545,11 @@ static ModelFormat detect_format(const char *path) {
         if (strcmp(dot, ".safetensors") == 0) return MODEL_FMT_SAFETENSORS;
     }
     /* Magic-byte fallback for extension-less files (e.g. Ollama blobs).
+     * Only GGUF has an unambiguous magic; an extension-less ONNX file is not
+     * identifiable this way, so it needs its ".onnx" name.
      * Note: safetensors has no magic — its first 8 bytes are the little-endian
      * length of a JSON header, so it cannot be identified here. Give it an
-     * explicit extension, or load it with mlx_safetensors_open(). */
+     * explicit extension, or load it with mlx_load_safetensors(). */
     FILE *f = fopen(path, "rb");
     if (!f) return MODEL_FMT_UNKNOWN;
     unsigned char magic[8] = {0};
@@ -600,148 +618,6 @@ static void ort_free(void *model) {
 
 #endif /* IONIC_HAVE_ORT */
 
-/* ════════════════════════════════════════════════════════════════════════════
- * llama.cpp / GGUF backend
- * ════════════════════════════════════════════════════════════════════════════ */
-
-#ifdef IONIC_HAVE_LLAMA
-
-static int g_llama_backend_init = 0;
-
-static void ensure_llama_backend(void) {
-    if (g_llama_backend_init) return;
-    llama_backend_init();
-    g_llama_backend_init = 1;
-}
-
-typedef struct {
-    ModelFormat          fmt;        /* MODEL_FMT_GGUF */
-    struct llama_model  *model;
-    struct llama_context*ctx;
-    float                temperature; /* sampling temperature */
-    float                top_p;       /* nucleus sampling p   */
-} GgufHandle;
-
-static void *gguf_load(const char *path) {
-    ensure_llama_backend();
-
-    struct llama_model_params mparams = llama_model_default_params();
-    mparams.n_gpu_layers = 999; /* offload all layers to Metal */
-
-    struct llama_model *model = llama_model_load_from_file(path, mparams);
-    if (!model) {
-        fprintf(stderr, "[ionic/llama] failed to load: %s\n", path);
-        return NULL;
-    }
-
-    struct llama_context_params cparams = llama_context_default_params();
-    cparams.n_ctx   = 4096;
-    cparams.n_batch = 512;
-
-    struct llama_context *ctx = llama_init_from_model(model, cparams);
-    if (!ctx) {
-        fprintf(stderr, "[ionic/llama] failed to create context\n");
-        llama_model_free(model);
-        return NULL;
-    }
-
-    GgufHandle *h = calloc(1, sizeof(GgufHandle));
-    h->fmt         = MODEL_FMT_GGUF;
-    h->model       = model;
-    h->ctx         = ctx;
-    h->temperature = 0.8f;
-    h->top_p       = 0.95f;
-
-    fprintf(stderr, "[ionic/llama] loaded: %s\n", path);
-    return h;
-}
-
-static void ionic_gguf_handle_free(void *model) {
-    GgufHandle *h = model;
-    /* Order matters: free context before model, then backend to drain Metal residency sets */
-    if (h->ctx)   { llama_free(h->ctx);         h->ctx   = NULL; }
-    if (h->model) { llama_model_free(h->model);  h->model = NULL; }
-    llama_backend_free();
-    g_llama_backend_init = 0;
-    free(h);
-}
-
-/* Generate text from a prompt; returns a malloc'd string owned by the runtime */
-static const char *gguf_generate(void *model, const char *prompt, int64_t max_tokens) {
-    GgufHandle *h = model;
-    const struct llama_vocab *vocab = llama_model_get_vocab(h->model);
-
-    /* Tokenise prompt */
-    int n_prompt_tokens = -llama_tokenize(vocab, prompt, (int32_t)strlen(prompt),
-                                           NULL, 0, 1, 1);
-    llama_token *prompt_tokens = malloc((size_t)n_prompt_tokens * sizeof(llama_token));
-    llama_tokenize(vocab, prompt, (int32_t)strlen(prompt),
-                   prompt_tokens, n_prompt_tokens, 1, 1);
-
-    /* KV-cache reset */
-    llama_memory_clear(llama_get_memory(h->ctx), 1);
-
-    /* Build sampler chain */
-    struct llama_sampler_chain_params sparams = llama_sampler_chain_default_params();
-    struct llama_sampler *smpl = llama_sampler_chain_init(sparams);
-    llama_sampler_chain_add(smpl, llama_sampler_init_penalties(
-        (int32_t)llama_vocab_n_tokens(vocab), 64, 1.1f, 0.0f, 0.0f));
-    llama_sampler_chain_add(smpl, llama_sampler_init_top_p(h->top_p, 1));
-    llama_sampler_chain_add(smpl, llama_sampler_init_temp(h->temperature));
-    llama_sampler_chain_add(smpl, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
-
-    /* Decode prompt in one batch */
-    struct llama_batch batch = llama_batch_get_one(prompt_tokens, n_prompt_tokens);
-    if (llama_decode(h->ctx, batch) != 0) {
-        fprintf(stderr, "[ionic/llama] prompt decode failed\n");
-        llama_sampler_free(smpl);
-        free(prompt_tokens);
-        return "";
-    }
-
-    /* Accumulate output into a growable buffer */
-    size_t buf_cap = 4096;
-    size_t buf_len = 0;
-    char  *buf     = malloc(buf_cap);
-    buf[0] = '\0';
-
-    char piece[256];
-    int64_t generated = 0;
-
-    while (generated < max_tokens) {
-        llama_token tok = llama_sampler_sample(smpl, h->ctx, -1);
-
-        if (llama_vocab_is_eog(vocab, tok)) break;
-
-        int n = llama_token_to_piece(vocab, tok, piece, sizeof(piece) - 1, 0, 1);
-        if (n < 0) n = 0;
-        piece[n] = '\0';
-
-        /* Grow buffer if needed */
-        while (buf_len + (size_t)n + 1 > buf_cap) {
-            buf_cap *= 2;
-            buf = realloc(buf, buf_cap);
-        }
-        memcpy(buf + buf_len, piece, (size_t)n);
-        buf_len += (size_t)n;
-        buf[buf_len] = '\0';
-
-        /* Decode the new token */
-        llama_token new_tok = tok;
-        struct llama_batch next = llama_batch_get_one(&new_tok, 1);
-        if (llama_decode(h->ctx, next) != 0) break;
-
-        generated++;
-    }
-
-    llama_sampler_free(smpl);
-    free(prompt_tokens);
-
-    fprintf(stderr, "[ionic/llama] generated %lld tokens\n", (long long)generated);
-    return buf; /* caller owns — but Ionic treats strings as const; leak is acceptable for now */
-}
-
-#endif /* IONIC_HAVE_LLAMA */
 
 /* ════════════════════════════════════════════════════════════════════════════
  * MLX tensor backend
@@ -775,8 +651,7 @@ static const char *gguf_generate(void *model, const char *prompt, int64_t max_to
  * Compiled only when IONIC_HAVE_MLX is defined AND we're on Apple (Metal).
  * On Linux every entry point is present but returns the "unavailable" value,
  * so an Ionic program that mentions mlx_* still *links* — it just reports at
- * runtime that the backend isn't compiled in, exactly like the llama.cpp
- * path does today. GGUF/llama.cpp remains the portable fallback.
+ * runtime that the backend isn't compiled in.
  * ════════════════════════════════════════════════════════════════════════════ */
 
 #if IONIC_MLX_ACTIVE
@@ -1791,7 +1666,7 @@ int64_t ionic_mlx_save_safetensors(void *h, const char *path, const char *key) {
 
 /* Every MLX entry point exists on every platform so Ionic programs that use
  * mlx_* still *link* — it just reports at runtime that the backend isn't
- * compiled in, exactly like the llama.cpp path does today.
+ * compiled in.
  *
  * The stub set is generated by hand from the real definitions above; keep the
  * two in sync when adding an op. A missing stub is a LINK error on Linux, not a
@@ -1805,8 +1680,7 @@ static void mlx_unavailable(void) {
     if (warned) return;
     warned = 1;
     fprintf(stderr, "[ionic/mlx] MLX backend not compiled in on this platform "
-                    "(Apple silicon + mlx-c required; GGUF/llama.cpp remains "
-                    "available)\n");
+                    "(Apple silicon + mlx-c required)\n");
 }
 
 /* ── Predicates / diagnostics ─────────────────────────────────────────────── */
@@ -1920,10 +1794,14 @@ void *ionic_load_model(const char *path) {
         case MODEL_FMT_ONNX:
             return ort_load(path);
 #endif
-#ifdef IONIC_HAVE_LLAMA
         case MODEL_FMT_GGUF:
-            return gguf_load(path);
-#endif
+            /* Recognised, but there is no runner: llama.cpp was removed because
+             * its only placement control (n_gpu_layers) is a single load-time
+             * integer and cannot express per-value tensor residency. Use an
+             * ONNX export, or wait for the low-level ggml path. */
+            fprintf(stderr, "[ionic] load_model: GGUF inference was removed with llama.cpp; "
+                            "export the model to ONNX instead\n");
+            return NULL;
         case MODEL_FMT_PT:
             fprintf(stderr, "[ionic] load_model: PyTorch (.pt/.pth) not yet supported\n");
             return NULL;
@@ -1945,51 +1823,15 @@ void ionic_model_free(void *model) {
 #ifdef IONIC_HAVE_ORT
         case MODEL_FMT_ONNX: ort_free(model); break;
 #endif
-#ifdef IONIC_HAVE_LLAMA
-        case MODEL_FMT_GGUF: ionic_gguf_handle_free(model); break;
-#endif
         default: free(model); break;
     }
 }
 
 void *ionic_model_forward(void *model, void *input) {
     if (!model) return input;
-    fprintf(stderr, "[ionic] ionic_model_forward: use ionic_piper_forward for ONNX, ionic_gguf_generate for GGUF\n");
+    fprintf(stderr, "[ionic] ionic_model_forward: model handles are backend-specific; "
+                    "use ionic_piper_forward for ONNX\n");
     return input;
-}
-
-/* ── GGUF text generation ─────────────────────────────────────────────────── */
-
-const char *ionic_gguf_generate(void *model, const char *prompt, int64_t max_tokens) {
-#ifdef IONIC_HAVE_LLAMA
-    if (!model || handle_fmt(model) != MODEL_FMT_GGUF) {
-        fprintf(stderr, "[ionic] gguf_generate: not a GGUF model\n");
-        return "";
-    }
-    return gguf_generate(model, prompt, max_tokens);
-#else
-    (void)model; (void)prompt; (void)max_tokens;
-    fprintf(stderr, "[ionic] gguf_generate: llama.cpp not compiled in\n");
-    return "";
-#endif
-}
-
-void ionic_gguf_set_temp(void *model, double temp) {
-#ifdef IONIC_HAVE_LLAMA
-    if (model && handle_fmt(model) == MODEL_FMT_GGUF)
-        ((GgufHandle *)model)->temperature = (float)temp;
-#else
-    (void)model; (void)temp;
-#endif
-}
-
-void ionic_gguf_set_top_p(void *model, double top_p) {
-#ifdef IONIC_HAVE_LLAMA
-    if (model && handle_fmt(model) == MODEL_FMT_GGUF)
-        ((GgufHandle *)model)->top_p = (float)top_p;
-#else
-    (void)model; (void)top_p;
-#endif
 }
 
 /* ── Piper TTS forward (ONNX) ─────────────────────────────────────────────── */
@@ -2596,3 +2438,796 @@ int64_t ionic_term_flush(void)  { return -1; }
 int64_t ionic_term_poll(int64_t timeout_ms) { (void)timeout_ms; return -1; }
 int64_t ionic_term_key(void)    { return -1; }
 #endif
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Minimal JSON — just enough to read tokenizer.json and model config.json
+ *
+ * A full-featured parser is unnecessary: the only consumers are the BPE
+ * tokenizer (one big object of string->int plus an array of merge rules) and a
+ * config lookup by key. This parses the whole document into a small tree and
+ * provides typed accessors. It handles \uXXXX escapes because tokenizer.json
+ * encodes the SentencePiece word marker U+2581 ("▁") that way in places.
+ * ════════════════════════════════════════════════════════════════════════════ */
+
+typedef enum { JNULL, JBOOL, JNUM, JSTR, JARR, JOBJ } JType;
+
+typedef struct JVal {
+    JType      type;
+    double     num;
+    int        boolean;
+    char      *str;        /* JSTR payload, or the key in a JOBJ parent */
+    struct JVal **items;   /* JARR elements / JOBJ values */
+    char     **keys;       /* JOBJ keys (parallel to items) */
+    int        n, cap;
+} JVal;
+
+static JVal *jnew(JType t) {
+    JVal *v = (JVal *)calloc(1, sizeof(JVal));
+    v->type = t;
+    return v;
+}
+
+static void jfree(JVal *v) {
+    if (!v) return;
+    if (v->str) free(v->str);
+    for (int i = 0; i < v->n; i++) {
+        if (v->keys) free(v->keys[i]);
+        jfree(v->items[i]);
+    }
+    free(v->items);
+    free(v->keys);
+    free(v);
+}
+
+static void jpush(JVal *v, char *key, JVal *item) {
+    if (v->n >= v->cap) {
+        v->cap = v->cap ? v->cap * 2 : 8;
+        v->items = (JVal **)realloc(v->items, (size_t)v->cap * sizeof(JVal *));
+        v->keys  = (char **)realloc(v->keys, (size_t)v->cap * sizeof(char *));
+    }
+    v->keys[v->n]  = key;
+    v->items[v->n] = item;
+    v->n++;
+}
+
+/* Encode a codepoint as UTF-8 into buf; returns bytes written. */
+static int utf8_put(char *buf, unsigned cp) {
+    if (cp < 0x80) { buf[0] = (char)cp; return 1; }
+    if (cp < 0x800) {
+        buf[0] = (char)(0xC0 | (cp >> 6));
+        buf[1] = (char)(0x80 | (cp & 0x3F));
+        return 2;
+    }
+    if (cp < 0x10000) {
+        buf[0] = (char)(0xE0 | (cp >> 12));
+        buf[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        buf[2] = (char)(0x80 | (cp & 0x3F));
+        return 3;
+    }
+    buf[0] = (char)(0xF0 | (cp >> 18));
+    buf[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+    buf[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+    buf[3] = (char)(0x80 | (cp & 0x3F));
+    return 4;
+}
+
+static JVal *jparse(const char **pp);
+static void jws(const char **pp) {
+    while (**pp == ' ' || **pp == '\t' || **pp == '\n' || **pp == '\r') (*pp)++;
+}
+
+static char *jparse_string(const char **pp) {
+    if (**pp != '"') return NULL;
+    (*pp)++;
+    size_t cap = 16, len = 0;
+    char *out = (char *)malloc(cap);
+    while (**pp && **pp != '"') {
+        unsigned char c = (unsigned char)**pp;
+        char tmp[4];
+        int tn = 0;
+        if (c == '\\') {
+            (*pp)++;
+            char e = **pp;
+            if (e == 'n') { tmp[0] = '\n'; tn = 1; (*pp)++; }
+            else if (e == 't') { tmp[0] = '\t'; tn = 1; (*pp)++; }
+            else if (e == 'r') { tmp[0] = '\r'; tn = 1; (*pp)++; }
+            else if (e == 'b') { tmp[0] = '\b'; tn = 1; (*pp)++; }
+            else if (e == 'f') { tmp[0] = '\f'; tn = 1; (*pp)++; }
+            else if (e == 'u') {
+                (*pp)++;
+                unsigned cp = 0;
+                for (int k = 0; k < 4 && **pp; k++) {
+                    char h = **pp; (*pp)++;
+                    cp <<= 4;
+                    if (h >= '0' && h <= '9') cp |= (unsigned)(h - '0');
+                    else if (h >= 'a' && h <= 'f') cp |= (unsigned)(h - 'a' + 10);
+                    else if (h >= 'A' && h <= 'F') cp |= (unsigned)(h - 'A' + 10);
+                }
+                /* surrogate pair */
+                if (cp >= 0xD800 && cp <= 0xDBFF && **pp == '\\') {
+                    const char *save = *pp;
+                    (*pp)++;
+                    if (**pp == 'u') {
+                        (*pp)++;
+                        unsigned lo = 0;
+                        for (int k = 0; k < 4 && **pp; k++) {
+                            char h = **pp; (*pp)++;
+                            lo <<= 4;
+                            if (h >= '0' && h <= '9') lo |= (unsigned)(h - '0');
+                            else if (h >= 'a' && h <= 'f') lo |= (unsigned)(h - 'a' + 10);
+                            else if (h >= 'A' && h <= 'F') lo |= (unsigned)(h - 'A' + 10);
+                        }
+                        cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                    } else {
+                        *pp = save;
+                    }
+                }
+                tn = utf8_put(tmp, cp);
+            }
+            else { tmp[0] = e; tn = 1; if (**pp) (*pp)++; }
+        } else {
+            tmp[0] = (char)c; tn = 1; (*pp)++;
+        }
+        if (len + (size_t)tn + 1 > cap) {
+            while (len + (size_t)tn + 1 > cap) cap *= 2;
+            out = (char *)realloc(out, cap);
+        }
+        memcpy(out + len, tmp, (size_t)tn);
+        len += (size_t)tn;
+    }
+    if (**pp == '"') (*pp)++;
+    out[len] = '\0';
+    return out;
+}
+
+static JVal *jparse(const char **pp) {
+    jws(pp);
+    char c = **pp;
+    if (c == '{') {
+        (*pp)++;
+        JVal *o = jnew(JOBJ);
+        jws(pp);
+        if (**pp == '}') { (*pp)++; return o; }
+        for (;;) {
+            jws(pp);
+            char *k = jparse_string(pp);
+            jws(pp);
+            if (**pp == ':') (*pp)++;
+            JVal *v = jparse(pp);
+            jpush(o, k, v);
+            jws(pp);
+            if (**pp == ',') { (*pp)++; continue; }
+            if (**pp == '}') { (*pp)++; break; }
+            break;
+        }
+        return o;
+    }
+    if (c == '[') {
+        (*pp)++;
+        JVal *a = jnew(JARR);
+        jws(pp);
+        if (**pp == ']') { (*pp)++; return a; }
+        for (;;) {
+            JVal *v = jparse(pp);
+            jpush(a, NULL, v);
+            jws(pp);
+            if (**pp == ',') { (*pp)++; continue; }
+            if (**pp == ']') { (*pp)++; break; }
+            break;
+        }
+        return a;
+    }
+    if (c == '"') { JVal *s = jnew(JSTR); s->str = jparse_string(pp); return s; }
+    if (!strncmp(*pp, "true", 4))  { *pp += 4; JVal *b = jnew(JBOOL); b->boolean = 1; return b; }
+    if (!strncmp(*pp, "false", 5)) { *pp += 5; JVal *b = jnew(JBOOL); b->boolean = 0; return b; }
+    if (!strncmp(*pp, "null", 4))  { *pp += 4; return jnew(JNULL); }
+    {
+        char *end = NULL;
+        double d = strtod(*pp, &end);
+        if (end == *pp) { (*pp)++; return jnew(JNULL); }
+        *pp = end;
+        JVal *n = jnew(JNUM);
+        n->num = d;
+        return n;
+    }
+}
+
+static JVal *jget(JVal *o, const char *key) {
+    if (!o || o->type != JOBJ) return NULL;
+    for (int i = 0; i < o->n; i++)
+        if (o->keys[i] && strcmp(o->keys[i], key) == 0) return o->items[i];
+    return NULL;
+}
+
+static JVal *jparse_file(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz <= 0) { fclose(f); return NULL; }
+    char *buf = (char *)malloc((size_t)sz + 1);
+    if (fread(buf, 1, (size_t)sz, f) != (size_t)sz) { free(buf); fclose(f); return NULL; }
+    buf[sz] = '\0';
+    fclose(f);
+    const char *p = buf;
+    JVal *v = jparse(&p);
+    free(buf);
+    return v;
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * BPE tokenizer (SentencePiece/HF `tokenizer.json`, byte_fallback)
+ *
+ * This is the piece that lets Ionic *generate text* rather than only emit
+ * token ids. It lives in C because Ionic has no hash map, and the vocab is a
+ * 32k string->int table that must be probed per token.
+ *
+ * Algorithm, matching the HF `tokenizers` reference for this family:
+ *   1. normalizer: prepend "▁" (U+2581) and replace every ' ' with "▁"
+ *   2. seed the symbol list with *bytes* — but any run that forms a known
+ *      vocab entry is merged first, via greedy longest-match over the raw
+ *      bytes; this reproduces SentencePiece's pre-tokenisation without
+ *      shipping a regex engine.
+ *   3. repeatedly merge the adjacent pair with the lowest merge rank,
+ *      leftmost first, until no pair remains.
+ *   4. any symbol that is not in the vocab becomes <0xNN> byte tokens.
+ *   5. post_processor: prepend BOS (<s>, id 1).
+ *
+ * Decode inverts it: ids -> strings, "▁" -> ' ', <0xNN> -> raw byte.
+ * ════════════════════════════════════════════════════════════════════════════ */
+
+#define BPE_HASH_BITS 16
+#define BPE_HASH_SIZE (1 << BPE_HASH_BITS)
+
+typedef struct BpeEntry {
+    char *key;
+    int   id;
+    struct BpeEntry *next;
+} BpeEntry;
+
+typedef struct {
+    BpeEntry *bucket[BPE_HASH_SIZE];
+    /* merge ranks: "a b" -> rank. Only the rank matters, not the result. */
+    BpeEntry *merges[BPE_HASH_SIZE];
+
+    char **id_to_str;      /* vocab_size strings, owned */
+    int    vocab_size;
+    int    merge_count;    /* number of merge rules loaded (for the log line) */
+    int    bos_id, eos_id, unk_id;
+    int    byte_fallback;
+    /* byte token ids, or -1 when the token is absent */
+    int    byte_ids[256];
+    int    loaded;
+} BpeTokenizer;
+
+static BpeTokenizer g_bpe;
+
+static unsigned bpe_hash(const char *s) {
+    unsigned h = 2166136261u;
+    while (*s) { h ^= (unsigned char)*s++; h *= 16777619u; }
+    return h & (BPE_HASH_SIZE - 1);
+}
+
+static void bpe_bucket_put(BpeEntry **bucket, const char *key, int id) {
+    unsigned b = bpe_hash(key);
+    BpeEntry *e = (BpeEntry *)malloc(sizeof(BpeEntry));
+    e->key  = strdup(key);
+    e->id   = id;
+    e->next = bucket[b];
+    bucket[b] = e;
+}
+
+static int bpe_bucket_get(BpeEntry **bucket, const char *key) {
+    for (BpeEntry *e = bucket[bpe_hash(key)]; e; e = e->next)
+        if (strcmp(e->key, key) == 0) return e->id;
+    return -1;
+}
+
+static void bpe_free_bucket(BpeEntry **bucket) {
+    for (int i = 0; i < BPE_HASH_SIZE; i++) {
+        BpeEntry *e = bucket[i];
+        while (e) { BpeEntry *n = e->next; free(e->key); free(e); e = n; }
+        bucket[i] = NULL;
+    }
+}
+
+/* Encode a merge rule "a b" as key "a\x01b" so it can share the hash table. */
+static void bpe_merge_key(char *dst, size_t cap, const char *a, const char *b) {
+    snprintf(dst, cap, "%s\x01%s", a, b);
+}
+
+/* Look up a single symbol in the vocab. */
+static int bpe_lookup(const char *sym) {
+    return bpe_bucket_get(g_bpe.bucket, sym);
+}
+
+/* Longest vocab match starting at s, up to maxn bytes. Returns length or 0. */
+static int bpe_longest(const char *s, int maxn) {
+    /* Cap the probe: the longest tokens in a SentencePiece vocab are short;
+       a 32-byte window is generous and keeps this O(32) per position. */
+    char buf[64];
+    int limit = maxn < 32 ? maxn : 32;
+    for (int n = limit; n >= 1; n--) {
+        memcpy(buf, s, (size_t)n);
+        buf[n] = '\0';
+        if (bpe_lookup(buf) >= 0) return n;
+    }
+    return 0;
+}
+
+typedef struct { char *s; } BpeSym;
+
+int64_t ionic_bpe_load(const char *path) {
+    bpe_free_bucket(g_bpe.bucket);
+    bpe_free_bucket(g_bpe.merges);
+    if (g_bpe.id_to_str) {
+        for (int i = 0; i < g_bpe.vocab_size; i++) free(g_bpe.id_to_str[i]);
+        free(g_bpe.id_to_str);
+        g_bpe.id_to_str = NULL;
+    }
+    memset(&g_bpe, 0, sizeof(g_bpe));
+
+    JVal *root = jparse_file(path);
+    if (!root) { fprintf(stderr, "[ionic/bpe] cannot read %s\n", path); return -1; }
+
+    JVal *model = jget(root, "model");
+    JVal *vocab = model ? jget(model, "vocab") : NULL;
+    JVal *merges = model ? jget(model, "merges") : NULL;
+    if (!vocab || vocab->type != JOBJ) {
+        fprintf(stderr, "[ionic/bpe] no vocab in %s\n", path);
+        jfree(root);
+        return -1;
+    }
+
+    /* Determine the id space. Ids are dense but not necessarily ordered, so
+       size from the maximum id seen. */
+    int maxid = -1;
+    for (int i = 0; i < vocab->n; i++) {
+        int id = (int)vocab->items[i]->num;
+        if (id > maxid) maxid = id;
+    }
+    g_bpe.vocab_size = maxid + 1;
+    g_bpe.id_to_str = (char **)calloc((size_t)g_bpe.vocab_size, sizeof(char *));
+    for (int i = 0; i < 256; i++) g_bpe.byte_ids[i] = -1;
+
+    for (int i = 0; i < vocab->n; i++) {
+        const char *k = vocab->keys[i];
+        int id = (int)vocab->items[i]->num;
+        bpe_bucket_put(g_bpe.bucket, k, id);
+        g_bpe.id_to_str[id] = strdup(k);
+        /* record <0xNN> byte tokens */
+        if (k[0] == '<' && k[1] == '0' && k[2] == 'x' && k[5] == '>') {
+            char hex[3] = { k[3], k[4], 0 };
+            int b = (int)strtol(hex, NULL, 16);
+            if (b >= 0 && b < 256) g_bpe.byte_ids[b] = id;
+        }
+    }
+
+    if (merges && merges->type == JARR) {
+        for (int i = 0; i < merges->n; i++) {
+            JVal *m = merges->items[i];
+            if (m->type != JSTR || !m->str) continue;
+            char key[512];
+            char a[256], b[256];
+            const char *sp = strchr(m->str, ' ');
+            if (!sp) continue;
+            size_t la = (size_t)(sp - m->str);
+            if (la >= sizeof(a)) la = sizeof(a) - 1;
+            memcpy(a, m->str, la); a[la] = '\0';
+            snprintf(b, sizeof(b), "%s", sp + 1);
+            bpe_merge_key(key, sizeof(key), a, b);
+            bpe_bucket_put(g_bpe.merges, key, i);
+        }
+        g_bpe.merge_count = merges->n;
+    }
+
+    /* special ids */
+    g_bpe.bos_id = bpe_lookup("<s>");
+    g_bpe.eos_id = bpe_lookup("</s>");
+    g_bpe.unk_id = bpe_lookup("<unk>");
+    if (g_bpe.bos_id < 0) g_bpe.bos_id = 1;
+    if (g_bpe.eos_id < 0) g_bpe.eos_id = 2;
+    if (g_bpe.unk_id < 0) g_bpe.unk_id = 0;
+
+    JVal *bf = model ? jget(model, "byte_fallback") : NULL;
+    g_bpe.byte_fallback = bf && bf->type == JBOOL ? bf->boolean : 1;
+
+    /* Capture this *before* jfree(): `merges` dangles afterwards, and reading
+       it in the log line below is a use-after-free that silently printed
+       "(no merges)" for every vocabulary. */
+    int n_merges = g_bpe.merge_count;
+    g_bpe.loaded = 1;
+    jfree(root);
+    fprintf(stderr, "[ionic/bpe] loaded %s: %d tokens, %d merges\n",
+            path, g_bpe.vocab_size, n_merges);
+    return g_bpe.vocab_size;
+}
+
+static void bpe_push_str(IonicArray *out, int id) {
+    ionic_array_push_i64(out, (int64_t)id);
+}
+
+/* Merge syms in place until no adjacent pair has a merge rank. */
+static int bpe_merge(BpeSym *syms, int n) {
+    char key[600];
+    for (;;) {
+        int best = -1, best_rank = -1;
+        for (int i = 0; i + 1 < n; i++) {
+            bpe_merge_key(key, sizeof(key), syms[i].s, syms[i + 1].s);
+            int r = bpe_bucket_get(g_bpe.merges, key);
+            if (r >= 0 && (best_rank < 0 || r < best_rank)) { best_rank = r; best = i; }
+        }
+        if (best < 0) break;
+        /* merge syms[best] and syms[best+1] */
+        size_t la = strlen(syms[best].s), lb = strlen(syms[best + 1].s);
+        char *m = (char *)malloc(la + lb + 1);
+        memcpy(m, syms[best].s, la);
+        memcpy(m + la, syms[best + 1].s, lb);
+        m[la + lb] = '\0';
+        free(syms[best].s);
+        free(syms[best + 1].s);
+        syms[best].s = m;
+        for (int j = best + 1; j + 1 < n; j++) syms[j] = syms[j + 1];
+        n--;
+    }
+    return n;
+}
+
+/* Encode `text` into `out` (an [int64] array). Returns the token count. */
+int64_t ionic_bpe_encode(const char *text, void *out_arr, int64_t add_bos) {
+    if (!g_bpe.loaded) { fprintf(stderr, "[ionic/bpe] not loaded\n"); return -1; }
+    IonicArray *out = (IonicArray *)out_arr;
+    out->len = 0;
+    if (!text) return 0;
+    if (add_bos) bpe_push_str(out, g_bpe.bos_id);
+
+    /* Step 1: normalizer — replace ' ' with the word marker, prefix one. */
+    size_t tl = strlen(text);
+    size_t ncap = tl * 4 + 8;
+    char *norm = (char *)malloc(ncap);
+    size_t np = 0;
+    /* U+2581 = E2 96 81 */
+    norm[np++] = (char)0xE2; norm[np++] = (char)0x96; norm[np++] = (char)0x81;
+    for (size_t i = 0; i < tl; i++) {
+        if (np + 4 > ncap) { ncap *= 2; norm = (char *)realloc(norm, ncap); }
+        if (text[i] == ' ') {
+            norm[np++] = (char)0xE2; norm[np++] = (char)0x96; norm[np++] = (char)0x81;
+        } else {
+            norm[np++] = text[i];
+        }
+    }
+    norm[np] = '\0';
+
+    /* Step 2: greedy longest-match into symbols, then BPE-merge each run. */
+    BpeSym *syms = (BpeSym *)malloc(sizeof(BpeSym) * (np + 1));
+    int nsym = 0;
+    size_t pos = 0;
+    while (pos < np) {
+        int m = bpe_longest(norm + pos, (int)(np - pos));
+        if (m > 0) {
+            syms[nsym].s = (char *)malloc((size_t)m + 1);
+            memcpy(syms[nsym].s, norm + pos, (size_t)m);
+            syms[nsym].s[m] = '\0';
+            nsym++;
+            pos += (size_t)m;
+        } else {
+            /* single raw byte; may need byte-fallback below */
+            syms[nsym].s = (char *)malloc(2);
+            syms[nsym].s[0] = norm[pos];
+            syms[nsym].s[1] = '\0';
+            nsym++;
+            pos++;
+        }
+    }
+
+    nsym = bpe_merge(syms, nsym);
+
+    for (int i = 0; i < nsym; i++) {
+        int id = bpe_lookup(syms[i].s);
+        if (id >= 0) {
+            bpe_push_str(out, id);
+        } else if (g_bpe.byte_fallback) {
+            for (const unsigned char *c = (const unsigned char *)syms[i].s; *c; c++) {
+                int bid = g_bpe.byte_ids[*c];
+                bpe_push_str(out, bid >= 0 ? bid : g_bpe.unk_id);
+            }
+        } else {
+            bpe_push_str(out, g_bpe.unk_id);
+        }
+        free(syms[i].s);
+    }
+    free(syms);
+    free(norm);
+    return out->len;
+}
+
+/* Decode `ids` (an [int64] array) into a freshly allocated string. */
+char *ionic_bpe_decode(void *ids_arr) {
+    IonicArray *a = (IonicArray *)ids_arr;
+    size_t cap = (size_t)a->len * 4 + 16, len = 0;
+    char *out = (char *)malloc(cap);
+    int64_t *slots = (int64_t *)a->data;
+    for (int64_t i = 0; i < a->len; i++) {
+        int id = (int)slots[i];
+        if (id < 0 || id >= g_bpe.vocab_size || !g_bpe.id_to_str[id]) continue;
+        const char *tok = g_bpe.id_to_str[id];
+        /* <0xNN> -> raw byte */
+        if (tok[0] == '<' && tok[1] == '0' && tok[2] == 'x' && tok[5] == '>' && strlen(tok) == 6) {
+            char hex[3] = { tok[3], tok[4], 0 };
+            unsigned char b = (unsigned char)strtol(hex, NULL, 16);
+            if (len + 2 > cap) { cap *= 2; out = (char *)realloc(out, cap); }
+            out[len++] = (char)b;
+            continue;
+        }
+        /* skip specials */
+        if ((tok[0] == '<' && tok[1] == 's' && tok[2] == '>') ||
+            (strcmp(tok, "</s>") == 0) || (strcmp(tok, "<unk>") == 0)) continue;
+        for (const char *p = tok; *p; ) {
+            if ((unsigned char)p[0] == 0xE2 && p[1] && (unsigned char)p[1] == 0x96 &&
+                p[2] && (unsigned char)p[2] == 0x81) {
+                if (len + 2 > cap) { cap *= 2; out = (char *)realloc(out, cap); }
+                out[len++] = ' ';
+                p += 3;
+            } else {
+                if (len + 2 > cap) { cap *= 2; out = (char *)realloc(out, cap); }
+                out[len++] = *p++;
+            }
+        }
+    }
+    out[len] = '\0';
+    return out;
+}
+
+int64_t ionic_bpe_bos(void) { return g_bpe.bos_id; }
+int64_t ionic_bpe_eos(void) { return g_bpe.eos_id; }
+
+/* Append one token id to an [int64] array (used by the generation loop). */
+int64_t ionic_arr_push_i64(void *arr, int64_t v) {
+    ionic_array_push_i64((IonicArray *)arr, v);
+    return 0;
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Minimal HTTP/1.1 server
+ *
+ * The runtime only ever had a *client*. Serving needs bind/listen/accept plus
+ * request parsing, so it lives here next to the client for symmetry. Scope is
+ * deliberately one request at a time: this exists to put a model behind a
+ * socket for a proof of concept, not to be a production web server.
+ *
+ *   ionic_http_serve(port)     -> listener fd (bound + listening), or -1
+ *   ionic_http_accept(fd)      -> *request* handle, or -1
+ *   ionic_http_method(req)     -> "GET" / "POST" / ...
+ *   ionic_http_path(req)       -> "/v1/models"   (query string stripped)
+ *   ionic_http_req_body(req)   -> request body, "" when there is none
+ *   ionic_http_respond(req, status, ctype, body) -> bytes written, or -1
+ *   ionic_http_req_done(req)   -> close the connection and free the request
+ *   ionic_http_close(fd)       -> close the *listener*
+ *
+ * One handle serves the whole exchange, so a caller can never mix up a socket
+ * fd with a request pointer: `accept` returns the request, and `respond` /
+ * `req_done` take that same request back. The connection fd lives inside it.
+ * ════════════════════════════════════════════════════════════════════════════ */
+
+typedef struct {
+    int   conn;         /* accepted connection, owned by this request */
+    char  method[16];
+    char  path[1024];
+    char *body;
+    int   body_len;
+    char *raw;          /* headers + body, kept alive for debugging */
+} HttpRequest;
+
+static void http_req_free(HttpRequest *r) {
+    if (!r) return;
+    if (r->conn >= 0) { close(r->conn); r->conn = -1; }
+    free(r->body);
+    free(r->raw);
+    free(r);
+}
+
+/* Read headers, then exactly Content-Length bytes. Returns NULL on error. */
+static HttpRequest *http_read_request(int conn) {
+    size_t cap = 8192, len = 0;
+    char *buf = (char *)malloc(cap);
+    char tmp[4096];
+    long hdr_end = -1;
+
+    /* Phase 1: headers. This function takes ownership of `conn`: every failure
+     * path below closes it, so callers must not close it a second time. */
+    while (hdr_end < 0) {
+        ssize_t n = recv(conn, tmp, sizeof(tmp), 0);
+        if (n <= 0) { free(buf); close(conn); return NULL; }
+        if (len + (size_t)n + 1 > cap) {
+            while (len + (size_t)n + 1 > cap) cap *= 2;
+            buf = (char *)realloc(buf, cap);
+        }
+        memcpy(buf + len, tmp, (size_t)n);
+        len += (size_t)n;
+        buf[len] = '\0';
+        char *p = strstr(buf, "\r\n\r\n");
+        if (p) hdr_end = (long)(p - buf) + 4;
+    }
+
+    HttpRequest *r = (HttpRequest *)calloc(1, sizeof(HttpRequest));
+    r->conn = conn;
+
+    /* request line: METHOD SP PATH SP VERSION */
+    {
+        const char *sp1 = strchr(buf, ' ');
+        if (!sp1) { free(buf); http_req_free(r); return NULL; }
+        size_t ml = (size_t)(sp1 - buf);
+        if (ml >= sizeof(r->method)) ml = sizeof(r->method) - 1;
+        memcpy(r->method, buf, ml); r->method[ml] = '\0';
+        const char *sp2 = strchr(sp1 + 1, ' ');
+        const char *pe = sp2 ? sp2 : sp1 + 1 + strlen(sp1 + 1);
+        size_t pl = (size_t)(pe - (sp1 + 1));
+        if (pl >= sizeof(r->path)) pl = sizeof(r->path) - 1;
+        memcpy(r->path, sp1 + 1, pl); r->path[pl] = '\0';
+        /* strip query string */
+        char *q = strchr(r->path, '?');
+        if (q) *q = '\0';
+    }
+
+    /* Content-Length (case-insensitive) */
+    long content_len = 0;
+    {
+        const char *cl = NULL;
+        for (char *p = buf; p && *p; p++) {
+            if (!strncasecmp(p, "content-length:", 15)) { cl = p + 15; break; }
+        }
+        if (cl) content_len = strtol(cl, NULL, 10);
+    }
+
+    size_t have_body = len - (size_t)hdr_end;
+    while ((long)have_body < content_len) {
+        ssize_t n = recv(conn, tmp, sizeof(tmp), 0);
+        if (n <= 0) break;
+        if (len + (size_t)n + 1 > cap) {
+            while (len + (size_t)n + 1 > cap) cap *= 2;
+            buf = (char *)realloc(buf, cap);
+        }
+        memcpy(buf + len, tmp, (size_t)n);
+        len += (size_t)n;
+        buf[len] = '\0';
+        have_body += (size_t)n;
+    }
+
+    r->raw = buf;
+    r->body_len = (int)content_len;
+    r->body = (char *)malloc((size_t)content_len + 1);
+    if (content_len > 0 && len >= (size_t)hdr_end) {
+        size_t avail = len - (size_t)hdr_end;
+        size_t take = avail < (size_t)content_len ? avail : (size_t)content_len;
+        memcpy(r->body, buf + hdr_end, take);
+        r->body[take] = '\0';
+        r->body_len = (int)take;
+    } else {
+        r->body[0] = '\0';
+        r->body_len = 0;
+    }
+    return r;
+}
+
+int64_t ionic_http_serve(int64_t port) {
+#ifndef _WIN32
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) { fprintf(stderr, "[ionic/http] socket: %s\n", strerror(errno)); return -1; }
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family      = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_ANY);
+    sa.sin_port        = htons((uint16_t)port);
+    if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+        fprintf(stderr, "[ionic/http] bind %lld: %s\n", (long long)port, strerror(errno));
+        close(fd); return -1;
+    }
+    if (listen(fd, 16) < 0) {
+        fprintf(stderr, "[ionic/http] listen: %s\n", strerror(errno));
+        close(fd); return -1;
+    }
+    return fd;
+#else
+    (void)port;
+    fprintf(stderr, "[ionic/http] server not implemented on Windows\n");
+    return -1;
+#endif
+}
+
+/* Returns 0 rather than void: every other builtin in this runtime returns
+ * int64 so generated code has a uniform "call -> i64" shape. A void return
+ * would force the two compilers to agree on a special case for one call. */
+int64_t ionic_http_close(int64_t fd) {
+#ifndef _WIN32
+    if (fd >= 0) close((int)fd);
+#endif
+    return 0;
+}
+
+/* Accept one connection and read its request. The request object is passed to
+ * Ionic as an opaque int64; the accessors below read through it. */
+int64_t ionic_http_accept(int64_t listen_fd) {
+#ifndef _WIN32
+    int conn = accept((int)listen_fd, NULL, NULL);
+    if (conn < 0) { fprintf(stderr, "[ionic/http] accept: %s\n", strerror(errno)); return -1; }
+    /* http_read_request owns `conn` from here on: on failure it has already
+     * closed it, so do not close again here (that would close a recycled fd). */
+    HttpRequest *r = http_read_request(conn);
+    if (!r) return -1;
+    return (int64_t)(intptr_t)r;
+#else
+    (void)listen_fd;
+    return -1;
+#endif
+}
+
+const char *ionic_http_method(int64_t req) {
+    HttpRequest *r = (HttpRequest *)(intptr_t)req;
+    return r ? r->method : "";
+}
+
+const char *ionic_http_path(int64_t req) {
+    HttpRequest *r = (HttpRequest *)(intptr_t)req;
+    return r ? r->path : "";
+}
+
+const char *ionic_http_req_body(int64_t req) {
+    HttpRequest *r = (HttpRequest *)(intptr_t)req;
+    return r ? (r->body ? r->body : "") : "";
+}
+
+int64_t ionic_http_req_done(int64_t req) {
+    HttpRequest *r = (HttpRequest *)(intptr_t)req;
+    http_req_free(r);
+    return 0;
+}
+
+/* Write a complete HTTP response on the request's connection. Every response
+ * says Connection: close and `ionic_http_req_done` closes it, which keeps the
+ * single-threaded loop simple and interoperable with curl. */
+int64_t ionic_http_respond(int64_t req, int64_t status, const char *ctype, const char *body) {
+#ifndef _WIN32
+    HttpRequest *r = (HttpRequest *)(intptr_t)req;
+    if (!r || r->conn < 0) return -1;
+    int conn = r->conn;
+    const char *reason = "OK";
+    if (status == 201) reason = "Created";
+    else if (status == 204) reason = "No Content";
+    else if (status == 400) reason = "Bad Request";
+    else if (status == 404) reason = "Not Found";
+    else if (status == 405) reason = "Method Not Allowed";
+    else if (status == 500) reason = "Internal Server Error";
+
+    size_t blen = body ? strlen(body) : 0;
+    char head[512];
+    int hn = snprintf(head, sizeof(head),
+        "HTTP/1.1 %lld %s\r\n"
+        "Content-Type: %s\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: close\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "\r\n",
+        (long long)status, reason, ctype ? ctype : "application/json", blen);
+    if (hn < 0) return -1;
+
+    size_t off = 0;
+    while (off < (size_t)hn) {
+        ssize_t w = send((int)conn, head + off, (size_t)hn - off, 0);
+        if (w <= 0) return -1;
+        off += (size_t)w;
+    }
+    size_t boff = 0;
+    while (boff < blen) {
+        ssize_t w = send((int)conn, body + boff, blen - boff, 0);
+        if (w <= 0) return -1;
+        boff += (size_t)w;
+    }
+    return (int64_t)(hn + (int)blen);
+#else
+    (void)req; (void)status; (void)ctype; (void)body;
+    return -1;
+#endif
+}

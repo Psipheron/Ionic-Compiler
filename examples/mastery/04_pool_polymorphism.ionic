@@ -1,0 +1,57 @@
+// Mastery 04.5 — pool-polymorphic builtins that must COMPILE (ex. 04.5).
+//
+// Builtins are the operations of the memory-pool model, so they accept a tensor
+// from *either* pool and produce their result in the pool their operands live
+// in:
+//
+//     mlx_add(cpu_a, cpu_b)  ->  tensor@cpu   (result lives in SRAM)
+//     mlx_add(gpu_a, gpu_b)  ->  tensor@gpu   (result lives in VRAM)
+//
+// That is what gives `tensor@gpu` something to do. Until this rule existed
+// every `mlx_*` signature was pinned to `tensor@cpu`, so a `tensor@gpu` could be
+// created, passed to `@gpu` functions, and returned — and no operation could
+// ever consume it.
+//
+// User functions stay *strictly* placement-typed. `@cpu fn f(tensor@cpu x)` is
+// a promise about where the work happens; passing it a `tensor@gpu` is still an
+// error (see fail/tensor_mismatch.ionic). Only builtins are polymorphic.
+//
+//   ./ionic_new examples/mastery/04_pool_polymorphism.ionic -o /tmp/x && /tmp/x
+
+// A GPU op composed from builtins: the result pool is inferred at each step.
+@gpu fn layer_norm_gpu(tensor@gpu x) -> tensor@gpu {
+    let sq = mlx_multiply(x, x);        // tensor@gpu (operand pool wins)
+    let sm = mlx_add(sq, x);            // tensor@gpu
+    return sm;
+}
+
+fn main() -> int64 {
+    if (mlx_available() == 0) {
+        println("MLX backend not compiled in on this platform");
+        return 0;
+    }
+
+    // SRAM side: every operand is tensor@cpu, so every result is tensor@cpu.
+    let a = mlx_ones([2, 2], 0);
+    let cpu_sum = mlx_add(a, a);
+    println(str_concat("cpu result ndim: ", int64_to_str(mlx_ndim(cpu_sum))));
+
+    // VRAM side: the same builtins, operands in the accelerator pool.
+    // The slot is created by a transfer (the only way a tensor@gpu can exist
+    // outside a GPU context) and written inside the block; the block's result
+    // is then brought back to SRAM with an explicit .toCpu().
+    let dev = a.toGpu();
+    mut gpu_result = a.toGpu();
+    gpu {
+        let gpu_sum = mlx_add(dev, dev);        // tensor@gpu
+        let layered = layer_norm_gpu(gpu_sum);  // tensor@gpu
+        gpu_result  = mlx_sum(layered, 0);      // tensor@gpu
+    }
+
+    let back = gpu_result.toCpu();              // explicit transfer back to SRAM
+    println(str_concat("gpu result: ", float64_to_str(mlx_item(back))));
+
+    mlx_free(a);
+    println("pool polymorphism: ok");
+    return 0;
+}
