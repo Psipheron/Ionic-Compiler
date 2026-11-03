@@ -553,7 +553,10 @@ jobs:
       - name: Backend linkage is usage-gated
         run: |
           ./ionic_new examples/hello.ionic -o /tmp/hello_gate
-          n=$(otool -L /tmp/hello_gate | grep -Eic 'mlx|onnx')
+          # `grep -c` exits 1 on a zero count, which `set -e` turns into a step
+          # failure -- so the *passing* case (zero ML libs) is the one that
+          # broke. `|| true` keeps the count.
+          n=$(otool -L /tmp/hello_gate | grep -Eic 'mlx|onnx' || true)
           if [ "$n" != "0" ]; then
             echo "hello-world unexpectedly links $n ML libs"; otool -L /tmp/hello_gate; exit 1
           fi
