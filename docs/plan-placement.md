@@ -538,6 +538,46 @@ This is where the "different capacities" part of the model becomes real rather
 than advisory, and it needs a per-backend allocator. Deferred because it
 depends on the backend existing (Stage C).
 
+### D.0 What the static check does *not* catch — measured, not assumed
+
+The goal is "pool exhaustion is a build error". The static check is a **necessary
+but not sufficient** condition today, and the difference is worth stating
+exactly, because every one of these was confirmed by compiling a program and
+watching it succeed. None of them can produce a *false* rejection; all of them
+can miss an over-budget program.
+
+| Gap | Confirmed by | Consequence |
+|---|---|---|
+| **No live-range analysis.** A binding keeps its charge for the whole scope, even after `mlx_free` or after it is provably dead. | Four 256 MiB values plus a freed fifth are rejected: 5 x 256 MiB is counted, though only 4 are live. | Over-approximates the peak, so it can reject a program that would fit. Conservative direction, but it is the *opposite* error from the ones below. |
+| **Interprocedural peak is not modelled.** `let n = inner()` where the caller already holds 1 GiB is not charged for what `inner` allocates. | A `@gpu` fn holding 1 GiB calls another that allocates 1 GiB; both compile, and the real peak is 2 GiB against a 1 GiB pool. | Under-approximates: the classic over-budget-at-3am case, still reachable. |
+| **Runtime-sized shapes are silently unbounded.** A shape element that is not an integer literal makes the size unknown, and unknown values are exempt (decision 4, narrowed). | `mlx_zeros([n, n], 0).toGpu()` in a budgeted scope compiles with no diagnostic, for any `n`. | Under-approximates. `sc_used_unknown` counts these but nothing reports the count. |
+| **The declared `vram` is never checked against the device.** The pool size is a compile-time literal. | Nothing compares it to the backend's real memory. | A program can declare more VRAM than exists and be "correct". |
+| **`gpu { }` inside `@gpu(f)` resets the running total** instead of adding to it. | Noted at `budget_begin(0)` in `checker.ionic`; the nested block checks its own locals against the whole pool. | Under-approximates for nested scopes. |
+
+Two of these are the difference between "catches obvious mistakes" and "makes
+pool exhaustion a build error": **interprocedural peak** and **runtime-sized
+shapes**. Until they land, the honest claim is the narrower one — the compiler
+rejects statically-evident over-budget scopes, and Stage D's allocator is what
+catches the rest at run time.
+
+Ordering, if this is to become the goal it claims to be:
+
+1. **Report unknown sizes instead of exempting them silently.** Cheapest and
+   largest honesty gain: `sc_used_unknown` is already counted, so the diagnostic
+   is a `println` away. "3 GPU values in this scope have no static size; the
+   budget cannot bound them" turns a silent pass into a warning the user can
+   act on.
+2. **Stage D's allocator**, so the program that gets past the checker still
+   fails loudly at the allocation rather than at an OOM hours later. This is
+   the backstop the whole design assumes and that does not exist yet.
+3. **Live-range analysis**, which converts the conservative over-approximation
+   into an accurate one and makes the check *sufficient* for values it can size.
+4. **Interprocedural peak** — needs call-graph summaries (what a callee allocates
+   and whether it frees), which is the largest piece of work here.
+5. **Device-capacity check at startup**, comparing the declared `vram` to
+   `mlx_pool_bytes` / the backend's real budget and warning when the source of
+   truth is a fiction.
+
 ### Stage E — Tests
 
 1. Mastery test: budget exceeded → compile error, with the arithmetic.
