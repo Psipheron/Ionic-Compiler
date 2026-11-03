@@ -1,0 +1,71 @@
+// Mastery 04.6 — the pool declaration, the `@gpu(f)` fraction, and the scope
+// budget (Stages B2–B4).
+//
+// `@cpu` / `@gpu` name *memory pools*, not devices:
+//
+//     @cpu  ->  SRAM   host memory        capacity = system RAM
+//     @gpu  ->  VRAM   accelerator memory capacity = the card
+//
+// VRAM is the scarce one, so the interesting failure is not "wrong device" but
+// "the model did not fit". Stage B2 makes the pool a declared, checkable fact:
+// the size is written once at top level and every `@gpu` scope inherits it.
+//
+//     let vram = 25769803776;              // bytes of accelerator memory
+//     @gpu fn train_step(...) -> ... {}    // may use up to the whole pool
+//     @gpu(0.25) fn helper(...) -> ... {}  // may use up to a quarter of it
+//
+// Before B2 the fraction was parsed and thrown away, so `@gpu(0.9)` was a claim
+// the compiler never read. Now a fraction must be a real share: greater than
+// zero, at most one, and of a pool that actually exists. Stage B3 then sizes a
+// tensor from its constructor — prod(shape) x dtype_bytes — and B4 charges that
+// against the enclosing scope, so the compiler knows whether the scope's
+// allocations fit its share of the pool before a byte is allocated.
+//
+// The rules this program exercises (and `scripts/placement_check.sh` pins down
+// the rejections for): a `@gpu` scope's sized allocations must fit its
+// fraction; a wider fraction is the fix; dtype counts toward the size; a bare
+// `gpu { }` block is budgeted too; and a tensor *parameter* is exempt, because
+// it was allocated and charged in the caller's scope.
+//
+//   ./ionic_new examples/mastery/04_pool_budget.ionic -o /tmp/b && /tmp/b
+
+// The deployment fact: how much accelerator memory this machine has.
+// Declared once, inherited by every @gpu scope below.
+let vram = 25769803776;   // 24 GiB
+
+// No fraction: this scope may use the whole declared pool.
+@gpu fn full_pool(tensor@gpu x) -> tensor@gpu {
+    return x;
+}
+
+// A quarter of it. The fraction is a *share*, not a byte count, so the same
+// source tree serves a 16 GB card and an 80 GB card.
+@gpu(0.25) fn quarter_pool(tensor@gpu x) -> tensor@gpu {
+    return x;
+}
+
+// The whole pool, stated explicitly. 1.0 is the largest meaningful fraction.
+@gpu(1.0) fn exactly_all(tensor@gpu x) -> tensor@gpu {
+    return x;
+}
+
+// Stage B3/B4: sized allocations inside a budgeted scope. 96 MiB of activations
+// against a quarter of a 24 GiB pool (6 GiB) is comfortable, and the checker
+// proves it here rather than at runtime. Swap the fraction to @gpu(0.001) and
+// this stops compiling, naming the allocation that did not fit.
+//
+// The `x` parameter is deliberately exempt: it was allocated — and charged —
+// in the caller's scope, so charging it again here would count it twice.
+@gpu(0.25) fn activations(tensor@gpu x) -> int64 {
+    let a = mlx_zeros([8192, 1024], 0).toGpu();   // 32 MiB in F32
+    let b = mlx_zeros([8192, 1024], 1).toGpu();   // 16 MiB in F16
+    let c = mlx_add(x, x);                        // sized from x, not a literal
+    return mlx_size(c);
+}
+
+fn main() -> int64 {
+    println(str_concat("declared pool (bytes): ", int64_to_str(vram)));
+    println(str_concat("quarter share (bytes): ", int64_to_str(vram / 4)));
+    println("pool budget: ok");
+    return 0;
+}

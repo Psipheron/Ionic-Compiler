@@ -95,6 +95,26 @@ jobs:
           diff examples/multitarget_test.expected elf.out \
             || (echo "ELF output does not match the golden file"; exit 1)
 
+      # Hardware placement is checked statically, so its whole test surface runs
+      # here — on Linux, with no accelerator backend compiled in. That is the
+      # point of keeping the checks in the checker rather than the runtime: the
+      # behaviour is portable even though the backend is not. (Stages B2–B5:
+      # the pool declaration, the `@gpu(f)` fraction, the scope budget, and
+      # use-after-move on a transferred binding.)
+      - name: Hardware placement — pool budget and moves (Linux, no accelerator)
+        run: ./scripts/placement_check.sh
+
+      - name: Hardware placement — mastery programs (Linux, no accelerator)
+        run: |
+          ./ionic_new examples/mastery/04_pool_budget.ionic -o /tmp/pb
+          /tmp/pb | grep -q "pool budget: ok" || (echo "pool-budget program failed"; exit 1)
+          if ./ionic_new examples/mastery/fail/tensor_mismatch.ionic -o /tmp/tm 2>/dev/null; then
+            echo "Expected tensor_mismatch.ionic to be rejected, but it compiled"; exit 1
+          fi
+          if ./ionic_new examples/mastery/fail/mixed_pool.ionic -o /tmp/mp 2>/dev/null; then
+            echo "Expected mixed_pool.ionic to be rejected, but it compiled"; exit 1
+          fi
+
       - uses: actions/upload-artifact@v4
         with:
           name: multitarget-elf

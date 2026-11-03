@@ -1,0 +1,29 @@
+// Mastery EXERCISE 04.8 — use after move; must be REJECTED.
+//
+// A transfer MOVES its operand. After `let g = a.toGpu();` the SRAM binding `a`
+// owns nothing, so touching it is an error. That is what makes pool occupancy
+// meaningful: a value occupies exactly one pool, under exactly one name, which
+// is the precondition for capacity accounting to count bytes rather than
+// aliases.
+//
+// Only `.toGpu()` and `.toCpu()` move. Everything else borrows — `mlx_add(g, g)`
+// below is legal for exactly that reason — so this is not a general ownership
+// system, only the rule that transfers hand over the value.
+//
+//   [error] 27:14: use after move of 'a': consumed by `a.toGpu()` on line 20
+//           (a transfer moves the value; bind the result and use that)
+//
+//   NO_COLOR=1 ./ionic_new examples/mastery/fail/use_after_move.ionic -o /tmp/x
+
+fn main() -> int64 {
+    let a = mlx_ones([2, 2], 0);
+    let g = a.toGpu();                     // moves `a`
+
+    gpu {
+        let sum = mlx_add(g, g);           // fine: a call borrows its operands
+        let s = mlx_sum(sum, 0);
+    }
+
+    mlx_free(a);                           // ERROR: `a` was moved on line 20
+    return 0;
+}

@@ -1,0 +1,8 @@
+// The first program to run.
+//
+//     ./ionic_new examples/hello_world.ionic -o /tmp/hw && /tmp/hw
+
+fn main() -> int64 {
+    println("Hello, world!");
+    return 0;
+}

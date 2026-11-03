@@ -51,27 +51,36 @@ self-hosts; `docs/stdlib.md` is updated to match.
 
 ## Task 09.3 — Unblock the memory model (the big one)
 
-Implement the **type-tagging prerequisite** from `docs/memory-model.md §10` (units
-06 §8, 07 §5). This is the highest-value work in the repo.
+Deliverables A and B are **done**; C remains. The work is the
+**type-tagging prerequisite** from `docs/memory-model.md §10` (units 06 §8,
+07 §5).
 
-Deliverable A — the oracle: carry the semantic checker's per-expression static
-type into codegen so `ncg_last_ty` is correct on **every** path, in particular
-the `ND_INDEX` arm (`src/codegen/native.ionic:~1159`) and `ND_LET` with non-literal
-string initializers. Replace the shadow-prone name tables
-(`local_find`/`local_get_str`/`ncg_string_expr`) with this uniform oracle.
+~~Deliverable A — the oracle.~~ Shipped: `ncg_ty_of` / `ncg_elem_ty` in
+`src/codegen/native.ionic`, a pure function over the AST and the symbol tables,
+plus a `local_elem` column and parameter type recording. It resolves an element
+load through the array's element type and a parameter through its declared type.
 
-Deliverable B — the observable fix: `println(names[0])` on a `[string]` array
-prints `alice`, not a pointer. Add an example asserting it.
+~~Deliverable B — the observable fix.~~ Shipped: `println(names[0])` prints
+`alice`. The example asserting it is
+`examples/mastery/02_string_array_print.ionic`, which also covers a parameter
+and a user function's return value.
 
-Deliverable C (stretch): re-attempt the RC slice on top of A, using the log in
-`docs/memory-model.md §10`. The churn loop must drop from ~160 MB to ~1 MB RSS.
+Deliverable C (the remaining work) — re-attempt the RC slice on top of A, using
+the log in `docs/memory-model.md §10`. The churn loop must drop from ~160 MB to
+~1 MB RSS. Read §10's "what is still required" before starting: the oracle
+answers `OTY_OTHER` for nested-array elements, method calls, and struct-field
+loads, and **`OTY_OTHER` must not be treated as "not managed"**. Widening the
+oracle (struct field types, method return types) is a legitimate sub-task, but
+the safe move is to emit retain/release only where the oracle proves the value is
+a managed string.
 
 **Grade:**
-- A: `--verify-self-hosting` passes; a table of expression kinds each prove the
-  oracle's classification.
-- B: the string-array print example is correct.
+- A: done — `--verify-self-hosting` passes and
+  `02_string_array_print.ionic` prints strings for all four shapes.
+- B: done.
 - C: RSS measured before/after on a churn loop; no use-after-free across the full
-  test suite.
+  test suite; and a written statement of which expression kinds the pass refuses
+  to touch and why.
 
 ---
 

@@ -10,6 +10,10 @@
 //
 // model_forward(model, tensor) yields a tensor@cpu; load_model yields model@cpu.
 
+// `@gpu(f)` is a share of a declared pool, so a program that uses a fraction
+// declares the pool once at top level (see unit 04 §5 and stage B2).
+let vram = 25769803776;   // 24 GiB of accelerator memory
+
 @gpu fn run(tensor@gpu x) -> tensor@gpu {
     // GPU context: tensor@gpu compute only.
     return run2(x);

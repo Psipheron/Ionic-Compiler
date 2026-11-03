@@ -1,4 +1,8 @@
-// Mastery EXERCISE 04.6 — mixed-pool operands; must be REJECTED.
+// Mastery — mixed-pool operands; must be REJECTED.
+//
+// (Placement stage B1. Referenced by name rather than by exercise number: the
+// tutorial's 04.6/04.7 cover the scope budget, 04.8/04.9 cover use-after-move,
+// and no exercise is assigned to this case.)
 //
 // Pool polymorphism means a builtin accepts a tensor from either pool, but a
 // single call still computes in exactly one pool. `mlx_add(cpu_tensor,

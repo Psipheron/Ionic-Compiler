@@ -20,6 +20,8 @@ the self-hosted compiler and prints labelled, deterministic output.
 - `02_arrays.ionic` — `.len`, `len()`, indexing, element set (ex. 02.2)
 - `02_data_bug.ionic` — the `std.data` off-by-one (ex. 02.3)
 - `02_structs.ionic` — struct fields mutable under `let` (ex. 02.4)
+- `02_string_array_print.ionic` — printing strings reached through an array
+  element or a parameter (ex. 02.5; formerly a `fail/` case)
 - `03_escapes.ionic` — `\e`, `\xHH`, `char_to_str` (ex. 03.2)
 - `03_args.ionic` — CLI argument + exit code (ex. 03.3)
 - `03_file_io.ionic` — `file_write`/`file_read` round trip (ex. 03.4)
@@ -32,13 +34,11 @@ the self-hosted compiler and prints labelled, deterministic output.
 
 ## Intentionally-failing programs (`fail/`)
 
-These are meant to be **rejected** (or, for the string-array one, to misbehave).
-They are references for the error-reproduction exercises; they are not part of
-any build.
+These are meant to be **rejected** by the compiler. They are references for the
+error-reproduction exercises; they are not part of any build.
 
 - `fail/immutable.ionic` — assign to a `let` (ex. 01.5)
 - `fail/multi_error.ionic` — several errors in one pass (unit 03 §7)
-- `fail/string_array_print.ionic` — compiles+runs but prints a pointer (ex. 02.5)
 - `fail/tensor_mismatch.ionic` — tensor@gpu where tensor@cpu expected (ex. 04.1)
 - `fail/mixed_pool.ionic` — one operand in SRAM, one in VRAM, in a single builtin
   call (ex. 04.6)

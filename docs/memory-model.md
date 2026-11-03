@@ -38,13 +38,14 @@ structs grows without bound. The compiler itself leaks for this reason.
 
 The memory model must respect the language's defining traits, not fight them.
 
-- **Static types, but the backend's type tracking is incomplete.** The native
+- **Static types, but the backend's type tracking was incomplete.** The native
   backend tracks which locals and globals hold strings vs. floats vs. structs
-  (`local_is_str`, `local_is_float_slot`, `local_get_stype`, `glob_is_str`), but
-  this is *not* sufficient on its own: string-ness is lost on array/struct
-  element loads and on several expression paths (see §10). An ownership model
-  needs a *complete* static type oracle — that missing oracle is the
-  prerequisite, not the existing ad-hoc tables.
+  (`local_is_str`, `local_is_float_slot`, `local_get_stype`, `glob_is_str`), and
+  that was *not* sufficient on its own: string-ness was lost on array element
+  loads, on parameters, and on several expression paths (see §10). A **type
+  oracle**, `ncg_ty_of`/`ncg_elem_ty` in `src/codegen/native.ionic`, now answers
+  the question directly. It is deliberately conservative: unknown answers are
+  distinguishable from "int64", which is what keeps an ownership pass sound.
 - **GPU placement (`@cpu` / `@gpu`).** Tensor and model memory crosses a device
   boundary. Reclamation of device memory must be *deterministic* — a delayed
   collector pause during inference is unacceptable.
@@ -67,8 +68,8 @@ Adopt **deterministic ownership** as the language memory model:
 2. **Unique ownership + RAII** for resources with scarce, device-affine lifetimes
    — `model`, GPU buffers, file/socket handles.
 3. **Arena scopes** for compiler-internal temporaries.
-4. **Cycles are made structurally impossible**, so no tracing GC or cycle
-   collector is ever required.
+4. **Cycles are intended to be impossible**, so no tracing GC or cycle collector
+   would be required. *This does not currently hold* — see §6 and §11.6.
 
 The three mechanisms share one property: reclamation is *deterministic* and
 *local*. Nothing walks the heap, nothing pauses, and nothing needs to understand
@@ -89,12 +90,23 @@ a foreign pointer to be correct.
   retain/release (they are known at every use site), or (b) materialize them once
   through a runtime wrapper (`ionic_str_lit`) as *pinned* managed copies keyed by
   rodata address, so literals participate uniformly and `release` on a literal is
-  a safe no-op. Option (b) proved more robust when the codegen cannot reliably
-  classify a value's string-ness at every site (see §10).
+  a safe no-op. Option (b) proved more robust when the codegen could not reliably
+  classify a value's string-ness at every site (see §10). With `ncg_ty_of` in
+  place, a literal is provably a string at every use site, so (a) becomes viable
+  again — but (b) is already the safer default.
 - **Runtime builtins route through `rc_alloc`** so the objects they return begin
   life at refcount 1: `ionic_str_concat`, `ionic_int64_to_str`,
-  `ionic_float64_to_str`, `ionic_str_slice`, `ionic_format`, `ionic_char_to_str`,
-  `ionic_read_line`, `ionic_file_read`, and `ionic_array_alloc`.
+  `ionic_float64_to_str`, `ionic_str_slice`, `ionic_str_replace`, `ionic_format`,
+  `ionic_char_to_str`, `ionic_read_line`, `ionic_file_read`, `ionic_http_get`,
+  `ionic_http_post`, `ionic_http_body`, `ionic_http_urlencode`, and
+  `ionic_array_alloc`. Every one of these now allocates on every path — including
+  the failure paths, which is what §11.1 was about.
+  **Not** `ionic_get_arg`, `ionic_getenv`, `ionic_exe_dir`, or
+  `ionic_mlx_last_error` — those return process-, libc-, or statically-owned
+  buffers and must never be instrumented. The three `ionic_http_*` *request*
+  accessors belong on this list too: they now copy out of the `HttpRequest`, so
+  they are fresh allocations and safe to instrument (§11.2). See §11.3; an
+  earlier version of this list wrongly included `get_arg` and `getenv`.
 
 ### 4.2 Insertion points (compile time)
 
@@ -139,28 +151,38 @@ no semantic change to the language.
   here — values escape into returns, struct fields, globals, and arrays. Viable
   only for temporaries (see §4.4).
 - **RC plus a cycle collector (trial deletion):** would make the runtime
-  unconditionally leak-free, but adds a mark phase and full object enumeration for
-  a case that the type system can prevent outright (§6).
+  unconditionally leak-free, but adds a mark phase and full object enumeration.
+  This was rejected on the grounds that the type system prevents cycles outright —
+  which, per §11.6, it currently does not. If §6 is not restored, this moves back
+  onto the table.
 
 ---
 
-## 6. The key principle: cycles are structurally impossible
+## 6. Cycles: the intended invariant, and where it does not hold
 
-A cycle collector is only necessary if a cycle can form. Ionic's data model
-forbids it:
+> **Correction (§11.6).** This section previously claimed cycles were structurally
+> impossible. They are not: two names can alias one mutable aggregate
+> (`let q = p`) and aggregates can contain aggregates (`a.push(b)`), so a
+> reference cycle is constructible from ordinary Ionic. Read this section as the
+> *intended* design and §11.6 for the shipped behaviour.
 
-- **Shared data is immutable** (strings, immutable array data, tensor storage).
-  You cannot create a cycle by mutating shared immutable data.
-- **Mutable ownership is unique / affine.** A `mut` value has exactly one owner;
-  there is no aliasing through which a back-edge could be constructed.
+A cycle collector is only necessary if a cycle can form. As designed, Ionic's
+data model was meant to forbid it:
 
-Because no object can hold a reference back to something that holds it, every
-reference graph is a DAG, and refcounting alone reclaims it completely. This is
-the reason Ionic can be leak-free *without* a general-purpose collector.
+- **Shared data is immutable** (strings, tensor storage). You cannot create a
+  cycle by mutating shared immutable data.
+- **Mutable ownership is unique / affine.** A `mut` value was meant to have
+  exactly one owner, with no aliasing through which a back-edge could be built.
 
-> If the language ever adds mutable, aliased, cyclic references, this invariant
-> breaks and a cycle collector becomes necessary. That trade-off should be made
-> deliberately, not accidentally.
+Under those two rules every reference graph is a DAG, and refcounting alone
+reclaims it completely — which is what would make Ionic leak-free *without* a
+general-purpose collector.
+
+The second rule is the one that did not survive contact with the implementation:
+`let q = p` copies a pointer rather than moving it, for both structs and arrays.
+Until that is changed (or aggregate-in-aggregate is rejected at the type level),
+refcounting reclaims acyclic graphs only and cyclic aggregates leak by
+construction. See §11.6 for the measurement and the options.
 
 ---
 
@@ -176,8 +198,10 @@ the reason Ionic can be leak-free *without* a general-purpose collector.
 
 **What RC does not solve**
 
-- **Reference cycles among counted objects.** Prevented by design (§6), not
-  collected. If a cycle is ever constructed, the participating objects leak.
+- **Reference cycles among counted objects.** Intended to be prevented by design
+  (§6), but they *are* constructible today (§11.6), and the objects in a cycle
+  leak. Mitigation is either a type-level restriction or an accepted, documented
+  leak.
 - **C-runtime buffers not routed through `rc_alloc`.** Anything `malloc`'d inside
   `src/ionic_model_runtime.c` (for example the `piper_forward` samples array, the
   `http_get` body) is invisible to the scheme until it is re-routed. These are
@@ -185,7 +209,10 @@ the reason Ionic can be leak-free *without* a general-purpose collector.
 - **Interior / foreign pointers.** A pointer stashed where the compiler cannot see
   it (a C callback, a cache) is not reflected in any refcount. This is the main
   soundness risk and the reason a type-level owned-vs-borrowed distinction
-  (§8, step 4) is the durable answer.
+  (§8, step 6) is the durable answer. §11.2 and §11.3 show this is not
+  hypothetical: four runtime accessors still return process- or statically-owned
+  pointers that the checker types as ordinary strings. The interior cases that
+  used to be listed first were made safe by copying.
 
 **Cost**
 
@@ -203,16 +230,34 @@ the reason Ionic can be leak-free *without* a general-purpose collector.
 Landed incrementally, lowest risk first, each step verified with
 `./build.sh --verify-self-hosting`.
 
-1. **Compiler arena per phase.** Immediate, self-contained leak elimination in
-   `ionic_new`; no language semantics change.
-2. **RC for strings and arrays.** Non-atomic. Literals are wrapped as pinned
+0. **Allocation audit (§11).** Establish which runtime entry points can legally
+   be refcounted. **Done** — and it changed the order of everything below: the
+   interior-pointer cases (§11.2) turned out to be a design blocker, not an
+   implementation detail.
+1. **Make every string return path allocate (§11.1).** **Done.** Five failure
+   paths were returning a rodata literal or the caller's own input; all now
+   allocate, so "returned a `TY_STR` ⇒ the result is owned" holds. Both the C
+   runtime and the inline LLVM IR definition of `ionic_file_read` were fixed.
+2. **Resolve the interior/static accessors (§11.2, §11.3).** **Done for the
+   interior class.** The three `http_*` request accessors and
+   `mlx_weights_key_at` now copy on access, so they return owned blocks. Four
+   foreign/static sources remain (`get_arg`, `getenv`, `exe_dir`,
+   `mlx_last_error`); the retain/release pass must special-case those four by
+   name until step 6 replaces the list with a type-level distinction.
+3. **Compiler arena per phase.** Immediate, self-contained leak elimination in
+   `ionic_new`; no language semantics change, and it does not depend on 1–2.
+4. **RC for strings and arrays.** Non-atomic. Literals are wrapped as pinned
    managed copies. Fixes the dominant user-program leak.
-3. **RC for tensor storage + RAII for `model`/handle types.** The domain core:
+5. **RC for tensor storage + RAII for `model`/handle types.** The domain core:
    deterministic release of scarce, device-affine memory. *(The `model` RAII half
    is implemented — see §9.)*
-4. **Type-level `owned` vs. `borrowed` distinction.** Makes the ownership
+6. **Type-level `owned` vs. `borrowed` distinction.** Makes the ownership
    discipline explicit in the type system rather than a runtime convention, and
    is the correct handling of foreign pointers from C/library interop.
+7. **Decide the cycle question (§11.6).** Either amend §6 to accept bounded leaks
+   for cyclic aggregates, or prevent aggregate-in-aggregate at the type level.
+   Step 4 can land before this, but `rss_check.sh` cannot be a hard gate until it
+   is decided.
 
 ---
 
@@ -260,6 +305,17 @@ This document records the decision and plan.
   See the `ND_RETURN` note in `src/codegen/native.ionic`.
 - **Slice 2 (RC for strings/arrays) — prototyped and REVERTED.** See §10 for the
   implementation log and the prerequisite it exposed.
+- **Prerequisite for Slice 2 — the type oracle, step 1 SHIPPED.** `ncg_ty_of` /
+  `ncg_elem_ty` answer "int64 / string / float64 / none of those" for an
+  expression and for an array element, and print dispatch now consults them. That
+  closed the observable `println` defects (array element, string parameter). It is
+  deliberately conservative, and the remaining widening is described in §10.
+- **Allocation audit (§11) — COMPLETE, both bug classes fixed.** Every pointer
+  the runtime hands to a program is classified as fresh, interior,
+  foreign/static, or caller-buffer. §11.1 (the alias returns) and §11.2 (the
+  interior request accessors) are both resolved: the second by copy-on-access,
+  which is what the audit said was preferred. Nothing in §11 now blocks the
+  retain/release pass.
 
 ## 10. Implementation log — the Slice 2 attempt and its prerequisite
 
@@ -299,31 +355,331 @@ not knowable from the current backend state:
    a name (shadowing) while `local_get_str` returned the *first*. If a string
    parameter `s` is shadowed by an integer local `s`, the integer was treated as
    a string. (Fixed to last-match, but only one instance of the class.)
-2. **`ncg_last_ty` is set only on some paths** — notably `ND_LET` never records a
-   string type when the initializer is a non-literal string call, and array /
-   struct element *loads* never set `ncg_last_ty = 1` at all.
-3. **Observable pre-existing symptom** — `println(arr[0])` prints the element's
-   **pointer as an integer**, not the string: element loads lose string-ness at
-   the codegen level. This is a latent correctness bug independent of RC, and it
-   is the same missing information RC needs.
+2. **`ncg_last_ty` is set only on some paths** — notably `ND_LET` never recorded a
+   string type when the initializer is a non-literal string call, and array
+   element *loads* never set `ncg_last_ty = 1` at all.
+3. **Parameters were never typed** — a parameter never enters the checker's
+   symbol table, so `fn show(string s) { println(s); }` had no way to know `s` was
+   a string.
+4. **Observable pre-existing symptom** — `println(arr[0])` printed the element's
+   **pointer as an integer**, not the string. This was a latent correctness bug
+   independent of RC, and it was the same missing information RC needs.
 
-Because a value's string-ness is not propagated through element loads, function
-returns, and some locals, the pass cannot prove a value is managed before
-emitting a release — and a single mis-placed release turns the benign leak into a
-use-after-free (which is worse).
+Because a value's string-ness was not propagated through element loads, function
+returns, parameters, and some locals, the pass could not prove a value was
+managed before emitting a release — and a single mis-placed release turns the
+benign leak into a use-after-free (which is worse).
 
-**Prerequisite for Slice 2 (recommended next step)**
+**Prerequisite for Slice 2 — step 1 is now done**
 
-Add a **type-tagging pass** that carries the semantic checker's static types into
-codegen and makes `ncg_last_ty` correct on *every* expression path — in
-particular array/struct element loads. This fixes the latent `println(arr[i])`
-bug at the same time and makes the retain/release insertion mechanical and sound.
-`local_get_str`/`local_find`/`ncg_string_expr` should be replaced by that
-uniform type oracle rather than the current shadow-prone name tables.
+The recommended next step was a **type-tagging pass** carrying the checker's
+static types into codegen. The additive half of it has shipped:
+
+- `ncg_ty_of(node)` / `ncg_elem_ty(node)` in `src/codegen/native.ionic` — a
+  **pure** function over the AST and the symbol tables that answers "int64,
+  string, float64, or none of those" for an expression, and the same for an
+  array element.
+- It is what `print`/`println` dispatch consults, replacing the hand-written
+  builtin-name list that was effectively guessing. That fixed items 2, 3, and 4
+  above as observable defects: `println(names[0])` and `println(s)` for a
+  `string` parameter now print the string.
+- Element types are recorded per local slot (`local_elem`), and parameters record
+  their declared type, so the information survives the way it needs to.
+
+**What is still required before Slice 2 may be retried.** The oracle is
+deliberately conservative. It answers "none of those" (`OTY_OTHER`) for a
+nested-array element, a method call, and a struct-field load. A retain/release
+pass must therefore:
+
+- emit operations **only** where `ncg_ty_of` proves the value is managed, and
+- treat `OTY_OTHER` as *unknown*, not as "not managed" — the two differ, and
+  conflating them is exactly how the first attempt produced a release on a
+  stack address.
+
+That is a narrower, sound starting point. Widening it means teaching the oracle
+about struct fields (needs field types in the struct registry) and about method
+return types (needs `fn_ret_ty` to describe methods).
 
 A second, cheaper prerequisite is to give the `@gpu`/tensor resource path
 (Slice 3, RAII) priority: it needs no value-type oracle, because handles are
 released explicitly and deterministically.
+
+## 11. Allocation audit — every pointer the runtime can hand to a program
+
+A reference count lives in an 8-byte word immediately *before* the payload, so
+`rc_release(p)` is `--((int64_t*)p)[-1]` and `rc_alloc` frees `p - 8`. That
+design has three preconditions, and none of them had been checked:
+
+1. every value the codegen believes is managed came from `rc_alloc`;
+2. `p - 8` is inside the allocation that owns `p` — i.e. `p` is the *start* of a
+   payload, never an interior or foreign address;
+3. releasing it exactly once balances the retain that produced it.
+
+This section is the audit of (1) and (2) across `src/ionic_model_runtime.c`.
+It is the missing information the Slice 2 log blamed on "type classification":
+classification was necessary but not sufficient. The §11.2 findings failed
+*even when the oracle was right*, because the checker declared the value to be a
+`TY_STR` and the runtime still returned something a refcount cannot own. Both
+classes are now closed; this section is kept as the record of why the audit came
+before RC rather than after it.
+
+Classification key:
+
+- **fresh** — `malloc`'d in the callee, exactly one allocation, payload starts at
+  offset 0. Safe to `rc_alloc` and safe to release. *18 functions.*
+- **alias** — returns one of its **inputs**, unchanged. Retaining/releasing it
+  changes the input's refcount. **Unsafe as-is.** *0 functions* — resolved, §11.1.
+- **interior** — returns a pointer *into* a larger allocation. A refcount word at
+  `p - 8` lands inside that allocation. **Unsafe as-is.** *0 functions* —
+  resolved by copy-on-access, §11.2.
+- **foreign/static** — not from this allocator at all: rodata literal, `getenv`
+  buffer, argv, a `static` buffer. **Unsafe to release.** *4 functions, 5
+  definitions* (the two `mlx_last_error` builds plus the shared `get_arg` /
+  `getenv` / `exe_dir` sources).
+- **caller-buffer** — writes into a buffer the caller owns. Not a return of new
+  memory at all. *1 function* (`ionic_fgets_stdin`).
+
+23 distinct functions return a `char *`/`const char *` to a program. That is 26
+definitions once you count the two `mlx_*` accessors, which have separate MLX and
+stub builds, and `ionic_file_read`, which exists twice for a different reason: a
+weak C definition and an inline LLVM IR definition emitted by the Rust
+bootstrap (§11.1).
+
+### 11.1 `alias` — returns an input, not a copy — RESOLVED
+
+This class is now empty. Every string-returning entry point allocates on every
+path, so "returned a `TY_STR` ⇒ the result is an owned `malloc` block" holds
+unconditionally, with one exception noted at the end (OOM).
+
+What was wrong, for the record:
+
+| function | condition | what it returned | why it was unsafe |
+|---|---|---|---|
+| `ionic_file_read` | `fopen` failed | `(char *)""` | rodata literal — a release is a free of static data |
+| `ionic_str_replace` | any of `s`/`from`/`to` is NULL | `s` (or `""`) | the **input**, or rodata |
+| `ionic_http_body` | no `\r\n\r\n` in the response | `raw` | the **input** |
+| `ionic_http_get` | socket/lookup/connect failure | `(char *)""` | rodata literal |
+| `ionic_http_post` | socket/lookup/connect failure | `(char *)""` | rodata literal |
+
+The last two were not in the original audit: they have the same shape as
+`file_read`'s failure path (`x ? x : ""`) and are equally reachable, so they are
+included in the class.
+
+Reachability from Ionic source, not from C:
+
+- `file_read` on a missing path is an ordinary, easily-reached program shape;
+  `examples/mastery/03_file_io.ionic` does it and prints `len = 0`.
+- `http_get` against an unreachable host is similarly ordinary.
+- `str_replace`/`http_body` with a *NULL* argument is **not** reachable — Ionic
+  strings are never NULL (a failed allocation aside). Those paths were fixed
+  anyway because the C functions are part of the runtime's own surface and a C
+  caller has no way to know the contract differs by path.
+
+Measured, not assumed (`clang -O0`, mirroring the exact bodies). The check is
+"is the returned pointer the start of a `malloc` block?", via
+`malloc_zone_from_ptr` — the same precondition `rc_alloc` needs, asked of the
+allocator rather than inferred from the contents:
+
+```
+before:  11 paths probed → 5 not owned → first free() aborts (exit 134)
+after:   11 paths probed → 11 owned   → all free()able      (exit 0)
+```
+
+The fix is uniform: **`rc_alloc` returns are the contract, so every return path
+must allocate.** `src/ionic_model_runtime.c` now routes each failure path
+through one helper:
+
+```c
+static char *rt_empty_str(void) {          /* allocated, not rodata */
+    char *e = (char *)malloc(1);
+    if (e) e[0] = '\0';
+    return e;
+}
+```
+
+and the three alias paths copy instead of returning their input.
+
+Note `ionic_file_read` is `__attribute__((weak))` because the LLVM IR path
+defines it inline in `src/codegen.rs`. The C fix alone was **not** enough: the
+IR definition also returned `@empty_str`, a rodata constant, and the
+`--verify-self-hosting` check would not have caught the divergence because both
+builds emit the same object *file* while differing only in a runtime routine's
+behaviour. Both definitions are now in step, and the comment in `codegen.rs`
+says so.
+
+**One path still cannot honour the contract: OOM.** If `malloc` fails inside a
+failure path, `rt_empty_str` returns NULL. That is a hard error everywhere else
+in this runtime too (Ionic strings are otherwise never NULL), and it is not
+reachable in practice; it is recorded here so the invariant is stated honestly
+rather than absolutely.
+
+### 11.2 `interior` — a pointer into a larger object — RESOLVED
+
+This was the severe one, because the *checker type-checks the result as a
+string*, so the oracle was right and the release still fired.
+
+`HttpRequest` (`src/ionic_model_runtime.c:3079`) stores two strings **inline**:
+
+```c
+typedef struct {
+    int   conn;
+    char  method[16];   /* offset 4  */
+    char  path[1024];   /* offset 20 */
+    char *body;
+    ...
+} HttpRequest;
+```
+
+and three accessors handed out pointers into it:
+
+| function | line | returned | declared type |
+|---|---|---|---|
+| `ionic_http_method` | 3241 | `r->method` (offset 4) | `TY_STR` |
+| `ionic_http_path` | 3246 | `r->path` (offset 20) | `TY_STR` |
+| `ionic_http_req_body` | 3251 | `r->body` (a heap pointer, or `""`) | `TY_STR` |
+
+`http_path` returned the *start of an inline array*, so `p - 8` was
+`offset 12` — the last 8 bytes of `method`. Measured before the fix:
+
+```
+before:  method[0..15]  47 45 54 00 00 00 00 00 00 00 00 00 00 00 00 00
+one release ->
+after:   method[0..15]  47 45 54 00 00 00 00 00 ff ff ff ff ff ff ff ff
+```
+
+`method` silently became `"GET"` followed by eight `0xff` bytes. When the count
+reached zero, `free(p - 8)` was called on `offset 12` of a `calloc`'d block,
+which aborts.
+
+**Fix applied: copy on access.** All three now return a `rt_dup_str()` copy, so
+`p` is always the start of an allocation the callee made. Copy-on-access was
+chosen over the "declare them borrowed" alternative because both compilers
+already classified these three as *owned* (`ncg_ty_of`, and the `ncg_last_ty = 1`
+list in `src/codegen/native.ionic`), so the copy makes the existing model true
+instead of introducing an owned-vs-borrowed distinction neither backend has
+today. That distinction (§8 step 6) remains the durable answer for foreign
+pointers generally; it was not needed for this class.
+
+`ionic_http_req_body` was a third case again: `r->body` is a real heap pointer
+owned by the *request*, so releasing it as a program string freed memory the
+request also frees in `http_req_free` — a double free on a pointer that at least
+began an allocation. Same treatment, same one-line shape.
+
+Measured after the fix with an ASan probe over all four accessors (the three HTTP
+ones plus `mlx_weights_key_at`, below):
+
+```
+m=0x602000000970 p=0x602000000990 b=0x6020000009b0 k=0x6020000009d0
+lens 0 0 0 0
+freed OK            exit 0
+```
+
+Four distinct heap allocations, each freed cleanly. The same probe against the
+pre-fix bodies reports `ALIASED` — all three HTTP accessors returned the one
+rodata pointer `0x1048d8940` — and `free()` on any of them aborts with exit 134.
+
+Inside the JSON/BPE code there are further interior pointers — `JVal.str` is
+handed out by `jget` as a pointer into a tree whose lifetime the caller does not
+own. None of them is reachable as a *program string* (they are internal `JVal`
+plumbing, not registered builtins), so they were never candidates for
+instrumentation. They are recorded here so that a future widening of the oracle,
+or a decision to expose the JSON tree to Ionic programs, does not sweep them in
+by accident.
+
+### 11.3 `foreign/static` — never from this allocator
+
+| function | line | source | rule |
+|---|---|---|---|
+| `ionic_get_arg` | 164 | `argv[idx]` (process-owned) | never release |
+| `ionic_getenv` | 173 | `getenv` buffer (libc-owned) | never release |
+| `ionic_exe_dir` | 184 | `static char dir[PATH_MAX]` | never release |
+| `ionic_mlx_last_error` | 1498 | `static char g_mlx_err[512]` | never release |
+| `ionic_mlx_last_error` (stub) | 1741 | rodata | never release |
+
+`ionic_mlx_weights_key_at` **was** in this class and no longer is: it returned a
+`static char keybuf[512]`, so `let k = mlx_weights_key_at(h, 0);
+let k2 = mlx_weights_key_at(h, 1);` left both names reading `k2`'s text — a plain
+aliasing bug that predated RC and was independent of it. It now returns a
+`rt_dup_str()` copy of that buffer on the MLX build, and `rt_empty_str()` on the
+stub, so the value is owned even though its *source* is still static. See §11.2.
+
+`ionic_mlx_last_error` is the one remaining trap: it returns `const char *` into
+`static` storage while the checker types the builtin as an ordinary `TY_STR`.
+Copy-on-access would fix it identically; it is not done because the buffer is a
+process-wide sticky diagnostic rather than per-object data, and no program has
+been observed to hold two live error strings. Recorded so the choice is explicit.
+
+### 11.4 Arrays and aggregates
+
+`IonicArray` is `{ i64 len; i64 cap; void *data; }`, allocated by
+`ionic_array_alloc`. It is a **two-allocation** object: the header and
+`data`. An RC header on the `IonicArray *` covers only the header, so releasing
+an array must also free `data` (and, if `data` holds managed slots, release
+them first). `ionic_arr_reset` (`:138`) currently sets `len = 0` and does
+nothing else — under RC it must release each element it drops.
+
+Strings stored in array slots are a separate retain: `ionic_array_get` returns
+`((int64_t*)arr->data)[i]`, an element *value*. Reading it out does not copy or
+retain, so `let s = names[0]` aliases the slot; writing `names[0] = s` stores a
+borrow. Both directions need explicit handling, and this is why the oracle
+needed `local_elem`.
+
+### 11.5 The audit's verdict
+
+Of the 26 definitions (23 distinct functions; two `mlx_*` accessors have separate
+MLX and stub builds, and `ionic_file_read` has both a weak C and an inline IR
+definition):
+
+| class | count | verdict |
+|---|---|---|
+| fresh | 18 | safe to `rc_alloc`; no change needed |
+| alias on some path | 0 | **resolved** — every return path now allocates (§11.1) |
+| interior | 0 | **resolved** — copy-on-access (§11.2) |
+| foreign/static | 4 (5 definitions) | must never be instrumented (§11.3) |
+| caller-buffer | 1 | `fgets_stdin` writes into a buffer the caller allocated |
+
+The interior count moved to zero in two directions: the three `http_*` request
+accessors copy (§11.2), and `mlx_weights_key_at` moved out of
+foreign/static into fresh because it now copies its static buffer. So
+`fresh` absorbed four functions (14 → 18), `interior` emptied (3 → 0), and
+`foreign/static` dropped from 5 functions / 6 definitions to 4 / 5. The totals
+still reconcile: 18 + 0 + 0 + 4 + 1 = 23 functions.
+
+Every string a program can obtain is now either a fresh allocation it owns or
+one of the four documented foreign/static sources that must never be
+instrumented. There are no remaining *bugs in this class*: no accessor returns a
+pointer whose release corrupts a neighbour, and no two live values alias by
+accident.
+
+So the ordering in §8 was wrong in one respect: this audit is not a *step*
+before RC, it is the thing that determines whether RC's design is viable. It is
+viable. The retain/release pass still needs the owned-vs-borrowed type
+distinction (§8 step 6) to be *sound by construction* rather than by a
+hand-maintained exemption list, but nothing in §11 blocks landing it.
+
+### 11.6 Cycles are constructible, contrary to §6
+
+§6 asserts cycles cannot form because "shared data is immutable and mutable
+ownership is unique/affine". Neither half holds in the shipped language. Measured:
+
+```
+let a = [1,2,3]; let b = [4,5,6];
+a.push(b); b.push(a);        // a.len == 4: an array element holding an array
+
+let p = P { x: 1, y: 2 }; let q = p; q.x = 99;   // p.x == 99
+```
+
+`let q = p` copies the *pointer* (structs and arrays are heap objects behind a
+single-word value), so two names alias one mutable aggregate. That gives both
+aliasing of mutable data and a back-edge, i.e. a reference cycle.
+
+Consequence: refcounting alone leaves mutually-referencing aggregates
+permanently leaked. The `scripts/rss_check.sh` benchmark must therefore remain
+cycle-free or it will never go flat, and §6 needs either an amendment ("bounded,
+programmer-visible leaks are accepted for cyclic aggregates") or a decision to
+prevent aggregate-in-aggregate at the type level. This is a design call, not an
+implementation task, and it should be made before the retain/release pass is
+written rather than discovered by it.
 
 ## See also
 

@@ -63,7 +63,7 @@ Stage A — Language user (fluency)
 Stage B — Compiler owner (mastery)
 
 - [06 — Compiler architecture](06-compiler-architecture.md) — pipeline, IR representations (SoA AST), SoA tokens, optimizer, codegen, diagnostics.
-- [07 — Memory model & runtime](07-memory-model-and-runtime.md) — C runtime, allocation, the RC decision, and the missing type oracle.
+- [07 — Memory model & runtime](07-memory-model-and-runtime.md) — C runtime, allocation, the RC decision, and the type oracle that unblocks it.
 - [08 — Build, bootstrap & self-hosting](08-build-bootstrap-selfhosting.md) — `ionic_self` vs `ionic_new`, the fixed point, the Rust bootstrap, releases/CI.
 - [09 — Capstone: extend the language](09-capstone.md) — an integrated feature build plus real open bugs in the repo.
 
@@ -89,19 +89,24 @@ Confirm each with the compiler, not the prose.
    direct array built as `[1.0, 2.0, 3.0, 4.0]` this silently drops the first
    element (`mean_f` returns `3.0`, not `2.5`). This is a real bug — see the
    capstone.
-2. **`println(arr[i])` prints a pointer, not the element**, for `[string]`
-   arrays (element loads lose string-ness at the codegen level). `println(arr[i])`
-   for `[int64]` works. This is the latent bug recorded in `docs/memory-model.md §10`.
-3. **CLI flags.** `src/main.ionic` accepts only `-o <name>` and source files; the
-   legacy self-hosted `compiler.ionic` accepted `--run`. If a doc snippet says
-   `ionic foo.ionic --run`, translate it to compile-then-execute:
-   `./ionic_new foo.ionic -o foo && ./foo`.
+2. **~~`println(arr[i])` prints a pointer~~ — fixed.** This used to print the
+   element's pointer as an integer for `[string]` arrays, and likewise for a
+   string *parameter* (`fn show(string s) { println(s); }`). Both were symptoms
+   of the same thing: print dispatch guessed the argument's type from the shape
+   of the AST node instead of asking for it. It now asks `ncg_ty_of`. The residue
+   that matters is narrower and belongs to the RC work, not to printing:
+   `ncg_ty_of` still answers "unknown" for a nested-array element and a method
+   call. See `docs/memory-model.md §10` and
+   `examples/mastery/02_string_array_print.ionic`.
+3. **CLI flags.** `src/main.ionic` accepts only `-o <name>` and source files;
+   there is no `--run` (a legacy `compiler.ionic` accepted it, but that file has
+   been removed). If a doc snippet says `ionic foo.ionic --run`, translate it to
+   compile-then-execute: `./ionic_new foo.ionic -o foo && ./foo`.
 4. **`print` vs `println`**: `print` has no trailing newline (`fputs`); `println`
    appends one (`puts`). Float params are passed as **raw IEEE-754 bit patterns
    in an integer slot**, and `println` of a float prints with `%g`.
 5. **`file_exists` is not a builtin in the shipped self-hosted compiler.** It is
-   implemented in the legacy `src/compiler.ionic` and in the Rust frontend, but
-   is absent from `register_builtins()` in `src/semantic/checker.ionic`, and
+   absent from `register_builtins()` in `src/semantic/checker.ionic`, and
    `src/codegen/native.ionic` does not lower it. `docs/language.md`/`guide.md`
    advertise it; the compiler rejects it with `unknown function 'file_exists'`.
    Use `str_len(file_read(path)) > 0` as a probe, or add it (capstone 09.1).

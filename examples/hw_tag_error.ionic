@@ -5,9 +5,14 @@
     return 1;
 }
 
-@gpu fn step(tensor@gpu x) -> tensor@gpu {
+@gpu fn step(tensor@gpu x, tensor@gpu y) -> tensor@gpu {
     print("side effects are not allowed on the GPU");
     let n = load();            // @cpu fn called from a GPU context
-    let leak: tensor@cpu = x.toCpu();   // tensor@cpu value inside GPU context
+    // `.toCpu()` MOVES `y`, so what follows is the placement leak and nothing
+    // else — returning `x` afterwards is not a use-after-move.
+    let leak: tensor@cpu = y.toCpu();
+    // The tensor@cpu value is only rejected where it is *used*; declaring it is
+    // not the violation the header describes.
+    let d = mlx_ndim(leak);    // tensor@cpu value inside GPU context
     return x;
 }

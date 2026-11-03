@@ -3,6 +3,12 @@
 // An @gpu fn body is a GPU context (same rules as a gpu { } block): no
 // tensor@cpu values and no CPU-only I/O. An @cpu fn body runs on the CPU
 // and may use anything that is legal outside a gpu block.
+//
+// The `vram` declaration is the accelerator pool size in bytes — a deployment
+// fact (which card is installed), declared once at top level. The `@gpu(0.5)`
+// below is a share *of that pool*; the checker rejects a fraction when no pool
+// is declared, because a fraction of an unknown pool has no meaning.
+let vram = 25769803776;   // 24 GiB of accelerator memory
 
 @cpu fn scale(int64 n) -> int64 {
     // CPU context: I/O (print) and ordinary compute are both fine here.

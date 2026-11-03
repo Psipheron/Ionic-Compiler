@@ -150,6 +150,24 @@ mut sv_names   = [""];
 mut sv_tys     = [0];
 mut sv_svs     = [""];  // struct name (TY_STRUCT) or elem type str (TY_ARRAY)
 mut sv_muts    = [0];   // 0=let, 1=mut
+// Static byte size of a value, or -1 when not knowable at compile time.
+// This is the size channel the pool budget (stage B3/B4) is charged against; it
+// is deliberately a separate column rather than folded into `sv_svs` (which
+// already carries a struct name or an array element type).
+mut sv_bytes   = [-1];
+// Where this binding was consumed by a transfer, or 0 if it still owns a value.
+//
+// A transfer is a MOVE: the value occupies exactly one pool, so after
+// `let g = x.toGpu();` the SRAM binding `x` no longer owns anything and using it
+// is a use-after-move (stage B5, decision 1). Capacity accounting is only
+// meaningful if a value has a single owner — otherwise `x` and `g` would both
+// count against their pools while naming the same bytes.
+//
+// The line (rather than a plain 0/1 flag) doubles as the provenance the
+// diagnostic needs: a move error that cannot say *where* the value went is much
+// harder to act on than one that can.
+mut sv_mvline  = [0];
+mut sv_mvhow   = [""];  // ".toGpu()" / ".toCpu()" — the transfer that consumed it
 mut sv_count   = 0;
 mut frame_stk  = [0];
 mut frame_count = 0;
@@ -177,13 +195,60 @@ fn sv_declare(string name, int64 ty, string sv, int64 mut_flag) -> int64 {
         sv_tys[sv_count]    = ty;
         sv_svs[sv_count]    = sv;
         sv_muts[sv_count]   = mut_flag;
+        sv_bytes[sv_count]  = -1;
+        sv_mvline[sv_count] = 0;
+        sv_mvhow[sv_count]  = "";
     } else {
         push(sv_names,  name);
         push(sv_tys,    ty);
         push(sv_svs,    sv);
         push(sv_muts,   mut_flag);
+        push(sv_bytes,  -1);
+        push(sv_mvline, 0);
+        push(sv_mvhow,  "");
     }
     return 0;
+}
+
+// Mark the binding `name` as consumed by the transfer `how` written on `line`.
+// A rebinding (`sv_declare`) clears the mark, which is what makes
+// `let g = x.toGpu(); let x = mlx_ones(...);` legal — the old value was moved,
+// the new one is a distinct value in a reused slot.
+fn sv_mark_moved(string name, int64 line, string how) -> int64 {
+    let i = sv_lookup_idx(name);
+    if (i == 0) { return 0; }
+    sv_mvline[i] = line;
+    sv_mvhow[i]  = how;
+    return 0;
+}
+
+// Line of the transfer that consumed `name`, or 0 if it still owns a value.
+fn sv_moved_at(string name) -> int64 {
+    let i = sv_lookup_idx(name);
+    if (i == 0) { return 0; }
+    return sv_mvline[i];
+}
+
+fn sv_moved_how(string name) -> string {
+    let i = sv_lookup_idx(name);
+    if (i == 0) { return ""; }
+    return sv_mvhow[i];
+}
+
+// Record the static size of the most recent binding of `name`. Kept separate
+// from sv_declare() because the size is not known until the initialiser has been
+// sized, and because a re-binding must be able to update it.
+fn sv_set_bytes(string name, int64 b) -> int64 {
+    let i = sv_lookup_idx(name);
+    if (i == 0) { return 0; }
+    sv_bytes[i] = b;
+    return 0;
+}
+
+fn sv_lookup_bytes(string name) -> int64 {
+    let i = sv_lookup_idx(name);
+    if (i == 0) { return -1; }
+    return sv_bytes[i];
 }
 
 fn sv_lookup_idx(string name) -> int64 {
@@ -525,6 +590,354 @@ fn hw_ann_name(int64 hw_node) -> string {
     if (hw_ann_is_gpu(hw_node)) { return "@gpu"; }
     if (hw_ann_is_cpu(hw_node)) { return "@cpu"; }
     return "";
+}
+
+// ── Memory-pool budget (Stage B2) ────────────────────────────────────────────
+//
+// `@cpu` / `@gpu` name *memory pools*, not devices: SRAM (host memory) and VRAM
+// (accelerator memory). The pools have different capacities, and VRAM is the
+// scarce one, so the interesting failure is not "wrong device" but "did not
+// fit". The pool size is a deployment fact — which card is installed — so it is
+// declared ONCE at top level and inherited by every @gpu scope:
+//
+//     let vram = 25769803776;             // bytes of accelerator memory
+//     @gpu fn train_step(...) -> ... {}   // may use up to the whole pool
+//     @gpu(0.25) fn helper(...) -> ... {} // may use up to a quarter of it
+//
+// The name is a convention the checker recognises, not a language keyword: it is
+// an ordinary top-level `let`, so it costs no new syntax and the value is
+// readable at runtime like any other global.
+let POOL_DECL_NAME = "vram";
+
+// Declared pool size in bytes, or 0 when the program declares none.
+// 0 is not an error by itself — a program that never restricts a GPU scope does
+// not need a pool. It only becomes an error when a `@gpu(f)` fraction is
+// applied, because a fraction of an undeclared pool is meaningless.
+mut pool_vram_bytes = 0;
+// How many top-level declarations of the pool name were seen, so a second one
+// is reported rather than silently taking the last value.
+mut pool_decl_count = 0;
+
+// Bits of the largest fraction we accept. 1.0 as IEEE-754 double. Comparing
+// bit patterns is exact for positives and avoids doing float arithmetic in the
+// checker: every positive double's bit pattern is monotonic in its value, so
+// `0 < bits <= bits(1.0)` is exactly `0 < f <= 1.0`.
+let FRAC_ONE_BITS = 4607182418800017408;
+
+// Parse the fraction text carried by an ND_HW node. Returns -1 when the node is
+// absent or carries no fraction, 0 when the text is not a positive number <= 1.
+fn hw_frac_bits(int64 hw_node) -> int64 {
+    if (hw_node == 0) { return -1; }
+    let v = nd_iv[hw_node];
+    if (v != HW_GPU_FRAC && v != HW_CPU_FRAC) { return -1; }
+    let txt = nd_sv[hw_node];
+    if (str_len(txt) == 0) { return -1; }
+    return str_to_float64_bits(txt);
+}
+
+// True when the fraction is a usable share of a pool: strictly positive and at
+// most the whole pool. A fraction outside that range cannot describe a budget,
+// so it is rejected where it is written rather than at some later use.
+fn hw_frac_is_valid(int64 bits) -> bool {
+    if (bits <= 0) { return false; }
+    return bits <= FRAC_ONE_BITS;
+}
+
+// ── The fraction as an exact integer ratio (Stage B4) ────────────────────────
+//
+// The checker works in int64 throughout, so the fraction is carried as
+// num/den (e.g. "0.25" -> 25/100) and the scope budget is
+//
+//     budget = pool_vram_bytes * num / den
+//
+// computed in integers. Multiplying first and dividing second keeps the result
+// exact whenever the pool divides evenly, which is the common case (a 24 GiB
+// pool, a quarter share). Fraction arithmetic in float64 would be one
+// rounding error away from reporting a budget the user did not write.
+
+fn frac_dot_pos(string s) -> int64 {
+    mut i = 0;
+    let n = str_len(s);
+    while (i < n) {
+        if (str_index(s, i) == 46) { return i; }   // 46 = '.'
+        i = i + 1;
+    }
+    return -1;
+}
+
+// "0.25" -> 25, "1" -> 1, "1.0" -> 10
+fn frac_num(string s) -> int64 {
+    let dot = frac_dot_pos(s);
+    if (dot < 0) { return str_to_int64(s); }
+    let a = str_slice(s, 0, dot);
+    let b = str_slice(s, dot + 1, str_len(s));
+    return str_to_int64(str_concat(a, b));
+}
+
+// "0.25" -> 100, "1" -> 1, "1.0" -> 10
+fn frac_den(string s) -> int64 {
+    let dot = frac_dot_pos(s);
+    if (dot < 0) { return 1; }
+    let places = str_len(s) - dot - 1;
+    mut d = 1;
+    mut i = 0;
+    while (i < places) { d = d * 10; i = i + 1; }
+    return d;
+}
+
+// The byte budget of a scope whose annotation is `hw_node`, or -1 when there is
+// nothing to check against (no pool declared). An unannotated fraction is the
+// whole pool, i.e. num/den = 1/1.
+fn scope_budget_bytes(int64 hw_node) -> int64 {
+    if (pool_vram_bytes <= 0) { return -1; }
+    let fb = hw_frac_bits(hw_node);
+    if (fb == -1) { return pool_vram_bytes; }
+    if (!hw_frac_is_valid(fb)) { return -1; }   // already reported by B2
+    let txt = nd_sv[hw_node];
+    let den = frac_den(txt);
+    if (den <= 0) { return -1; }
+    return pool_vram_bytes * frac_num(txt) / den;
+}
+
+// ── Static tensor sizes (Stage B3) ──────────────────────────────────────────
+//
+// A tensor's size is product(shape) x dtype_size. Both are knowable for the
+// constructor builtins, which is where VRAM actually gets allocated, so those
+// are what this models. Everything else reports "unknown" (-1) rather than
+// guessing.
+//
+// Sizes are the currency of the budget check: a `tensor@gpu` whose size is
+// unknown is not counted, and not rejected either — see the COVERAGE note on
+// budget_charge() below.
+
+// Bytes per element for an IonicDtype code (mirrors ionic_model_runtime.c).
+fn dtype_bytes(int64 dt) -> int64 {
+    if (dt == 0) { return 4; }   // F32 (the default when unspecified)
+    if (dt == 1) { return 2; }   // F16
+    if (dt == 2) { return 2; }   // BF16
+    if (dt == 3) { return 8; }   // F64
+    if (dt == 4) { return 4; }   // I32
+    if (dt == 5) { return 8; }   // I64
+    if (dt == 6) { return 1; }   // BOOL
+    if (dt == 7) { return 1; }   // U8
+    return -1;
+}
+
+// nth argument node (1-based) of a call, or 0 when there is no such argument.
+fn arg_node(int64 args, int64 n) -> int64 {
+    mut cur = args;
+    mut i = 1;
+    while (cur != 0) {
+        if (i == n) { return nd_i2[cur]; }
+        i = i + 1;
+        cur = nd_i3[cur];
+    }
+    return 0;
+}
+
+// Element count of an `[a, b, c]` shape literal, or -1 unless every element is
+// a non-negative integer literal. A shape built at runtime is not static.
+fn shape_lit_count(int64 lit) -> int64 {
+    if (lit == 0) { return -1; }
+    if (nd_kind[lit] != ND_ARRAY_LIT) { return -1; }
+    mut cur = nd_i2[lit];
+    mut n = 0;
+    mut prod = 1;
+    while (cur != 0) {
+        let e = nd_i2[cur];
+        if (nd_kind[e] != ND_INT) { return -1; }
+        if (nd_iv[e] < 0) { return -1; }
+        prod = prod * nd_iv[e];
+        n = n + 1;
+        cur = nd_i3[cur];
+    }
+    if (n == 0) { return -1; }
+    return prod;
+}
+
+// `shape_lit_count x dtype_bytes`, or -1 if either is unknown.
+fn bytes_of_shape(int64 shape_node, int64 dtype_node) -> int64 {
+    let n = shape_lit_count(shape_node);
+    if (n < 0) { return -1; }
+    if (dtype_node == 0) { return -1; }
+    if (nd_kind[dtype_node] != ND_INT) { return -1; }
+    let es = dtype_bytes(nd_iv[dtype_node]);
+    if (es < 0) { return -1; }
+    return n * es;
+}
+
+// Static size in bytes of `node`, or -1 when not knowable at compile time.
+fn expr_bytes(int64 node) -> int64 {
+    if (node == 0) { return -1; }
+    let k = nd_kind[node];
+
+    // A transfer moves bytes between pools; it does not change how many.
+    if (k == ND_TO_GPU || k == ND_TO_CPU) { return expr_bytes(nd_i2[node]); }
+
+    if (k == ND_IDENT) { return sv_lookup_bytes(nd_sv[node]); }
+
+    if (k == ND_METHOD_CALL) {
+        let m = nd_sv[node];
+        if (str_eq(m, "toGpu") || str_eq(m, "toCpu")) { return expr_bytes(nd_i2[node]); }
+        return -1;
+    }
+
+    if (k == ND_CALL) {
+        let callee = nd_sv[node];
+        let args   = nd_i2[node];
+
+        // Constructors: (shape, dtype)
+        if (str_eq(callee, "mlx_zeros") || str_eq(callee, "mlx_ones")) {
+            return bytes_of_shape(arg_node(args, 1), arg_node(args, 2));
+        }
+        // mlx_full(shape, value, dtype)
+        if (str_eq(callee, "mlx_full")) {
+            return bytes_of_shape(arg_node(args, 1), arg_node(args, 3));
+        }
+        // mlx_random_normal(shape, loc, scale, dtype) / _uniform(shape, lo, hi, dtype)
+        if (str_eq(callee, "mlx_random_normal") || str_eq(callee, "mlx_random_uniform")) {
+            return bytes_of_shape(arg_node(args, 1), arg_node(args, 4));
+        }
+        // mlx_eye(n, m, dtype)
+        if (str_eq(callee, "mlx_eye")) {
+            let n_nd = arg_node(args, 1);
+            let m_nd = arg_node(args, 2);
+            let d_nd = arg_node(args, 3);
+            if (n_nd == 0 || m_nd == 0 || d_nd == 0) { return -1; }
+            if (nd_kind[n_nd] != ND_INT || nd_kind[m_nd] != ND_INT) { return -1; }
+            if (nd_kind[d_nd] != ND_INT) { return -1; }
+            let es = dtype_bytes(nd_iv[d_nd]);
+            if (es < 0 || nd_iv[n_nd] < 0 || nd_iv[m_nd] < 0) { return -1; }
+            return nd_iv[n_nd] * nd_iv[m_nd] * es;
+        }
+
+        // Shape-preserving ops: the result occupies what the first operand does.
+        if (str_eq(callee, "mlx_add")       || str_eq(callee, "mlx_subtract") ||
+            str_eq(callee, "mlx_multiply")  || str_eq(callee, "mlx_divide")   ||
+            str_eq(callee, "mlx_power")     || str_eq(callee, "mlx_maximum")  ||
+            str_eq(callee, "mlx_minimum")   || str_eq(callee, "mlx_matmul")   ||
+            str_eq(callee, "mlx_negative")  || str_eq(callee, "mlx_square")   ||
+            str_eq(callee, "mlx_sqrt")      || str_eq(callee, "mlx_exp")      ||
+            str_eq(callee, "mlx_log")       || str_eq(callee, "mlx_abs")      ||
+            str_eq(callee, "mlx_tanh")      || str_eq(callee, "mlx_erf")      ||
+            str_eq(callee, "mlx_contiguous")) {
+            return expr_bytes(arg_node(args, 1));
+        }
+
+        // Reductions, reshapes, casts, slices and concatenation change the
+        // shape (or the dtype) in ways this pass does not model.
+        return -1;
+    }
+
+    return -1;
+}
+
+// ── Scope budget accumulation (Stage B4) ────────────────────────────────────
+//
+// Within one GPU scope, the values that occupy VRAM simultaneously must fit the
+// scope's share of the pool. `sc_used_bytes` accumulates what the checker can
+// size statically; the check fires at the declaration that pushes it over, so
+// the diagnostic names the allocation responsible.
+//
+// COVERAGE — read before trusting this:
+//   * It counts `let`-bound `tensor@gpu` locals whose size is statically known.
+//   * It does NOT count values whose size is unknown (a parameter received from
+//     the caller, or the result of an op this pass does not model). Those are
+//     exempt rather than rejected: a parameter was allocated — and charged — in
+//     the caller's scope, and rejecting every function that takes a tensor would
+//     make the feature unusable. Decision 4 in the plan ("reject unbounded") is
+//     therefore applied only where a value is *created* in a budgeted scope;
+//     see the note in docs/plan-placement.md.
+//   * Consequently this is a NECESSARY but not sufficient check: it catches
+//     "I allocated 4 GiB against a 1% budget", and it does not prove that every
+//     value in the scope fits. It under-approximates; it cannot produce a false
+//     rejection.
+mut sc_budget_bytes  = -1;   // -1 = no budget in force
+mut sc_used_bytes    = 0;
+mut sc_used_unknown  = 0;    // count of un-sized GPU locals (informational)
+
+// Start a budget for a scope. Returns nothing; sc_budget_bytes/sc_used_bytes are
+// saved and restored by the caller.
+fn budget_begin(int64 hw_node) -> int64 {
+    sc_budget_bytes = scope_budget_bytes(hw_node);
+    sc_used_bytes   = 0;
+    sc_used_unknown = 0;
+    return 0;
+}
+
+// Charge one GPU-resident declaration. `name` is the binding, `init_nd` its
+// initialiser, `node` the declaration node (for the diagnostic position).
+fn budget_charge(string name, int64 init_nd, int64 node) -> int64 {
+    if (sc_budget_bytes < 0) { return 0; }
+    let b = expr_bytes(init_nd);
+    if (b < 0) {
+        sc_used_unknown = sc_used_unknown + 1;
+        return 0;
+    }
+    sv_set_bytes(name, b);
+    sc_used_bytes = sc_used_bytes + b;
+    if (sc_used_bytes > sc_budget_bytes) {
+        sc_active_node = node;
+        sc_error_at(str_concat("'" , str_concat(name, "' does not fit the accelerator pool")),
+            str_concat(str_concat(str_concat(int64_to_str(b), " bytes here; "),
+                                  str_concat(int64_to_str(sc_used_bytes), " bytes live in this scope")),
+                       str_concat(str_concat(", budget is ", int64_to_str(sc_budget_bytes)),
+                                  " (raise the `vram` pool or narrow the scope's fraction)")));
+    }
+    return 0;
+}
+
+// ── Transfers move: use-after-move (Stage B5) ────────────────────────────────
+//
+// `x.toGpu()` consumes `x`. Every other operation *borrows*: `mlx_add(g, g)`
+// reads `g` twice and leaves it owned, `return x` hands over a copy of the
+// handle. Only a transfer changes which binding owns the value, and only a
+// transfer can strand one.
+//
+// The asymmetry matters. If builtin calls consumed their operands too, then
+// `mlx_add(g, g)` would be illegal and every expression would need a copy of its
+// inputs — which is not how the runtime works (MLX arrays are refcounted
+// handles) and not what capacity accounting needs. What accounting needs is one
+// owner per value, and transferring is the one operation that reassigns it.
+
+// Reject a reference to a binding a previous transfer consumed.
+fn sc_check_not_moved(string name) -> int64 {
+    let at = sv_moved_at(name);
+    if (at == 0) { return 0; }
+    let how = sv_moved_how(name);
+    sc_error_at(str_concat("use after move of '", str_concat(name, "'")),
+        str_concat(str_concat(str_concat(str_concat("consumed by `", name), how),
+                              str_concat("` on line ", int64_to_str(at))),
+                   " (a transfer moves the value; bind the result and use that)"));
+    return 0;
+}
+
+// Consume `name` at `line` on behalf of the transfer `how`. Idempotent: a second
+// transfer of an already-moved value is reported by sc_check_not_moved(), not
+// here, so the first move's provenance is what the diagnostic keeps.
+fn sc_move_binding(string name, int64 line, string how) -> int64 {
+    if (!sv_is_defined(name)) { return 0; }
+    if (sv_moved_at(name) != 0) { return 0; }
+    sv_mark_moved(name, line, how);
+    return 0;
+}
+
+// Apply the transfer rule to a `.toGpu()` / `.toCpu()` operand: the operand may
+// itself be a transfer (`a.toCpu().toGpu()` moves `a` once, through the inner
+// call), and a temporary has no binding to consume.
+fn sc_consume_operand(int64 operand, int64 line, string how) -> int64 {
+    if (operand == 0) { return 0; }
+    let k = nd_kind[operand];
+    if (k == ND_IDENT) {
+        sc_move_binding(nd_sv[operand], line, how);
+        return 0;
+    }
+    if (k == ND_TO_GPU || k == ND_TO_CPU) {
+        // The inner transfer already consumed whatever it was given; the outer
+        // one consumes the temporary it produced.
+        return 0;
+    }
+    return 0;
 }
 
 // Functions that access CPU state and are banned inside gpu {} blocks
@@ -899,6 +1312,17 @@ fn register_builtins() -> int64 {
     bparam(1, TY_TENSOR_CPU);
     register_builtin("mlx_dtype",         1, TY_INT64,   "");
     bparam(1, TY_TENSOR_CPU);
+    // Pool introspection (Stage C). `mlx_pool` takes a tensor and reports which
+    // pool its bytes are charged to (0 = SRAM, 1 = VRAM), so a test can assert
+    // that a transfer moved the value rather than only retyping it.
+    // `mlx_pool_bytes` reports a pool's current occupancy, which is what a
+    // capacity budget bounds.
+    register_builtin("mlx_pool",          1, TY_INT64,   "");
+    bparam(1, TY_TENSOR_CPU);
+    register_builtin("mlx_pool_bytes",    1, TY_INT64,   "");
+    bparam(1, TY_INT64);
+    register_builtin("mlx_pool_count",    0, TY_INT64,   "");
+    register_builtin("mlx_pools_unified", 0, TY_INT64,   "");
     // Elementwise binary
     register_builtin("mlx_add",           2, TY_TENSOR_CPU, ""); bparams_tensor(2);
     register_builtin("mlx_subtract",      2, TY_TENSOR_CPU, ""); bparams_tensor(2);
@@ -1054,6 +1478,10 @@ fn sc_expr(int64 node) -> int64 {
             sc_hint_did_you_mean("variable", suggest_var(name));
             sc_ty = TY_UNKNOWN; sc_sv = ""; return 0;
         }
+        // A value a previous transfer consumed no longer belongs to this name.
+        // Report it here rather than at each use site, so every reference — as
+        // an argument, an initialiser, a return value — is covered by one rule.
+        sc_check_not_moved(name);
         sc_ty = sv_lookup_ty(name);
         sc_sv = sv_lookup_sv_val(name);
         // tensor@cpu cannot be used directly inside a gpu block
@@ -1257,12 +1685,14 @@ fn sc_expr(int64 node) -> int64 {
             if (obj_ty != TY_TENSOR_CPU && obj_ty != TY_UNKNOWN) {
                 sc_error_at("toGpu", "can only call toGpu() on tensor@cpu");
             }
+            sc_consume_operand(nd_i2[node], nd_line[node], ".toGpu()");
             sc_ty = TY_TENSOR_GPU; sc_sv = ""; return 0;
         }
         if (str_eq(method, "toCpu")) {
             if (obj_ty != TY_TENSOR_GPU && obj_ty != TY_UNKNOWN) {
                 sc_error_at("toCpu", "can only call toCpu() on tensor@gpu");
             }
+            sc_consume_operand(nd_i2[node], nd_line[node], ".toCpu()");
             sc_ty = TY_TENSOR_CPU; sc_sv = ""; return 0;
         }
         if (str_eq(method, "forward")) {
@@ -1370,6 +1800,7 @@ fn sc_expr(int64 node) -> int64 {
         if (sc_ty != TY_TENSOR_CPU && sc_ty != TY_UNKNOWN) {
             sc_error_at("toGpu", "operand must be tensor@cpu");
         }
+        sc_consume_operand(nd_i2[node], nd_line[node], ".toGpu()");
         sc_ty = TY_TENSOR_GPU; sc_sv = ""; return 0;
     }
     if (k == ND_TO_CPU) {
@@ -1379,6 +1810,7 @@ fn sc_expr(int64 node) -> int64 {
         if (sc_ty != TY_TENSOR_GPU && sc_ty != TY_UNKNOWN) {
             sc_error_at("toCpu", "operand must be tensor@gpu");
         }
+        sc_consume_operand(nd_i2[node], nd_line[node], ".toCpu()");
         sc_ty = TY_TENSOR_CPU; sc_sv = ""; return 0;
     }
 
@@ -1425,6 +1857,16 @@ fn sc_stmt(int64 node) -> int64 {
             decl_sv_val = ann_sv_val;
         }
         sv_declare(name, decl_ty, decl_sv_val, mut_flag);
+        // Stage B3/B4: a GPU-resident binding is charged against the enclosing
+        // scope's budget. Sized values are summed; unsized ones are exempt (see
+        // the COVERAGE note on budget_charge).
+        if (decl_ty == TY_TENSOR_GPU && sc_budget_bytes >= 0) {
+            budget_charge(name, init_nd, node);
+        } else {
+            // Even outside a budgeted GPU scope, track the size so a later
+            // `.toGpu()` inside one can be sized without re-deriving it.
+            sv_set_bytes(name, expr_bytes(init_nd));
+        }
         return 0;
     }
 
@@ -1547,11 +1989,26 @@ fn sc_stmt(int64 node) -> int64 {
     if (k == ND_GPU_BLOCK) {
         // Save/restore so a gpu { } nested inside an @gpu fn does not drop the
         // enclosing function's GPU context on exit.
-        let saved_gpu = sc_in_gpu_block;
+        let saved_gpu    = sc_in_gpu_block;
+        let saved_budget = sc_budget_bytes;
+        let saved_used   = sc_used_bytes;
         sc_in_gpu_block = 1;
+        // A bare `gpu { }` has no fraction of its own, so it inherits the whole
+        // declared pool.
+        //
+        // NOTE: nesting resets the running total rather than adding to the
+        // enclosing scope's. A `gpu { }` inside an `@gpu(0.25) fn` therefore
+        // checks its own locals against the whole pool, not the remaining
+        // quarter, which under-counts. This is the conservative-for-the-user
+        // direction (it can only let more through, never reject), and it
+        // matches the fact that the block's own locals die at its `}`. Fixing
+        // it properly needs the live-range analysis that stage D defers.
+        budget_begin(0);
         sv_push_frame();
         sc_block_stmts(nd_i2[node]);
         sv_pop_frame();
+        sc_budget_bytes = saved_budget;
+        sc_used_bytes   = saved_used;
         sc_in_gpu_block = saved_gpu;
         return 0;
     }
@@ -1580,10 +2037,19 @@ fn sc_fn(int64 fn_node) -> int64 {
     let fn_is_gpu  = hw_ann_is_gpu(fn_hw);
     let fn_is_cpu  = hw_ann_is_cpu(fn_hw);
 
+    // A `@gpu(f)` / `@cpu(f)` fraction is a share of the declared pool. Validate
+    // it where it is written — until B2 the parser read it and nothing used it.
+    sc_check_hw_frac(fn_hw, hw_ann_name(fn_hw));
+
     let saved_fn   = sc_cur_fn_name;
     let saved_rty  = sc_cur_fn_ret_ty;
     let saved_rsv  = sc_cur_fn_ret_sv;
     let saved_gpu  = sc_in_gpu_block;
+    // Stage B4: a @gpu fn body is a budgeted scope; its budget is the declared
+    // pool scaled by the function's own fraction (or the whole pool if none).
+    let saved_budget = sc_budget_bytes;
+    let saved_used   = sc_used_bytes;
+    if (fn_is_gpu) { budget_begin(fn_hw); }
     sc_cur_fn_name   = name;
     sc_cur_fn_ret_ty = ret_ty;
     sc_cur_fn_ret_sv = ret_sv_val;
@@ -1629,14 +2095,80 @@ fn sc_fn(int64 fn_node) -> int64 {
     sc_cur_fn_ret_ty = saved_rty;
     sc_cur_fn_ret_sv = saved_rsv;
     sc_in_gpu_block  = saved_gpu;
+    sc_budget_bytes  = saved_budget;
+    sc_used_bytes    = saved_used;
     return 0;
 }
 
 // ── sc_program: full semantic pass over a parsed program ──────────────────────
+// Find the top-level pool declaration (see the Memory-pool budget block above).
+//
+// The declaration is an ordinary `let` whose *name* the checker recognises, so
+// it needs no new syntax and remains a perfectly normal global at runtime. It is
+// scanned before any function body is checked, because `@gpu(f)` means "f of the
+// declared pool" and there is no meaningful answer to that until the pool size
+// is known.
+fn pool_scan_toplevel(int64 top_list) -> int64 {
+    mut snode = top_list;
+    while (snode != 0) {
+        let stmt = nd_i2[snode];
+        if (nd_kind[stmt] == ND_LET) {
+            if (str_eq(nd_sv[stmt], POOL_DECL_NAME)) {
+                pool_decl_count = pool_decl_count + 1;
+                sc_active_node = stmt;
+                if (pool_decl_count > 1) {
+                    sc_error_at("duplicate pool declaration",
+                        str_concat(str_concat("'", POOL_DECL_NAME),
+                                   "' is a deployment fact — declare it once"));
+                } else {
+                    let init_nd = nd_i3[stmt];
+                    if (nd_kind[init_nd] != ND_INT) {
+                        sc_error_at("pool declaration", str_concat(str_concat("'", POOL_DECL_NAME),
+                            "' must be a plain byte count, e.g. `let vram = 25769803776;`"));
+                    } else if (nd_iv[init_nd] <= 0) {
+                        sc_error_at("pool declaration", str_concat(str_concat("'", POOL_DECL_NAME),
+                            str_concat("' must be positive, got ", int64_to_str(nd_iv[init_nd]))));
+                    } else {
+                        pool_vram_bytes = nd_iv[init_nd];
+                    }
+                }
+            }
+        }
+        snode = nd_i3[snode];
+    }
+    return 0;
+}
+
+// Validate a `@gpu(f)` / `@cpu(f)` fraction where it is written.
+//
+// `@gpu(0.5)` used to be parsed and then discarded, which made it a claim the
+// compiler never looked at. Giving it a meaning starts with rejecting the values
+// that cannot have one: a share that is zero, above the whole pool, or a
+// fraction of a pool the program never declared.
+fn sc_check_hw_frac(int64 hw_node, string what) -> int64 {
+    let fb = hw_frac_bits(hw_node);
+    if (fb == -1) { return 0; }
+    sc_active_node = hw_node;
+    if (!hw_frac_is_valid(fb)) {
+        sc_error_at(str_concat(what, " fraction"),
+            str_concat(str_concat("must be greater than 0 and at most 1, got ", nd_sv[hw_node]),
+                       " (a share of the accelerator pool, e.g. @gpu(0.25))"));
+        return 0;
+    }
+    if (pool_vram_bytes <= 0) {
+        sc_error_at(str_concat(what, " fraction"),
+            str_concat(str_concat("is a share of the accelerator pool, but no pool is declared; add a top-level `let ",
+                                  POOL_DECL_NAME),
+                       " = <bytes>;`"));
+    }
+    return 0;
+}
+
 fn sc_program(int64 structs_list, int64 fns_list, int64 top_list) -> int64 {
     pre_pass_structs(structs_list);
     pre_pass_fns(fns_list);
     register_builtins();
+    pool_scan_toplevel(top_list);
 
     // Pre-declare top-level globals so functions that reference them work.
     mut snode = top_list;

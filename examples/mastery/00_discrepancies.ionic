@@ -6,9 +6,10 @@
 // You will see:
 //   1. mean_f([1,2,3,4]) = 3   (WRONG; a correct mean is 2.5) — the std.data
 //      off-by-one, because those helpers assume 1-based arrays while Ionic
-//      arrays are 0-based.
-//   2. println(names[0]) prints a pointer-ish integer, not "alice" — element
-//      loads lose string-ness at the codegen level (unit 06 §8).
+//      arrays are 0-based. Still open.
+//   2. println(names[0]) prints "alice". This one used to be a discrepancy and
+//      is now FIXED: dispatch asks the codegen type oracle (ncg_ty_of) instead
+//      of guessing from the shape of the AST node.
 //
 // (Discrepancy 3 — CLI/`--run` — is about the tooling, not output. Discrepancy
 //  4 — print vs println — is shown in 01_print_variants.ionic.)
@@ -21,11 +22,12 @@ let a = [1.0, 2.0, 3.0, 4.0];
 println(str_concat("mean_f([1,2,3,4]) = ", float64_to_str(mean_f(a))));
 println("   (correct answer is 2.5; std.data drops index 0)");
 
-// This line is deliberately non-deterministic: it prints a pointer as an int.
-println("names[0] via println(arr[i]) — garbage, varies run to run:");
-println(names[0]);
+// Discrepancy 2, formerly a bug: this printed the element's pointer as an
+// integer. It now prints the string. See examples/mastery/02_string_array_print.ionic
+// for the parameter and return-value cases too.
+println(str_concat("names[0] = ", names[0]));
 
-// For contrast, indexing into an [int64] prints correctly:
+// For contrast, indexing into an [int64] also prints correctly:
 mut nums = [10, 20, 30];
 println(str_concat("nums[0] (int array) = ", int64_to_str(nums[0])));
 

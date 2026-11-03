@@ -386,12 +386,26 @@ when several are live.
 
 ### MLX tensor backend
 
-Apple-silicon GPU array runtime. Handles are typed `tensor@cpu` — they are
-host-side handles to a lazily-built device graph. On Apple silicon the CPU and
-GPU share physical memory, so a `.toGpu()` there does not copy: the bytes stay
-put and only the accounting pool changes. That is why MLX is the *unified
-memory* backend — it is one implementation of the pool model, not the model
-itself.
+Apple-silicon array runtime. A handle's type records its **pool**, not a
+device: `tensor@cpu` is SRAM-resident and `tensor@gpu` is
+accelerator-resident, and the runtime handle carries the same flag, so the
+distinction holds at run time and not only in the checker. Builtins are
+pool-polymorphic — `mlx_add(cpu_a, cpu_b)` yields `tensor@cpu` and
+`mlx_add(gpu_a, gpu_b)` yields `tensor@gpu` — while user functions stay strictly
+placement-typed.
+
+A `.toGpu()` / `.toCpu()` transfer **moves**: the source binding is consumed (a
+later use is a use-after-move error) and the destination pool is charged for
+the bytes. On Apple silicon the CPU and GPU address the same physical memory, so
+no data is copied and only the accounting moves; on a discrete backend the value
+is copied onto the destination stream and the source's storage is released. That
+is why MLX is the *unified memory* backend — it is one implementation of the pool
+model, not the model itself.
+
+`mlx_pool(t)` reports which pool a handle lives in, `mlx_pool_bytes(p)` how many
+bytes that pool currently holds, `mlx_pool_count()` how many pools there are, and
+`mlx_pools_unified()` whether a transfer between them is free on this backend.
+They exist so the pool model is observable, and therefore testable, from Ionic.
 
 Unlike `load_model`, **handles are not RAII-freed**: call `mlx_free()`
 explicitly.

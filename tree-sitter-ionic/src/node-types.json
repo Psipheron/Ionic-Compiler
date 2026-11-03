@@ -1650,6 +1650,11 @@
     }
   },
   {
+    "type": "model_type",
+    "named": true,
+    "fields": {}
+  },
+  {
     "type": "named_type",
     "named": true,
     "fields": {},
@@ -2027,6 +2032,10 @@
       "types": [
         {
           "type": "array_type",
+          "named": true
+        },
+        {
+          "type": "model_type",
           "named": true
         },
         {

@@ -554,6 +554,13 @@ mut local_is_float = [0];   // 1 if float64
 mut local_is_str   = [0];   // 1 if string type
 mut local_stypes   = [""];  // struct type name, or "" for non-struct locals
 mut local_model    = [0];   // 1 if this local owns a `model` resource (RAII)
+// Element type of an array-typed local, as a checker TY_* code (0 = not an
+// array, or the element type is unknown). Recorded from the declaration's type
+// annotation — or inferred from an array literal — so an element load can be
+// typed. Without it `println(names[0])` printed the element's pointer as an
+// integer, because an element load is an int64 bit pattern and nothing carried
+// the element type to the call site.
+mut local_elem     = [0];
 mut local_count    = 0;
 
 // Names+slots of model-owning locals, for auto-free at function end.
@@ -596,6 +603,7 @@ fn local_reset() -> int64 {
     arr_reset(local_is_str);
     arr_reset(local_stypes);
     arr_reset(local_model);
+    arr_reset(local_elem);
     arr_reset(model_names);
     arr_reset(model_slots);
     model_count = 0;
@@ -640,12 +648,29 @@ fn local_def(string name, int64 is_float) -> int64 {
     local_is_str.push(0);
     local_stypes.push("");
     local_model.push(0);
+    local_elem.push(0);
     local_count = local_count + 1;
     return slot;
 }
 
 fn local_set_str(int64 slot, int64 is_str) -> int64 {
     local_is_str[slot] = is_str;
+    return 0;
+}
+
+fn local_set_elem(int64 slot, int64 code) -> int64 {
+    local_elem[slot] = code;
+    return 0;
+}
+
+// Element type of an array-typed local, or 0 when it is not a known array.
+fn local_get_elem(string name) -> int64 {
+    let h = str_hash(name);
+    mut i = 0;
+    while (i < local_count) {
+        if (local_names[i] == h) { return local_elem[i]; }
+        i = i + 1;
+    }
     return 0;
 }
 
@@ -687,6 +712,146 @@ fn local_is_float_slot(string name) -> int64 {
         i = i + 1;
     }
     return 0;
+}
+
+// ── The codegen type oracle ───────────────────────────────────────────────────
+//
+// `ncg_last_ty` is a side effect of emission: it is assigned along the paths
+// that emit instructions, so it is only ever as good as the last path taken.
+// Everything that *consumes* a static type — print/println dispatch, and the
+// retain/release insertion a reference-counting memory model would need — wants
+// the type the checker already computed, not a leftover from emission.
+//
+// So these two functions ask the question directly instead:
+//
+//     ncg_ty_of(node)        → 0 int64 · 1 string · 2 float64 · 3 other/unknown
+//     ncg_elem_ty(node)      → the same, for an array *element*
+//
+// Why this exists at all: `println(names[0])` printed the element's pointer as
+// an integer, because an element load is an int64 bit pattern and nothing told
+// the call site the element was a string. That was a live correctness bug, and
+// the reason a previous RC attempt was reverted — it could not prove a value was
+// a managed string before emitting a release, and a misplaced release is a
+// use-after-free rather than a leak.
+//
+// Deliberately a *pure* function over the AST and the symbol tables: it emits
+// nothing and mutates nothing, so it cannot perturb codegen that does not call
+// it. 3 means "not one of the three value classes we care about" and callers
+// fall back to their previous behaviour.
+
+// The oracle's own vocabulary. These are deliberately NOT named TY_*: the
+// checker's TY_* constants are imported into this module and a same-named
+// redefinition would silently shadow them (TY_STR is 4 in the checker, so
+// `let TY_STR = 1` here made every `elem == TY_STR` comparison false).
+let OTY_INT   = 0;
+let OTY_STR   = 1;
+let OTY_FLOAT = 2;
+let OTY_OTHER = 3;
+
+// Map a checker TY_* code onto the oracle's vocabulary.
+fn oty_from_ty(int64 t) -> int64 {
+    if (t == TY_STR)     { return OTY_STR; }
+    if (t == TY_FLOAT64) { return OTY_FLOAT; }
+    if (t == TY_INT64 || t == TY_BOOL) { return OTY_INT; }
+    return OTY_OTHER;
+}
+
+// Array element type of a named array, as a checker TY_* code (TY_UNKNOWN when
+// the name is not a known array). The checker stores it in the `sv` column;
+// see elem_sv.
+fn ncg_array_elem_code(string name) -> int64 {
+    let sv = sv_lookup_sv_val(name);
+    if (str_len(sv) == 0) { return TY_UNKNOWN; }
+    return elem_from_sv(sv);
+}
+
+fn ncg_ty_of(int64 n) -> int64 {
+    if (n == 0) { return OTY_OTHER; }
+    let k = nd_kind[n];
+
+    // Literals.
+    if (k == ND_STR)   { return OTY_STR; }
+    if (k == ND_FLOAT) { return OTY_FLOAT; }
+    if (k == ND_INT)   { return OTY_INT; }
+    if (k == ND_BOOL)  { return OTY_INT; }
+
+    // A name: locals first (they shadow globals), then the checker's symbol
+    // table. `local_find` already resolves shadowing to the last declaration.
+    if (k == ND_IDENT) {
+        let name = nd_sv[n];
+        if (local_find(name) >= 0) {
+            if (local_is_float_slot(name) == 1) { return OTY_FLOAT; }
+            if (local_get_str(name) == 1) { return OTY_STR; }
+            // An array is not one of the three value classes. `println(arr)`
+            // prints the array's pointer either way, but saying so lets a
+            // caller distinguish "I know this is an int64" from "this is some
+            // aggregate" — which is the distinction an RC pass depends on.
+            if (local_get_elem(name) != 0) { return OTY_OTHER; }
+            return OTY_INT;
+        }
+        return oty_from_ty(sv_lookup_ty(name));
+    }
+
+    // An element load takes the array's element type — this is the case that
+    // was missing.
+    if (k == ND_INDEX) {
+        return ncg_elem_ty(n);
+    }
+
+    // Arithmetic promotes to float, otherwise int.
+    if (k == ND_BINOP) {
+        let op = nd_iv[n];
+        if (op == OP_FADD || op == OP_FSUB || op == OP_FMUL || op == OP_FDIV) { return OTY_FLOAT; }
+        if (ncg_ty_of(nd_i2[n]) == OTY_FLOAT || ncg_ty_of(nd_i3[n]) == OTY_FLOAT) { return OTY_FLOAT; }
+        return OTY_INT;
+    }
+    if (k == ND_UNOP) {
+        let op = nd_iv[n];
+        if (op == OP_NEG && ncg_ty_of(nd_i2[n]) == OTY_FLOAT) { return OTY_FLOAT; }
+        return OTY_INT;
+    }
+
+    // A call: the checker's declared return type, which is exactly what the
+    // emission path was trying to reconstruct with its hand-written name list.
+    // ND_METHOD_CALL is not in fn_ret_ty, so it falls through to OTY_OTHER —
+    // the previous hand-written special case returned OTY_OTHER for every
+    // method anyway.
+    if (k == ND_CALL || k == ND_METHOD_CALL) {
+        return oty_from_ty(fn_ret_ty(nd_sv[n]));
+    }
+
+    // Everything else — array literal, struct literal, field access, the
+    // tensor conversions — is not one of the three value classes.
+    return OTY_OTHER;
+}
+
+// Element type of the array produced by node `n`, as an oracle type code.
+fn ncg_array_elem_oracle(int64 n) -> int64 {
+    if (n == 0) { return OTY_OTHER; }
+    let k = nd_kind[n];
+    if (k == ND_IDENT) {
+        let name = nd_sv[n];
+        // A local shadows the symbol table, so its own column is asked first —
+        // and it is the only place a *parameter's* array element type is
+        // recorded, since parameters never enter sv_tys.
+        let le = local_get_elem(name);
+        if (le != 0) { return oty_from_ty(le); }
+        return oty_from_ty(ncg_array_elem_code(name));
+    }
+    if (k == ND_ARRAY_LIT) {
+        return oty_from_ty(array_lit_elem_ty(n));
+    }
+    // A nested array (`[[int]]`) has an array-valued element, and the oracle's
+    // vocabulary has no code for that; `a[i][j]` therefore stays OTY_OTHER
+    // rather than claiming a scalar type it cannot prove.
+    return OTY_OTHER;
+}
+
+// Element type of the array being indexed by `n` (n is the ND_INDEX node;
+// nd_i2 is the receiver).
+fn ncg_elem_ty(int64 n) -> int64 {
+    if (n == 0) { return OTY_OTHER; }
+    return ncg_array_elem_oracle(nd_i2[n]);
 }
 
 // ── RAII helpers for `model` resources ─────────────────────────────────────────
@@ -1371,9 +1536,38 @@ fn ncg_expr(int64 node) -> int64 {
         return arr_r;
     }
 
-    // Tensor conversions — identity at the codegen level; type safety enforced by checker
+    // Tensor conversions: `.toGpu()` / `.toCpu()`.
+    //
+    // These used to compile to `ncg_expr(operand)` — an identity, so a transfer
+    // produced the same handle and the two pools were indistinguishable at
+    // runtime no matter what the checker proved about them. They now call into
+    // the runtime, which moves the value between pools and charges the
+    // destination pool for it.
+    //
+    // Same shape as the `.len`/`.push` method path: spill outer live registers
+    // (BL clobbers caller-saved), pass the receiver in X0, call, restore.
     if (kind == ND_TO_GPU || kind == ND_TO_CPU) {
-        return ncg_expr(nd_i2[node]);
+        let tc_live = scratch_depth;
+        mut tc_si = 0;
+        while (tc_si < tc_live) {
+            a64_store_fp(REG_X9 + tc_si, (spill_base + 2 + tc_si) * 8);
+            tc_si = tc_si + 1;
+        }
+        let tc_obj = ncg_expr(nd_i2[node]);
+        mut tc_fn = "ionic_mlx_to_cpu";
+        if (kind == ND_TO_GPU) { tc_fn = "ionic_mlx_to_gpu"; }
+        let tc_sym = sym_undef(tc_fn);
+        a64_mov(REG_X0, tc_obj);
+        a64_bl_sym(tc_sym);
+        scratch_pop();
+        tc_si = 0;
+        while (tc_si < tc_live) {
+            a64_load_fp(REG_X9 + tc_si, (spill_base + 2 + tc_si) * 8);
+            tc_si = tc_si + 1;
+        }
+        let tc_r = scratch_push();
+        a64_mov(tc_r, REG_X0);
+        return tc_r;
     }
 
     // Fallback
@@ -1427,25 +1621,22 @@ fn ncg_call(int64 node) -> int64 {
         move_i = move_i + 1;
     }
 
-    // For print/println, fix up ncg_last_ty based on first arg type.
-    // Nested calls reset ncg_last_ty=0; correct it for known string-returning callees.
+    // For print/println, decide the variant from the *static* type of the
+    // first argument, asked of the oracle rather than reconstructed from the
+    // shape of the AST.
+    //
+    // The previous version guessed: "if the argument is a call to one of these
+    // 16 names it is a string; if it is a method call it is a string; if it is
+    // a literal string it is a string". That missed every other way to have a
+    // string — a parameter, an array element, a user function's return value —
+    // so `println(names[0])` and `println(s)` inside `fn show(string s)` both
+    // dispatched to ionic_println_int64 and printed a pointer.
     if (str_eq(callee, "print") || str_eq(callee, "println")) {
         let fa = nd_i2[args];
-        if (nd_kind[fa] == ND_CALL) {
-            let inner = nd_sv[fa];
-            if (str_eq(inner, "int64_to_str") || str_eq(inner, "float64_to_str") ||
-                str_eq(inner, "char_to_str")  || str_eq(inner, "str_concat")     ||
-                str_eq(inner, "get_arg")      || str_eq(inner, "file_read")      ||
-                str_eq(inner, "format")       || str_eq(inner, "str_replace")    ||
-                str_eq(inner, "str_slice")    || str_eq(inner, "read_line")      ||
-                str_eq(inner, "http_get")    || str_eq(inner, "http_post")      ||
-                str_eq(inner, "http_body")   || str_eq(inner, "http_urlencode") ||
-                str_eq(inner, "getenv")      || str_eq(inner, "str_hash_to_str")) {
-                ncg_last_ty = 1;
-            }
-        }
-        if (nd_kind[fa] == ND_STR) { ncg_last_ty = 1; }
-        if (nd_kind[nd_i2[args]] == ND_METHOD_CALL) { ncg_last_ty = 1; }
+        let at = ncg_ty_of(fa);
+        if (at == OTY_STR)        { ncg_last_ty = 1; }
+        else if (at == OTY_FLOAT) { ncg_last_ty = 2; }
+        else                      { ncg_last_ty = 0; }
     }
 
     // Remap Ionic builtin names → C runtime functions
@@ -1555,6 +1746,10 @@ fn ncg_call(int64 node) -> int64 {
     if (str_eq(callee, "mlx_dim"))             { real_callee = "ionic_mlx_dim"; }
     if (str_eq(callee, "mlx_shape"))           { real_callee = "ionic_mlx_shape"; }
     if (str_eq(callee, "mlx_dtype"))           { real_callee = "ionic_mlx_dtype"; }
+    if (str_eq(callee, "mlx_pool"))            { real_callee = "ionic_mlx_pool"; }
+    if (str_eq(callee, "mlx_pool_bytes"))      { real_callee = "ionic_mlx_pool_bytes"; }
+    if (str_eq(callee, "mlx_pool_count"))      { real_callee = "ionic_mlx_pool_count"; }
+    if (str_eq(callee, "mlx_pools_unified"))   { real_callee = "ionic_mlx_pools_unified"; }
     if (str_eq(callee, "mlx_add"))             { real_callee = "ionic_mlx_add"; }
     if (str_eq(callee, "mlx_subtract"))        { real_callee = "ionic_mlx_subtract"; }
     if (str_eq(callee, "mlx_multiply"))        { real_callee = "ionic_mlx_multiply"; }
@@ -1641,10 +1836,13 @@ fn ncg_call(int64 node) -> int64 {
         ncg_last_ty = 2;
     }
     // For user-defined functions, look up the return type recorded by the checker.
+    // The builtin lists above stay: several of them (float64_to_str, format,
+    // the http_* readers) are not declared as Ionic functions, so fn_ret_ty
+    // cannot see them and they would otherwise fall back to int64.
     if (ncg_last_ty == 0) {
-        let rty = fn_ret_ty(callee);
-        if (rty == 2) { ncg_last_ty = 2; }
-        if (rty == 4) { ncg_last_ty = 1; }
+        let rty = oty_from_ty(fn_ret_ty(callee));
+        if (rty == OTY_FLOAT) { ncg_last_ty = 2; }
+        if (rty == OTY_STR)   { ncg_last_ty = 1; }
     }
     return 0;
 }
@@ -1659,6 +1857,7 @@ fn ncg_stmt(int64 node) -> int64 {
     // let / mut declaration
     if (kind == ND_LET) {
         let name    = nd_sv[node];
+        let ann_ty  = nd_i2[node];   // type annotation node, or 0
         let init    = nd_i3[node];
         let is_flt  = 0;   // TODO: detect float type from init
         let slot    = local_def(name, is_flt);
@@ -1668,6 +1867,26 @@ fn ncg_stmt(int64 node) -> int64 {
         if (ncg_last_ty == 1) { local_set_str(slot, 1); }
         if (ncg_last_ty == 2) { local_set_float(slot, 1); }
         if (!str_eq(ncg_last_stype, "")) { local_set_stype(slot, ncg_last_stype); }
+        // Record the element type when this local is an array, so an element
+        // load can be typed. The annotation is authoritative; an array literal
+        // is the fallback for an unannotated binding.
+        //
+        // `let names: [string] = [...]` declares the type, and the checker
+        // records it in sv_svs — but a *local* shadows the symbol table entry,
+        // so ncg_ty_of consults this column first and needs it filled in.
+        if (ann_ty != 0) {
+            if (node_ty_to_int(ann_ty) == TY_ARRAY) {
+                local_set_elem(slot, node_ty_elem_int(ann_ty));
+                local_set_str(slot, 0);   // an array is not itself a string
+            } else if (node_ty_to_int(ann_ty) == TY_STR) {
+                local_set_str(slot, 1);
+            } else if (node_ty_to_int(ann_ty) == TY_FLOAT64) {
+                local_set_float(slot, 1);
+            }
+        }
+        if (nd_kind[init] == ND_ARRAY_LIT && local_get_elem(name) == 0) {
+            local_set_elem(slot, array_lit_elem_ty(init));
+        }
         // RAII: a local bound to a freshly loaded model owns that resource.
         if (ncg_model_expr(init) == 1) { local_set_model(name, 1); }
         // Store to stack
@@ -2164,6 +2383,15 @@ fn ncg_fn_node(int64 fn_node) -> int64 {
         if (nd_kind[param_ty] == ND_TY_NAMED) {
             local_set_stype(slot, nd_sv[param_ty]);
         }
+        // A parameter never enters the checker's symbol table, so its type has
+        // to be recorded here or every use of it looks like an int64. That is
+        // why `fn show(string s) { println(s); }` printed a pointer.
+        if (nd_kind[param_ty] == ND_TY_STRING) {
+            local_set_str(slot, 1);
+        }
+        if (nd_kind[param_ty] == ND_TY_ARRAY) {
+            local_set_elem(slot, node_ty_elem_int(param_ty));
+        }
         let off  = local_offset(slot);
         // Prologue happens before we store params, so store after prologue
         param_node = nd_i3[param_node];
@@ -2264,13 +2492,16 @@ fn ncg_main_wrapper(int64 top_list) -> int64 {
         tl = nd_i3[tl];
     }
 
-    // Call ionic_user_main() if one exists
+    // Call ionic_user_main() and propagate its return value as the process
+    // exit status. The value arrives in X0 and must survive the epilogue
+    // (which only restores callee-saved registers and SP), so it is not
+    // clobbered on the way out.
     if (ncg_has_user_main == 1) {
         let um_sym = sym_undef("ionic_user_main");
         a64_bl_sym(um_sym);
+    } else {
+        a64_load_imm(REG_X0, 0);
     }
-
-    a64_load_imm(REG_X0, 0);
     ncg_fn_epilogue();
     return 0;
 }
@@ -2542,6 +2773,7 @@ fn codegen_program(int64 structs_list, int64 fns_list, int64 top_list, string ou
     local_is_str   = [0]; arr_reset(local_is_str);
     local_stypes   = [""]; arr_reset(local_stypes);
     local_model    = [0];  arr_reset(local_model);
+    local_elem     = [0];  arr_reset(local_elem);
     model_names    = [""]; arr_reset(model_names);
     model_slots    = [0];  arr_reset(model_slots);
     model_count    = 0;

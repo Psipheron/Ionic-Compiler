@@ -98,19 +98,31 @@ It silently drops the first element. `min_f`, `max_f`, `stdev_f`, and
 09.2's first task — decide whether the fix is the library or the array
 convention.
 
-### 3.2 `println(arr[i])` for `[string]` arrays is broken
+### 3.2 Printing a string that is not a literal (was broken, now fixed)
 
-Element loads lose string-ness at the codegen level, so:
+`println` is overloaded by argument type, and the choice of overload used to be
+made by pattern-matching the *shape* of the argument node: "a string literal is
+a string; a call to one of sixteen named builtins is a string; a method call is
+a string". Anything else fell through to `ionic_println_int64`:
 
 ```ionic
 mut names = ["alice", "bob"];
-println(names[0]);              // prints a POINTER as an integer (garbage)
-println(int64_to_str(...));     // n/a — it's a string
+println(names[0]);              // used to print a POINTER as an integer
+fn show(string s) { println(s); }
+show("alice");                  // used to print a POINTER as an integer
 ```
 
-`println(arr[i])` works for `[int64]`. For strings, this is the latent bug
-documented in `docs/memory-model.md §10` and is the same missing information
-that blocks the RC slice. See units 06–07.
+Both cases are fixed. The overload is now chosen by asking the type oracle
+(`ncg_ty_of` in `src/codegen/native.ionic`) for the argument's static type,
+which resolves an element load through the array's element type and a
+parameter through its declared type. `examples/mastery/02_string_array_print.ionic`
+is the regression reference.
+
+This is the same "element loads carry no type" gap recorded in
+`docs/memory-model.md §10`, and closing it was a prerequisite for the RC slice —
+but it does *not* by itself make refcounting safe: `ncg_ty_of` still answers
+"other/unknown" for a nested-array element and for a method call, so a release
+must not be emitted on those. See units 06–07.
 
 ---
 
@@ -169,9 +181,12 @@ returns and verify.
 **02.4 — Struct mutation.** Create a struct under a `let` binding and mutate a
 field. Explain why this is legal.
 
-**02.5 — String-array print bug.** Demonstrate the pointer-garbage print for a
-`[string]` element. Reference: `examples/mastery/fail/string_array_print.ionic`
-(expected: compiles, prints a numeric pointer).
+**02.5 — Where string-ness was being lost.** Run
+`examples/mastery/02_string_array_print.ionic`. It prints a string reached
+through an array element, through a function parameter, and as a user
+function's return value. Then find `ncg_ty_of` in `src/codegen/native.ionic`
+and write down, for each of those three, which branch of the oracle answers the
+question. Reference: `examples/mastery/02_string_array_print.ionic`.
 
 ---
 
@@ -180,6 +195,6 @@ field. Explain why this is legal.
 - [ ] You can describe propagation-based inference in three sentences.
 - [ ] You know arrays are 0-indexed *and* that `data.ionic` assumes 1-based.
 - [ ] You can explain the difference between `.len` and `len()`.
-- [ ] You can name the latent codegen bug behind both the string-array print
-      garbage and the blocked RC slice.
+- [ ] You can name the two places string-ness used to be lost at codegen (array
+      element loads, and parameters) and say what fixed them.
 ## [Next](03-advanced-language.md)

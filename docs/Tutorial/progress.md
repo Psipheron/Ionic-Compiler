@@ -12,7 +12,7 @@ Suggested cadence:
 - **Day 8** — Unit 05. Stdlib & modules.
 - **Day 9** — Review + write a small program using everything so far.
 - **Days 10–12** — Unit 06. Read the whole pipeline in `src/`.
-- **Days 13–14** — Unit 07. Memory model; write the type-oracle plan.
+- **Days 13–14** — Unit 07. Memory model; audit the oracle's blind spots.
 - **Day 15** — Unit 08. Build, bootstrap, CI, fixed point.
 - **Days 16+** — Unit 09 capstone, one task at a time.
 
@@ -44,7 +44,7 @@ A realistic full pass is 4–6 weeks at a few focused hours a week.
 - [ ] Exercise 02.2 — array semantics + bounds error
 - [ ] Exercise 02.3 — reproduced the `mean_f` off-by-one
 - [ ] Exercise 02.4 — struct field mutation under `let`
-- [ ] Exercise 02.5 — string-array print bug reproduced
+- [ ] Exercise 02.5 — traced where string-ness was lost (element load, parameter)
 - [ ] I can describe propagation-based inference in three sentences
 
 ### Unit 03 — Advanced language
@@ -80,7 +80,7 @@ A realistic full pass is 4–6 weeks at a few focused hours a week.
 - [ ] Exercise 06.2 — token/AST kinds for `+=` and `tensor@gpu`
 - [ ] Exercise 06.3 — compound-assign desugaring quoted
 - [ ] Exercise 06.4 — unrolling shown (and prevented by `break`)
-- [ ] Exercise 06.5 — the missing `ncg_last_ty` site pinpointed
+- [ ] Exercise 06.5 — traced `ncg_ty_of` on four expression shapes
 - [ ] Exercise 06.6 — named the files a new builtin must touch
 - [ ] I can name all five optimizer passes
 
@@ -89,7 +89,7 @@ A realistic full pass is 4–6 weeks at a few focused hours a week.
 - [ ] Exercise 07.2 — quoted the intentional-leak comment + `IonicArray`
 - [ ] Exercise 07.3 — quoted the bounds check
 - [ ] Exercise 07.4 — traced the four `model` RAII sites
-- [ ] Exercise 07.5 — wrote the type-oracle plan
+- [ ] Exercise 07.5 — listed the oracle's `OTY_OTHER` blind spots
 - [ ] I can explain why RC was reverted (soundness, not coverage)
 
 ### Unit 08 — Build, bootstrap & self-hosting
@@ -103,8 +103,8 @@ A realistic full pass is 4–6 weeks at a few focused hours a week.
 ### Unit 09 — Capstone
 - [ ] Task 09.1 — added a builtin end-to-end
 - [ ] Task 09.2 — fixed the `data.ionic` off-by-one
-- [ ] Task 09.3A — type oracle: `ncg_last_ty` correct on all paths
-- [ ] Task 09.3B — `println(names[0])` prints the string
+- [x] Task 09.3A — type oracle shipped (done in the repo)
+- [x] Task 09.3B — `println(names[0])` prints the string (done in the repo)
 - [ ] Task 09.3C — RC slice: churn RSS ~160 MB → ~1 MB (stretch)
 - [ ] Task 09.4 — new optimizer pass or SSA proof
 - [ ] Task 09.5 — hardened an invariant with a regression test

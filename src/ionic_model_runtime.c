@@ -231,15 +231,50 @@ int64_t ionic_cpu_core_count(void) {
 
 /* ── File I/O builtins ────────────────────────────────────────────────────── */
 
-/* Marked weak: LLVM IR path defines ionic_file_read inline */
+/* A freshly allocated empty string.
+ *
+ * Every string-returning entry point in this runtime must allocate on *every*
+ * path. The contract is "the caller owns the result", and Ionic has no way to
+ * distinguish an owned empty string from a rodata literal — so returning `""`
+ * from a failure path makes free()/rc_release() on the caller's value a free of
+ * a string literal. See docs/memory-model.md §11.1.
+ *
+ * On OOM this returns NULL; that is the one case the contract cannot honour. */
+static char *rt_empty_str(void) {
+    char *e = (char *)malloc(1);
+    if (e) e[0] = '\0';
+    return e;
+}
+
+/* Copy a string into a fresh allocation. Used by builtins that hand out a
+ * pointer to memory they do not own (a struct field, a static buffer, an
+ * environment block). The caller-owns-it contract requires the copy: handing
+ * back an interior pointer would let a release free the middle of someone
+ * else's allocation. NULL and empty both map to an owned "". */
+static char *rt_dup_str(const char *s) {
+    if (!s) return rt_empty_str();
+    size_t n = strlen(s) + 1;
+    char *d = (char *)malloc(n);
+    if (!d) return rt_empty_str();
+    memcpy(d, s, n);
+    return d;
+}
+
+/* Marked weak: LLVM IR path defines ionic_file_read inline.
+ *
+ * Every return path allocates (see rt_empty_str above). A failed open used to
+ * return a rodata `""`, which made the ownership contract false on exactly the
+ * path a program is most likely to hit. See docs/memory-model.md §11.1. */
 __attribute__((weak))
 char *ionic_file_read(const char *path) {
     FILE *f = fopen(path, "rb");
-    if (!f) { return (char *)""; }
+    if (!f) return rt_empty_str();
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
     fseek(f, 0, SEEK_SET);
+    if (sz < 0) sz = 0;                      /* ftell failed: treat as empty */
     char *buf = (char *)malloc((size_t)(sz + 1));
+    if (!buf) { fclose(f); return rt_empty_str(); }
     fread(buf, 1, (size_t)sz, f);
     buf[sz] = '\0';
     fclose(f);
@@ -365,7 +400,19 @@ int64_t ionic_str_starts_with(const char *s, const char *prefix) {
 }
 
 char *ionic_str_replace(const char *s, const char *from, const char *to) {
-    if (!s || !from || !to) return (char *)(s ? s : "");
+    /* Every return path allocates. Returning the input here (the previous
+     * behaviour) would mean a caller that owns its result can end up with two
+     * names for one buffer, and a release/free of both is a double free.
+     * Ionic strings are never NULL, so this path is only reachable from C
+     * callers — but the contract has to hold for all of them.
+     * See docs/memory-model.md §11.1. */
+    if (!s || !from || !to) {
+        const char *src = s ? s : "";
+        size_t n = strlen(src);
+        char *r = (char *)malloc(n + 1);
+        memcpy(r, src, n + 1);
+        return r;
+    }
     size_t ls = strlen(s), lf = strlen(from), lt = strlen(to);
     if (lf == 0) { char *r = (char *)malloc(ls + 1); memcpy(r, s, ls + 1); return r; }
     /* Count occurrences */
@@ -707,7 +754,41 @@ static int64_t mlx_dtype_to_ionic(mlx_dtype d) {
  * mlx_last_error(). */
 static char  g_mlx_err[512] = {0};
 static int   g_mlx_inited = 0;
-static mlx_stream g_mlx_gpu_stream;   /* default GPU stream; created at init */
+
+/* ── Memory pools ────────────────────────────────────────────────────────────
+ * `tensor@cpu` / `tensor@gpu` name *pools*, not devices — SRAM (host memory,
+ * capacity = system RAM) and VRAM (accelerator memory, capacity = the card).
+ * The checker enforces the pool a value belongs to statically; the runtime's
+ * job is to make that accountancy real, so a transfer can be observed and a
+ * pool's occupancy can be read back.
+ *
+ * On Apple silicon (unified memory) both pools address the same physical bytes:
+ * a transfer changes which pool the value is *charged to* and moves no data.
+ * On a discrete backend the streams differ and the transfer copies. Keeping the
+ * pool in the handle is what makes those two cases distinguishable at all.
+ *
+ * IONIC_POOL_NONE is for a tensor that has not been assigned to a pool yet;
+ * every handle produced by a backend ends up in CPU or GPU.
+ */
+#define IONIC_POOL_CPU  0
+#define IONIC_POOL_GPU  1
+#define IONIC_POOL_NONE (-1)
+#define IONIC_POOL_COUNT 2
+
+static mlx_stream g_mlx_cpu_stream;   /* SRAM stream; created at init */
+static mlx_stream g_mlx_gpu_stream;   /* VRAM stream; created at init */
+
+/* Bytes currently charged to each pool, maintained by mlx_tensor_new/free.
+ * This is *our* accounting, deliberately independent of mlx_get_active_memory:
+ * MLX's number is process-global and includes intermediate graph buffers, so it
+ * cannot answer "how much is in VRAM" once the pools are meant to be separate. */
+static int64_t g_pool_bytes[IONIC_POOL_COUNT] = {0, 0};
+
+static int pool_valid(int64_t p) { return p == IONIC_POOL_CPU || p == IONIC_POOL_GPU; }
+
+static const char *pool_name(int64_t p) {
+    return p == IONIC_POOL_GPU ? "VRAM" : (p == IONIC_POOL_CPU ? "SRAM" : "none");
+}
 
 static void ionic_mlx_error_handler(const char *msg, void *data) {
     (void)data;
@@ -721,6 +802,7 @@ static void ionic_mlx_error_handler(const char *msg, void *data) {
 static void ionic_mlx_init(void) {
     if (g_mlx_inited) return;
     mlx_set_error_handler(ionic_mlx_error_handler, NULL, NULL);
+    g_mlx_cpu_stream = mlx_default_cpu_stream_new();
     g_mlx_gpu_stream = mlx_default_gpu_stream_new();
     g_mlx_inited = 1;
 }
@@ -737,16 +819,62 @@ static void ionic_mlx_init(void) {
 
 typedef struct {
     uint32_t   magic;
-    uint32_t   alive;
+    uint32_t   alive;      /* 0 once freed or moved away from             */
     mlx_array  a;
+    int64_t    pool;       /* IONIC_POOL_CPU / IONIC_POOL_GPU / _NONE      */
+    int64_t    bytes;      /* charged against `pool` while this is alive  */
+    uint32_t   owns_array; /* 0 after a move: another handle holds `a`    */
 } MlxTensor;
 
-static MlxTensor *mlx_tensor_new(mlx_array a) {
+/* The stream an op on this pool must run on. Keeping the pool in the handle —
+ * rather than one process-global stream — is what makes `tensor@cpu` and
+ * `tensor@gpu` distinguishable at runtime at all. Before this, all 36 call
+ * sites hardcoded the GPU stream, so `tensor@cpu` was already VRAM and a
+ * transfer could not have meant anything even if it had been implemented. */
+static mlx_stream pool_stream(int64_t pool) {
+    return pool == IONIC_POOL_GPU ? g_mlx_gpu_stream : g_mlx_cpu_stream;
+}
+
+/* 1 when a transfer between the pools moves no bytes: on Apple silicon both
+ * pools address the same physical memory, so only the accountancy changes.
+ * A discrete backend would define IONIC_POOLS_DISCRETE and pay the copy. */
+static int pools_unified(void) {
+#if defined(IONIC_POOLS_DISCRETE)
+    return 0;
+#else
+    bool metal = false;
+    if (mlx_ck(mlx_metal_is_available(&metal)) != 0) return 1;
+    return metal ? 1 : 0;
+#endif
+}
+
+static void pool_charge(int64_t pool, int64_t bytes) {
+    if (!pool_valid(pool)) return;
+    g_pool_bytes[pool] += bytes;
+    if (g_pool_bytes[pool] < 0) g_pool_bytes[pool] = 0;  /* defensive */
+}
+
+/* Construct a handle in a given pool. Sizes the array so the pool's occupancy
+ * is answerable from Ionic (`mlx_pool_bytes`). Constructors charge SRAM; only a
+ * transfer charges VRAM, which is the operation a capacity budget bounds. */
+static MlxTensor *mlx_tensor_new_at(mlx_array a, int64_t pool) {
     MlxTensor *t = (MlxTensor *)calloc(1, sizeof(MlxTensor));
-    t->magic = IONIC_MLX_MAGIC;
-    t->alive = 1;
-    t->a     = a;
+    if (!t) return NULL;
+    t->magic      = IONIC_MLX_MAGIC;
+    t->alive      = 1;
+    t->a          = a;
+    t->pool       = pool;
+    t->bytes      = (int64_t)mlx_array_nbytes(a);
+    t->owns_array = 1;
+    pool_charge(pool, t->bytes);
     return t;
+}
+
+/* Default: SRAM. Every constructor and every safetensors lookup lands here,
+ * matching the checker's rule that constructors take no tensor operand and so
+ * have no pool to infer one from (docs/plan-placement.md §3.3a). */
+static MlxTensor *mlx_tensor_new(mlx_array a) {
+    return mlx_tensor_new_at(a, IONIC_POOL_CPU);
 }
 
 /* Validate a handle coming from Ionic. A dangling/NULL/mistyped pointer is a
@@ -771,8 +899,10 @@ static MlxTensor *mlx_tensor_of(void *h) {
 #define MLX_ARG(h) \
     MlxTensor *_t = mlx_tensor_of(h); \
     if (!_t) return NULL; \
-    mlx_array _a = _t->a; \
-    (void)_a
+    mlx_array  _a    = _t->a; \
+    int64_t    _pool = _t->pool; \
+    mlx_stream _s    = pool_stream(_pool); \
+    (void)_a; (void)_s
 
 /* ── Shape helper ───────────────────────────────────────────────────────────
  * Ionic passes shapes as an `[int64]` array. MLX wants `const int*`. Convert
@@ -801,7 +931,7 @@ void *ionic_mlx_zeros(void *shape_arr, int64_t dtype) {
     int shape[IONIC_MLX_MAX_DIMS]; size_t n = 0;
     if (mlx_shape_from_arr(shape_arr, shape, &n) != 0) return NULL;
     mlx_array r = mlx_array_new();
-    if (mlx_ck(mlx_zeros(&r, shape, n, ionic_dtype_to_mlx(dtype), g_mlx_gpu_stream)) != 0) return NULL;
+    if (mlx_ck(mlx_zeros(&r, shape, n, ionic_dtype_to_mlx(dtype), g_mlx_cpu_stream)) != 0) return NULL;
     return mlx_tensor_new(r);
 }
 
@@ -810,7 +940,7 @@ void *ionic_mlx_ones(void *shape_arr, int64_t dtype) {
     int shape[IONIC_MLX_MAX_DIMS]; size_t n = 0;
     if (mlx_shape_from_arr(shape_arr, shape, &n) != 0) return NULL;
     mlx_array r = mlx_array_new();
-    if (mlx_ck(mlx_ones(&r, shape, n, ionic_dtype_to_mlx(dtype), g_mlx_gpu_stream)) != 0) return NULL;
+    if (mlx_ck(mlx_ones(&r, shape, n, ionic_dtype_to_mlx(dtype), g_mlx_cpu_stream)) != 0) return NULL;
     return mlx_tensor_new(r);
 }
 
@@ -825,7 +955,7 @@ void *ionic_mlx_full(void *shape_arr, int64_t val_bits, int64_t dtype) {
     if (mlx_shape_from_arr(shape_arr, shape, &n) != 0) return NULL;
     mlx_array s = mlx_array_new_float32((float)i642d(val_bits));
     mlx_array r = mlx_array_new();
-    int rc = mlx_ck(mlx_full(&r, shape, n, s, ionic_dtype_to_mlx(dtype), g_mlx_gpu_stream));
+    int rc = mlx_ck(mlx_full(&r, shape, n, s, ionic_dtype_to_mlx(dtype), g_mlx_cpu_stream));
     mlx_array_free(s);
     if (rc != 0) return NULL;
     return mlx_tensor_new(r);
@@ -835,14 +965,14 @@ void *ionic_mlx_arange(int64_t start_b, int64_t stop_b, int64_t step_b, int64_t 
     ionic_mlx_init();
     mlx_array r = mlx_array_new();
     if (mlx_ck(mlx_arange(&r, i642d(start_b), i642d(stop_b), i642d(step_b),
-                          ionic_dtype_to_mlx(dtype), g_mlx_gpu_stream)) != 0) return NULL;
+                          ionic_dtype_to_mlx(dtype), g_mlx_cpu_stream)) != 0) return NULL;
     return mlx_tensor_new(r);
 }
 
 void *ionic_mlx_eye(int64_t n, int64_t m, int64_t dtype) {
     ionic_mlx_init();
     mlx_array r = mlx_array_new();
-    if (mlx_ck(mlx_eye(&r, (int)n, (int)m, 0, ionic_dtype_to_mlx(dtype), g_mlx_gpu_stream)) != 0) return NULL;
+    if (mlx_ck(mlx_eye(&r, (int)n, (int)m, 0, ionic_dtype_to_mlx(dtype), g_mlx_cpu_stream)) != 0) return NULL;
     return mlx_tensor_new(r);
 }
 
@@ -855,7 +985,7 @@ void *ionic_mlx_random_normal(void *shape_arr, int64_t loc_b, int64_t scale_b, i
     mlx_array r = mlx_array_new();
     if (mlx_ck(mlx_random_normal(&r, shape, n, ionic_dtype_to_mlx(dtype),
                                  (float)i642d(loc_b), (float)i642d(scale_b), mlx_array_empty,
-                                 g_mlx_gpu_stream)) != 0) return NULL;
+                                 g_mlx_cpu_stream)) != 0) return NULL;
     return mlx_tensor_new(r);
 }
 
@@ -868,7 +998,7 @@ void *ionic_mlx_random_uniform(void *shape_arr, int64_t lo_b, int64_t hi_b, int6
     mlx_array r    = mlx_array_new();
     int rc = mlx_ck(mlx_random_uniform(&r, low, high, shape, n,
                                        ionic_dtype_to_mlx(dtype), mlx_array_empty,
-                                       g_mlx_gpu_stream));
+                                       g_mlx_cpu_stream));
     mlx_array_free(low);
     mlx_array_free(high);
     if (rc != 0) return NULL;
@@ -931,7 +1061,7 @@ void *ionic_mlx_from_array(void *flat_arr, void *shape_arr, int64_t dtype) {
     /* Generic path: build as f64 then cast. */
     mlx_array base = mlx_array_new_data(slots, shape, (int)n, MLX_FLOAT64);
     mlx_array r    = mlx_array_new();
-    rc = mlx_ck(mlx_astype(&r, base, mdt, g_mlx_gpu_stream));
+    rc = mlx_ck(mlx_astype(&r, base, mdt, g_mlx_cpu_stream));
     mlx_array_free(base);
     if (rc != 0) return NULL;
     return mlx_tensor_new(r);
@@ -1042,7 +1172,7 @@ void *ionic_mlx_to_array(void *h) {
 
     /* Fallback: cast to f32 in-graph, then read. */
     mlx_array c = mlx_array_new();
-    if (mlx_ck(mlx_astype(&c, t->a, MLX_FLOAT32, g_mlx_gpu_stream)) == 0
+    if (mlx_ck(mlx_astype(&c, t->a, MLX_FLOAT32, pool_stream(t->pool))) == 0
         && mlx_ck(mlx_array_eval(c)) == 0) {
         const float *p = mlx_array_data_float32(c);
         if (p) {
@@ -1090,14 +1220,118 @@ int64_t ionic_mlx_item(void *h) {
 /* ── Lifetime ─────────────────────────────────────────────────────────────── */
 
 /* Free a tensor. Null-tolerant and idempotent-ish: a second free on the same
- * handle is caught by the `alive` flag rather than double-freeing the array. */
+ * handle is caught by the `alive` flag rather than double-freeing the array.
+ *
+ * A handle that no longer owns its array (it was moved away from) releases
+ * nothing: the bytes belong to the handle the transfer produced. Releasing the
+ * array twice would be a double free of the same refcount, which MLX turns
+ * into a use-after-free the moment either handle is read. */
 void ionic_mlx_free(void *h) {
     MlxTensor *t = mlx_tensor_of(h);
     if (!t) return;
-    mlx_array_free(t->a);
+    pool_charge(t->pool, -t->bytes);
+    if (t->owns_array) mlx_array_free(t->a);
     t->alive = 0;
     free(t);
 }
+
+/* ── Transfers between pools ─────────────────────────────────────────────────
+ * `.toGpu()` / `.toCpu()` compile to these. Before them, codegen emitted the
+ * operand's value unchanged (`native.ionic:1539`), so a "transfer" was a no-op
+ * and `tensor@cpu`/`tensor@gpu` were the same pool at runtime no matter what
+ * the checker proved about them.
+ *
+ * The semantics are the ones docs/plan-placement.md §4.3 settled on: a
+ * transfer is a MOVE. The destination handle takes the array reference over
+ * and the source is left not owning it, so the checker's use-after-move rule
+ * has something real behind it — the source's bytes are unaccounted from its
+ * pool and accounted to the destination's.
+ *
+ * On unified memory (Apple silicon) both pools address the same physical bytes,
+ * so no data is copied and the array reference is handed over as-is. On a
+ * discrete backend the value is copied onto the destination stream and the
+ * source's storage is released; that is what `pools_unified()` distinguishes.
+ * `mlx_copy` is the primitive either way, so the two paths differ only in
+ * whether the source is reclaimed.
+ */
+static void *mlx_transfer(void *h, int64_t to_pool) {
+    MlxTensor *t = mlx_tensor_of(h);
+    if (!t) return NULL;
+
+    if (t->pool == to_pool) {
+        /* Already there. Returning a *new* handle rather than `h` keeps the
+         * move contract uniform: the caller always ends up owning the result,
+         * and the source is always dead afterwards. */
+        t->alive      = 0;
+        t->owns_array = 0;
+        pool_charge(t->pool, -t->bytes);
+        return mlx_tensor_new_at(t->a, to_pool);
+    }
+
+    int64_t from_pool = t->pool;
+    mlx_array moved;
+
+    if (pools_unified()) {
+        /* Same physical bytes, different accountancy. Bump the refcount so the
+         * destination handle owns a reference of its own, then drop the
+         * source's. */
+        moved = mlx_array_new();
+        if (mlx_ck(mlx_array_set(&moved, t->a)) != 0) return NULL;
+    } else {
+        /* Discrete pools: the value must physically land on the destination
+         * stream before the source storage can be reclaimed. */
+        moved = mlx_array_new();
+        if (mlx_ck(mlx_copy(&moved, t->a, pool_stream(to_pool))) != 0) return NULL;
+        if (mlx_ck(mlx_array_eval(moved)) != 0) {
+            mlx_array_free(moved);
+            return NULL;
+        }
+    }
+
+    /* Move, not copy: the source stops owning its array and its bytes leave the
+     * source pool. The checker already rejects reading the source afterwards;
+     * this makes the runtime agree instead of leaving two handles over one
+     * allocation. */
+    t->alive      = 0;
+    t->owns_array = 0;
+    pool_charge(from_pool, -t->bytes);
+    mlx_array_free(t->a);
+
+    return mlx_tensor_new_at(moved, to_pool);
+}
+
+/* Ionic-facing: `.toGpu()` / `.toCpu()`. Both take the source handle and return
+ * the destination handle; codegen reassigns the slot to the result. */
+void *ionic_mlx_to_gpu(void *h) { return mlx_transfer(h, IONIC_POOL_GPU); }
+void *ionic_mlx_to_cpu(void *h) { return mlx_transfer(h, IONIC_POOL_CPU); }
+
+/* ── Pool introspection ──────────────────────────────────────────────────────
+ * These are what make the pool model observable from Ionic, and therefore
+ * testable. Without them a transfer that silently did nothing would look
+ * exactly like one that worked: the existing master test only ever checked
+ * that the *types* line up.
+ *
+ *   mlx_pool(h)         -> IONIC_POOL_CPU (0) / IONIC_POOL_GPU (1) / -1
+ *   mlx_pool_bytes(p)   -> bytes currently charged to pool p, or -1
+ *   mlx_pool_count()    -> number of pools (2)
+ */
+int64_t ionic_mlx_pool(void *h) {
+    MlxTensor *t = mlx_tensor_of(h);
+    if (!t) return -1;
+    return t->pool;
+}
+
+int64_t ionic_mlx_pool_bytes(int64_t pool) {
+    if (!pool_valid(pool)) return -1;
+    return g_pool_bytes[pool];
+}
+
+int64_t ionic_mlx_pool_count(void) { return IONIC_POOL_COUNT; }
+
+/* Whether a transfer between the two pools is free on this backend. Ionic uses
+ * this to assert "unified memory means the byte count does not move" without
+ * hard-coding the answer per platform. */
+int64_t ionic_mlx_pools_unified(void) { return pools_unified(); }
 
 /* ── Elementwise binary ops ───────────────────────────────────────────────── */
 
@@ -1109,8 +1343,8 @@ void ionic_mlx_free(void *h) {
         if (!_tb) return NULL;                                             \
         mlx_array _r = mlx_array_new();                                    \
         if (mlx_ck(mlxfn(&_r, _a, _tb->a,                                  \
-                         g_mlx_gpu_stream)) != 0) return NULL;             \
-        return mlx_tensor_new(_r);                                         \
+                         _s)) != 0) return NULL;             \
+        return mlx_tensor_new_at(_r, _pool);                                         \
     }
 
 MLX_BINOP_IMPL(ionic_mlx_add,      mlx_add)
@@ -1131,8 +1365,8 @@ MLX_BINOP_IMPL(ionic_mlx_matmul,   mlx_matmul)
         ionic_mlx_init();                                                  \
         MLX_ARG(h);                                                        \
         mlx_array _r = mlx_array_new();                                    \
-        if (mlx_ck(mlxfn(&_r, _a, g_mlx_gpu_stream)) != 0) return NULL;     \
-        return mlx_tensor_new(_r);                                         \
+        if (mlx_ck(mlxfn(&_r, _a, _s)) != 0) return NULL;     \
+        return mlx_tensor_new_at(_r, _pool);                                         \
     }
 
 MLX_UNOP_IMPL(ionic_mlx_negative, mlx_negative)
@@ -1152,8 +1386,8 @@ void *ionic_mlx_contiguous(void *h) {
     ionic_mlx_init();
     MLX_ARG(h);
     mlx_array r = mlx_array_new();
-    if (mlx_ck(mlx_contiguous(&r, _a, false, g_mlx_gpu_stream)) != 0) return NULL;
-    return mlx_tensor_new(r);
+    if (mlx_ck(mlx_contiguous(&r, _a, false, _s)) != 0) return NULL;
+    return mlx_tensor_new_at(r, _pool);
 }
 
 /* ── Reductions ───────────────────────────────────────────────────────────── */
@@ -1164,32 +1398,32 @@ void *ionic_mlx_sum(void *h, int64_t keepdims) {
     ionic_mlx_init();
     MLX_ARG(h);
     mlx_array r = mlx_array_new();
-    if (mlx_ck(mlx_sum(&r, _a, keepdims != 0, g_mlx_gpu_stream)) != 0) return NULL;
-    return mlx_tensor_new(r);
+    if (mlx_ck(mlx_sum(&r, _a, keepdims != 0, _s)) != 0) return NULL;
+    return mlx_tensor_new_at(r, _pool);
 }
 
 void *ionic_mlx_mean(void *h, int64_t keepdims) {
     ionic_mlx_init();
     MLX_ARG(h);
     mlx_array r = mlx_array_new();
-    if (mlx_ck(mlx_mean(&r, _a, keepdims != 0, g_mlx_gpu_stream)) != 0) return NULL;
-    return mlx_tensor_new(r);
+    if (mlx_ck(mlx_mean(&r, _a, keepdims != 0, _s)) != 0) return NULL;
+    return mlx_tensor_new_at(r, _pool);
 }
 
 void *ionic_mlx_max(void *h, int64_t keepdims) {
     ionic_mlx_init();
     MLX_ARG(h);
     mlx_array r = mlx_array_new();
-    if (mlx_ck(mlx_max(&r, _a, keepdims != 0, g_mlx_gpu_stream)) != 0) return NULL;
-    return mlx_tensor_new(r);
+    if (mlx_ck(mlx_max(&r, _a, keepdims != 0, _s)) != 0) return NULL;
+    return mlx_tensor_new_at(r, _pool);
 }
 
 void *ionic_mlx_min(void *h, int64_t keepdims) {
     ionic_mlx_init();
     MLX_ARG(h);
     mlx_array r = mlx_array_new();
-    if (mlx_ck(mlx_min(&r, _a, keepdims != 0, g_mlx_gpu_stream)) != 0) return NULL;
-    return mlx_tensor_new(r);
+    if (mlx_ck(mlx_min(&r, _a, keepdims != 0, _s)) != 0) return NULL;
+    return mlx_tensor_new_at(r, _pool);
 }
 
 /* Reduction along one axis. axis may be negative (Python-style from the end),
@@ -1198,24 +1432,24 @@ void *ionic_mlx_sum_axis(void *h, int64_t axis, int64_t keepdims) {
     ionic_mlx_init();
     MLX_ARG(h);
     mlx_array r = mlx_array_new();
-    if (mlx_ck(mlx_sum_axis(&r, _a, (int)axis, keepdims != 0, g_mlx_gpu_stream)) != 0) return NULL;
-    return mlx_tensor_new(r);
+    if (mlx_ck(mlx_sum_axis(&r, _a, (int)axis, keepdims != 0, _s)) != 0) return NULL;
+    return mlx_tensor_new_at(r, _pool);
 }
 
 void *ionic_mlx_mean_axis(void *h, int64_t axis, int64_t keepdims) {
     ionic_mlx_init();
     MLX_ARG(h);
     mlx_array r = mlx_array_new();
-    if (mlx_ck(mlx_mean_axis(&r, _a, (int)axis, keepdims != 0, g_mlx_gpu_stream)) != 0) return NULL;
-    return mlx_tensor_new(r);
+    if (mlx_ck(mlx_mean_axis(&r, _a, (int)axis, keepdims != 0, _s)) != 0) return NULL;
+    return mlx_tensor_new_at(r, _pool);
 }
 
 void *ionic_mlx_argmax(void *h, int64_t axis, int64_t keepdims) {
     ionic_mlx_init();
     MLX_ARG(h);
     mlx_array r = mlx_array_new();
-    if (mlx_ck(mlx_argmax_axis(&r, _a, (int)axis, keepdims != 0, g_mlx_gpu_stream)) != 0) return NULL;
-    return mlx_tensor_new(r);
+    if (mlx_ck(mlx_argmax_axis(&r, _a, (int)axis, keepdims != 0, _s)) != 0) return NULL;
+    return mlx_tensor_new_at(r, _pool);
 }
 
 /* Softmax over an axis — the sampling/logits step of any generator. */
@@ -1223,8 +1457,8 @@ void *ionic_mlx_softmax(void *h, int64_t axis) {
     ionic_mlx_init();
     MLX_ARG(h);
     mlx_array r = mlx_array_new();
-    if (mlx_ck(mlx_softmax_axis(&r, _a, (int)axis, false, g_mlx_gpu_stream)) != 0) return NULL;
-    return mlx_tensor_new(r);
+    if (mlx_ck(mlx_softmax_axis(&r, _a, (int)axis, false, _s)) != 0) return NULL;
+    return mlx_tensor_new_at(r, _pool);
 }
 
 /* Log-softmax along an axis. MLX has no fused log_softmax, so this composes
@@ -1236,12 +1470,12 @@ void *ionic_mlx_log_softmax(void *h, int64_t axis) {
     ionic_mlx_init();
     MLX_ARG(h);
     mlx_array sm = mlx_array_new();
-    if (mlx_ck(mlx_softmax_axis(&sm, _a, (int)axis, false, g_mlx_gpu_stream)) != 0) return NULL;
+    if (mlx_ck(mlx_softmax_axis(&sm, _a, (int)axis, false, _s)) != 0) return NULL;
     mlx_array r = mlx_array_new();
-    int rc = mlx_ck(mlx_log(&r, sm, g_mlx_gpu_stream));
+    int rc = mlx_ck(mlx_log(&r, sm, _s));
     mlx_array_free(sm);
     if (rc != 0) return NULL;
-    return mlx_tensor_new(r);
+    return mlx_tensor_new_at(r, _pool);
 }
 
 /* ── Shape manipulation ───────────────────────────────────────────────────── */
@@ -1252,8 +1486,8 @@ void *ionic_mlx_reshape(void *h, void *shape_arr) {
     int shape[IONIC_MLX_MAX_DIMS]; size_t n = 0;
     if (mlx_shape_from_arr(shape_arr, shape, &n) != 0) return NULL;
     mlx_array r = mlx_array_new();
-    if (mlx_ck(mlx_reshape(&r, _a, shape, n, g_mlx_gpu_stream)) != 0) return NULL;
-    return mlx_tensor_new(r);
+    if (mlx_ck(mlx_reshape(&r, _a, shape, n, _s)) != 0) return NULL;
+    return mlx_tensor_new_at(r, _pool);
 }
 
 /* Transpose given an explicit permutation of dims ([1,0] for a 2-D matrix).
@@ -1274,13 +1508,13 @@ void *ionic_mlx_transpose(void *h, void *axes_arr) {
         }
         for (int i = 0; i < nd; i++) rev[i] = nd - 1 - i;
         mlx_array r = mlx_array_new();
-        if (mlx_ck(mlx_transpose_axes(&r, _a, rev, (size_t)nd, g_mlx_gpu_stream)) != 0) return NULL;
-        return mlx_tensor_new(r);
+        if (mlx_ck(mlx_transpose_axes(&r, _a, rev, (size_t)nd, _s)) != 0) return NULL;
+        return mlx_tensor_new_at(r, _pool);
     }
 
     mlx_array r = mlx_array_new();
-    if (mlx_ck(mlx_transpose_axes(&r, _a, axes, n, g_mlx_gpu_stream)) != 0) return NULL;
-    return mlx_tensor_new(r);
+    if (mlx_ck(mlx_transpose_axes(&r, _a, axes, n, _s)) != 0) return NULL;
+    return mlx_tensor_new_at(r, _pool);
 }
 
 /* Cast element dtype. Kept separate from construction so precision can be
@@ -1289,8 +1523,8 @@ void *ionic_mlx_astype(void *h, int64_t dtype) {
     ionic_mlx_init();
     MLX_ARG(h);
     mlx_array r = mlx_array_new();
-    if (mlx_ck(mlx_astype(&r, _a, ionic_dtype_to_mlx(dtype), g_mlx_gpu_stream)) != 0) return NULL;
-    return mlx_tensor_new(r);
+    if (mlx_ck(mlx_astype(&r, _a, ionic_dtype_to_mlx(dtype), _s)) != 0) return NULL;
+    return mlx_tensor_new_at(r, _pool);
 }
 
 /* Slice: take elements [start, stop) along `axis`, leaving other dims whole.
@@ -1322,8 +1556,8 @@ void *ionic_mlx_slice(void *h, int64_t start, int64_t stop, int64_t axis) {
      * strides_num 0 makes MLX reject the call as a rank mismatch. */
     mlx_array r = mlx_array_new();
     if (mlx_ck(mlx_slice(&r, _a, st, (size_t)nd, sp, (size_t)nd, sd, (size_t)nd,
-                         g_mlx_gpu_stream)) != 0) return NULL;
-    return mlx_tensor_new(r);
+                         _s)) != 0) return NULL;
+    return mlx_tensor_new_at(r, _pool);
 }
 
 /* Gather rows by index along an axis (embedding lookup / token selection). */
@@ -1341,10 +1575,10 @@ void *ionic_mlx_take(void *h, void *idx_arr, int64_t axis) {
     free(buf);
 
     mlx_array r = mlx_array_new();
-    int rc = mlx_ck(mlx_take_axis(&r, _a, idx, (int)axis, g_mlx_gpu_stream));
+    int rc = mlx_ck(mlx_take_axis(&r, _a, idx, (int)axis, _s));
     mlx_array_free(idx);
     if (rc != 0) return NULL;
-    return mlx_tensor_new(r);
+    return mlx_tensor_new_at(r, _pool);
 }
 
 /* Concatenate two tensors along an axis. mlx_concatenate() only exists as the
@@ -1358,10 +1592,10 @@ void *ionic_mlx_concatenate(void *ha, void *hb, int64_t axis) {
     mlx_array pair[2] = { _a, tb->a };
     mlx_vector_array va = mlx_vector_array_new_data(pair, 2);
     mlx_array r = mlx_array_new();
-    int rc = mlx_ck(mlx_concatenate_axis(&r, va, (int)axis, g_mlx_gpu_stream));
+    int rc = mlx_ck(mlx_concatenate_axis(&r, va, (int)axis, _s));
     mlx_vector_array_free(va);
     if (rc != 0) return NULL;
-    return mlx_tensor_new(r);
+    return mlx_tensor_new_at(r, _pool);
 }
 
 /* ── NN primitives ──────────────────────────────────────────────────────────
@@ -1382,8 +1616,8 @@ void *ionic_mlx_sdpa(void *q, void *k, void *v, int64_t scale_b, int64_t causal)
     if (mlx_ck(mlx_fast_scaled_dot_product_attention(
             &r, tq->a, tk->a, tv->a, (float)i642d(scale_b),
             causal ? "causal" : "", mlx_array_empty, mlx_array_empty,
-            g_mlx_gpu_stream)) != 0) return NULL;
-    return mlx_tensor_new(r);
+            pool_stream(tq->pool))) != 0) return NULL;
+    return mlx_tensor_new_at(r, tq->pool);
 }
 
 /* RMSNorm. `weight` may be NULL for the weightless form. */
@@ -1398,8 +1632,8 @@ void *ionic_mlx_rms_norm(void *h, void *weight, int64_t eps_b) {
         w = tw->a;
     }
     mlx_array r = mlx_array_new();
-    if (mlx_ck(mlx_fast_rms_norm(&r, _a, w, (float)i642d(eps_b), g_mlx_gpu_stream)) != 0) return NULL;
-    return mlx_tensor_new(r);
+    if (mlx_ck(mlx_fast_rms_norm(&r, _a, w, (float)i642d(eps_b), _s)) != 0) return NULL;
+    return mlx_tensor_new_at(r, _pool);
 }
 
 /* LayerNorm. weight and bias may both be NULL. */
@@ -1410,8 +1644,8 @@ void *ionic_mlx_layer_norm(void *h, void *weight, void *bias, int64_t eps_b) {
     if (weight) { MlxTensor *t = mlx_tensor_of(weight); if (!t) return NULL; w = t->a; }
     if (bias)   { MlxTensor *t = mlx_tensor_of(bias);   if (!t) return NULL; b = t->a; }
     mlx_array r = mlx_array_new();
-    if (mlx_ck(mlx_fast_layer_norm(&r, _a, w, b, (float)i642d(eps_b), g_mlx_gpu_stream)) != 0) return NULL;
-    return mlx_tensor_new(r);
+    if (mlx_ck(mlx_fast_layer_norm(&r, _a, w, b, (float)i642d(eps_b), _s)) != 0) return NULL;
+    return mlx_tensor_new_at(r, _pool);
 }
 
 /* Rotary position embedding. `dims` is the number of dimensions to rotate;
@@ -1424,8 +1658,8 @@ void *ionic_mlx_rope(void *h, int64_t dims, int64_t base_b, int64_t traditional,
     opt.has_value = true;
     mlx_array r = mlx_array_new();
     if (mlx_ck(mlx_fast_rope(&r, _a, (int)dims, traditional != 0, opt, 1.0f,
-                             (int)offset, mlx_array_empty, g_mlx_gpu_stream)) != 0) return NULL;
-    return mlx_tensor_new(r);
+                             (int)offset, mlx_array_empty, _s)) != 0) return NULL;
+    return mlx_tensor_new_at(r, _pool);
 }
 
 /* ── Autodiff seam (documented, not yet wired) ──────────────────────────────
@@ -1534,7 +1768,7 @@ void *ionic_mlx_load_safetensors(const char *path) {
     w->params = mlx_map_string_to_array_new();
     w->meta   = mlx_map_string_to_string_new();
 
-    if (mlx_ck(mlx_load_safetensors(&w->params, &w->meta, path, g_mlx_gpu_stream)) != 0) {
+    if (mlx_ck(mlx_load_safetensors(&w->params, &w->meta, path, g_mlx_cpu_stream)) != 0) {
         mlx_map_string_to_array_free(w->params);
         mlx_map_string_to_string_free(w->meta);
         free(w);
@@ -1603,10 +1837,15 @@ void *ionic_mlx_weights_at(void *h, int64_t i) {
     return result;
 }
 
-/* Key at index i, or "" — pair with weights_at to walk the dict. */
-const char *ionic_mlx_weights_key_at(void *h, int64_t i) {
+/* Key at index i, or "" — pair with weights_at to walk the dict.
+ *
+ * Returns a fresh copy, not `keybuf`. A static buffer would be clobbered by
+ * the next call, so `a = key_at(w, 0); b = key_at(w, 1)` left `a` reading as
+ * `b` — and the caller owns a TY_STR, so there is nothing else it could hold.
+ * See docs/memory-model.md §11.2. */
+char *ionic_mlx_weights_key_at(void *h, int64_t i) {
     MlxWeights *w = mlx_weights_of(h);
-    if (!w) return "";
+    if (!w) return rt_empty_str();
 
     static char keybuf[512];
     keybuf[0] = '\0';
@@ -1627,7 +1866,7 @@ const char *ionic_mlx_weights_key_at(void *h, int64_t i) {
 
     mlx_array_free(val);
     mlx_map_string_to_array_iterator_free(it);
-    return keybuf;
+    return rt_dup_str(keybuf);
 }
 
 /* Look up one tensor by name, or NULL when absent. */
@@ -1705,6 +1944,19 @@ int64_t ionic_mlx_item(void *h) { (void)h; return 0; }
 void   *ionic_mlx_shape(void *h) { (void)h; return ionic_array_alloc(1); }
 void   *ionic_mlx_to_array(void *h) { (void)h; return ionic_array_alloc(1); }
 
+/* ── Pools (Stage C) ─────────────────────────────────────────────────────────
+ * The pool model is language-level, so its *introspection* must exist even
+ * where no backend does: a program can ask whether transfers are free and how
+ * much is charged to each pool on any platform. What it cannot do without a
+ * backend is transfer anything — hence NULL from to_gpu/to_cpu, which the
+ * checker's placement rules have already made unreachable in practice. */
+void   *ionic_mlx_to_gpu(void *h) { (void)h; mlx_unavailable(); return NULL; }
+void   *ionic_mlx_to_cpu(void *h) { (void)h; mlx_unavailable(); return NULL; }
+int64_t ionic_mlx_pool(void *h) { (void)h; return -1; }
+int64_t ionic_mlx_pool_bytes(int64_t p) { (void)p; return -1; }
+int64_t ionic_mlx_pool_count(void) { return 2; }
+int64_t ionic_mlx_pools_unified(void) { return 0; }
+
 /* ── Construction ─────────────────────────────────────────────────────────── */
 void *ionic_mlx_zeros(void *shape, int64_t dt)               { (void)shape; (void)dt; mlx_unavailable(); return NULL; }
 void *ionic_mlx_ones(void *shape, int64_t dt)                { (void)shape; (void)dt; mlx_unavailable(); return NULL; }
@@ -1769,7 +2021,7 @@ void      *ionic_mlx_load_safetensors(const char *path) { (void)path; mlx_unavai
 void       ionic_mlx_weights_free(void *h)              { (void)h; }
 int64_t    ionic_mlx_weights_count(void *h)             { (void)h; return -1; }
 void      *ionic_mlx_weights_at(void *h, int64_t i)     { (void)h; (void)i; return NULL; }
-const char *ionic_mlx_weights_key_at(void *h, int64_t i) { (void)h; (void)i; return ""; }
+char       *ionic_mlx_weights_key_at(void *h, int64_t i) { (void)h; (void)i; return rt_empty_str(); }
 void      *ionic_mlx_weights_get(void *h, const char *n) { (void)h; (void)n; return NULL; }
 int64_t    ionic_mlx_save_safetensors(void *h, const char *p, const char *k) {
     (void)h; (void)p; (void)k; return -1;
@@ -2123,14 +2375,17 @@ static char *http_request(const char *method, const char *url,
 #endif
 }
 
+/* Both wrappers fall back to an *allocated* empty string, not a rodata one:
+ * http_request() returns NULL on socket/lookup/connect failure, so this is a
+ * reachable path and the caller owns whatever comes back. See §11.1. */
 char *ionic_http_get(const char *url) {
     char *b = http_request("GET", url, "", NULL);
-    return b ? b : ((char *)"");
+    return b ? b : rt_empty_str();
 }
 
 char *ionic_http_post(const char *url, const char *body) {
     char *b = http_request("POST", url, "Content-Type: application/json\r\n", body);
-    return b ? b : ((char *)"");
+    return b ? b : rt_empty_str();
 }
 
 /*
@@ -2144,10 +2399,21 @@ int64_t ionic_http_status(const char *raw) {
     return atoi(sp + 1);
 }
 
-/* Split a full HTTP response into headers and body. Returns the body. */
+/* Split a full HTTP response into headers and body. Returns the body.
+ *
+ * The no-separator path copies rather than returning `raw`. Returning the input
+ * made "the caller owns the result" false: releasing both `raw` and the body
+ * would be a double free, and on a literal response it would be a free of
+ * rodata. See docs/memory-model.md §11.1. */
 char *ionic_http_body(const char *raw) {
     const char *sep = strstr(raw, "\r\n\r\n");
-    if (!sep) return (char *)(raw ? raw : "");
+    if (!sep) {
+        const char *src = raw ? raw : "";
+        size_t n = strlen(src);
+        char *c = (char *)malloc(n + 1);
+        if (c) memcpy(c, src, n + 1);
+        return c;
+    }
     char *b = (char *)malloc(strlen(sep + 4) + 1);
     strcpy(b, sep + 4);
     return b;
@@ -3164,19 +3430,27 @@ int64_t ionic_http_accept(int64_t listen_fd) {
 #endif
 }
 
-const char *ionic_http_method(int64_t req) {
+/* These three return into the request object: `method` and `path` are inline
+ * char arrays, `body` a separately malloc'd buffer freed by
+ * ionic_http_req_done(). Handing any of them back directly would break the
+ * "a returned TY_STR is the caller's" contract in two ways — releasing the
+ * result would free the middle of the HttpRequest, and the value would dangle
+ * the moment the caller closed the request. Both compilers already classify
+ * these as owned strings, so the copy makes their existing model true rather
+ * than changing it. See docs/memory-model.md §11.2. */
+char *ionic_http_method(int64_t req) {
     HttpRequest *r = (HttpRequest *)(intptr_t)req;
-    return r ? r->method : "";
+    return rt_dup_str(r ? r->method : NULL);
 }
 
-const char *ionic_http_path(int64_t req) {
+char *ionic_http_path(int64_t req) {
     HttpRequest *r = (HttpRequest *)(intptr_t)req;
-    return r ? r->path : "";
+    return rt_dup_str(r ? r->path : NULL);
 }
 
-const char *ionic_http_req_body(int64_t req) {
+char *ionic_http_req_body(int64_t req) {
     HttpRequest *r = (HttpRequest *)(intptr_t)req;
-    return r ? (r->body ? r->body : "") : "";
+    return rt_dup_str(r ? r->body : NULL);
 }
 
 int64_t ionic_http_req_done(int64_t req) {

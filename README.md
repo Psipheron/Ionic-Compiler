@@ -19,7 +19,7 @@ while (i <= 10) {
 ```
 
 ```
-$ ./ionic_new fib.ionic -o fib && ./fib
+$ ./ionic_new examples/fib.ionic -o /tmp/fib && /tmp/fib
 fib(0) = 0
 fib(1) = 1
 fib(2) = 1
@@ -98,10 +98,10 @@ program still needs a C compiler on `PATH`; nothing else is required.
 ### Quick start (using the prebuilt `ionic_self`)
 
 ```sh
-git clone <repo>
-cd AILANG
+git clone https://github.com/Pkill-MyDaemons/Ionic.git
+cd Ionic
 ./build.sh                                  # ~3 s; produces ./ionic_new
-./ionic_new hello.ionic -o hello && ./hello
+./ionic_new examples/hello_world.ionic -o /tmp/hw && /tmp/hw
 ```
 
 ### Rebuilding after source changes
@@ -173,7 +173,7 @@ own programs.
 
 **Compile and run:**
 ```sh
-./ionic_new hello.ionic -o hello && ./hello
+./ionic_new examples/hello_world.ionic -o /tmp/hw && /tmp/hw
 ```
 
 **No `fn main` needed** — top-level statements run directly:
@@ -198,14 +198,14 @@ one pass), and colorized when stdout is a terminal. A typical error in a
 TTY:
 
 ```
-    at /Users/henry/Developer/AILANG/examples/foo.ionic:5:12
+    at /Users/henry/Developer/Ionic/examples/foo.ionic:5:12
 [error] 5:12: unknown variable 'x': not declared in this scope
     in fn compute(int64 n) -> int64 {
         return x + 1;
                ^
     help: did you mean 'xs' (similar variable)?
 1 error(s) found.
-    hint: re-run `/Users/henry/Developer/AILANG/examples/foo.ionic` in your editor (hx) -- click path:line:col above to jump.
+    hint: re-run `/Users/henry/Developer/Ionic/examples/foo.ionic` in your editor (hx) -- click path:line:col above to jump.
 ```
 
 In a plain terminal / CI log (`NO_COLOR=1`, pipe, `TERM=dumb`, …) the escape
@@ -464,7 +464,7 @@ if (status(raw) == 200) {
 ## ML backends
 
 Ionic ships two optional ML backends. Each is linked into a program **only when
-that program's source references it**, so `ionic hello.ionic` stays
+that program's source references it**, so a plain program stays
 dependency-free:
 
 - source mentions `mlx_*` → links `mlx-c` (Apple silicon / Metal)
@@ -599,4 +599,4 @@ only ever see `ionic_new`.
 ---
 ## Contributing
 PR's are always welcome.
-If you want a in-depth intro to the compiler and it's intricacies, look at the [Tutorial](docs/tutorial/README.md)
+If you want a in-depth intro to the compiler and it's intricacies, look at the [Tutorial](docs/Tutorial/README.md)

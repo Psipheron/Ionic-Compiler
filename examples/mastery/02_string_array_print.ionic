@@ -1,0 +1,41 @@
+// Mastery 02.5 — printing strings that are not plain string literals.
+//
+// This used to be a *fail* example: `println(names[0])` printed the element's
+// pointer as an integer, because the codegen decided which println variant to
+// call by pattern-matching the shape of the argument node. An element load is
+// an int64 bit pattern, so it fell through to ionic_println_int64.
+//
+// The decision now asks the type oracle (ncg_ty_of) instead, which resolves
+// element loads through the array's element type and resolves parameters
+// through their declared type. Every line below prints text.
+
+fn show(string label, string value) {
+    // A *parameter* is the other place string-ness used to be lost: parameters
+    // never enter the checker's symbol table, so `value` looked like an int64.
+    println(str_concat(str_concat(label, ": "), value));
+}
+
+fn first_of([string] xs) -> string {
+    return xs[0];
+}
+
+mut names: [string] = ["alice", "bob"];
+
+println(str_concat("names[0]      -> ", names[0]));   // alice
+println(str_concat("names[1]      -> ", names[1]));   // bob
+println(str_concat("first_of      -> ", first_of(names)));
+
+show("param", "alice");
+show("from index", names[1]);
+
+// An element type that is not a string is unaffected: floats still dispatch to
+// ionic_println_float64 and ints to ionic_println_int64.
+let scores: [float64] = [2.5, 3.5];
+println(str_concat("scores[1]     -> ", float64_to_str(scores[1])));   // 3.5
+
+let counts: [int64] = [7, 8];
+println(str_concat("counts[0]     -> ", int64_to_str(counts[0])));    // 7
+
+// An array literal with no annotation still infers its element type.
+let inferred = [1.5, 2.5];
+println(str_concat("inferred[0]   -> ", float64_to_str(inferred[0]))); // 1.5

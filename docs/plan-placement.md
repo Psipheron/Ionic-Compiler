@@ -1,6 +1,7 @@
 # Functional Hardware-Placement Awareness
 
-Status: **Stage A complete, Stage B1 complete, B2–B6 pending** — revised 2026-11-03
+Status: **Stage A complete, Stage B (B1–B6) complete, Stage C partially complete
+(pool as a runtime fact), Stage D pending** — revised 2026-11-03
 Author: audit + design pass
 Scope: `src/semantic/checker.ionic`, `src/ionic_model_runtime.c`,
 `src/codegen/native.ionic`, `docs/`
@@ -17,8 +18,12 @@ purpose, and this revision replaces it.
 Corrections from the maintainer:
 
 1. **The target is AI on servers and PCs.** MLX exists in the tree for testing
-   and to keep the build multiplatform. It is **not** the intended GPU backend
-   and must not shape the semantics.
+   and to keep the build multiplatform. On Apple silicon it is the **unified
+   memory** backend: it is what the pool model is exercised and tested against
+   there, and it is a legitimate deployment backend on that platform. It is
+   *not* the definition of the model, and it must not shape the semantics —
+   the Linux VRAM side needs real SRAM/VRAM pools, which MLX does not provide
+   today. Settled: MLX is the unified-memory backend, not "the GPU backend".
 2. **`@cpu` / `@gpu` should mean SRAM and VRAM** — host memory versus
    accelerator memory, with **different capacities**.
 3. **Metal's unified memory is the exception, not the rule.** On Apple silicon
@@ -101,6 +106,7 @@ sites.
 | CPU-only I/O inside GPU context rejected | `:1062` | works |
 | `.toGpu()` / `.toCpu()` are the only transfers | `:1120-1131` | works |
 | Conversion hints on mismatch | `:478-494` | works |
+| A transfer consumes its operand (no use-after-move) | `sv_mvline`/`sv_mvhow`, `sc_consume_operand`, `sc_check_not_moved` | works (B5) |
 
 The **separation** half of the contract is done and sound.
 
@@ -172,16 +178,29 @@ Regression coverage: `examples/mastery/04_pool_polymorphism.ionic` (compiles and
 runs) and `examples/mastery/fail/mixed_pool.ionic` (rejected with exactly one
 diagnostic, the intended one).
 
-### 3.4 The runtime is inverted
+### 3.4 The runtime is inverted — **fixed in Stage C (pool as a runtime fact)**
 
-`MlxTensor` is `{ magic, alive, mlx_array a }` — no pool field
-(`ionic_model_runtime.c:738-742`). All 34 MLX call sites hardcode
-`g_mlx_gpu_stream`; there is no CPU stream in the file at all. Every tensor is
-GPU-resident regardless of its Ionic type, so `tensor@cpu` is already VRAM and
-`tensor@gpu` is unreachable.
+`MlxTensor` was `{ magic, alive, mlx_array a }` — no pool field — and every MLX
+call site hardcoded `g_mlx_gpu_stream`. Every tensor was GPU-resident regardless
+of its Ionic type, so `tensor@cpu` was already VRAM and `tensor@gpu` was
+unreachable. `toGpu()`/`toCpu()` compiled to an identity (`native.ionic:1375`)
+and `gpu { }` compiled to nothing.
 
-`toGpu()`/`toCpu()` compile to nothing (`native.ionic:1375` is an identity) and
-`gpu { }` compiles to nothing (`:1957-1959`).
+What landed instead (see Stage C):
+
+- `MlxTensor` carries `pool` and `bytes`; `mlx_tensor_new_at(a, pool)` is the
+  one constructor, and `mlx_tensor_new(a)` defaults to SRAM.
+- `pool_stream(pool)` replaces all 36 hardcoded stream references, so an
+  operation runs on the stream belonging to its handle's pool.
+- `toGpu()` / `toCpu()` are real runtime calls (`ionic_mlx_to_gpu` /
+  `ionic_mlx_to_cpu`) that move the value and charge the destination pool.
+- `mlx_pool`, `mlx_pool_bytes`, `mlx_pool_count` and `mlx_pools_unified` make
+  the pool model observable from Ionic, and therefore testable — a harness can
+  now tell a transfer that works from one that silently does nothing.
+
+`gpu { }` still compiles to its body plus a comment; it is a checked *claim*
+about the pool, not a scheduling primitive, and the refusal path (§4.4a) is not
+wired yet.
 
 ---
 
@@ -239,9 +258,13 @@ For a `@gpu` scope with budget `B` and a set of live `tensor@gpu` values:
 
 4. **Static vs dynamic size.** Some sizes are not knowable at compile time
    (a tensor whose shape depends on runtime data). Those are **unbounded**
-   contributions. Per decision 4, the checker **rejects** a statically-
-   unbounded GPU tensor in a budgeted scope rather than waving it through: an
-   unbounded GPU tensor would defeat the budget entirely.
+   contributions. Decision 4 says the checker rejects a statically-unbounded
+   GPU tensor in a budgeted scope rather than waving it through. **As
+   implemented (B4), the rejection is narrowed to values *created* in the
+   scope**: a tensor *parameter* has no static size, and rejecting it would
+   make every function that takes a tensor uncompilable. See the note under
+   Stage B item 4 for the reasoning and the resulting "necessary but not
+   sufficient" property.
 
 ### 4.3 The ownership question: is a transfer a move or a copy?
 
@@ -249,13 +272,14 @@ This is the sharpest decision, and it is **not** answered by the current code.
 
 If `.toGpu()` is a **move**, then after `let g = x.toGpu();` the CPU-side `x`
 is dead. Using `x` afterwards is a use-after-move — a *new class of compile
-error* the language does not currently have (verified: no `moved`/`consumed`
-tracking anywhere in `src/`).
+error* the language did not have before B5 (until then there was no
+`moved`/`consumed` tracking anywhere in `src/`).
 
 If `.toGpu()` is a **copy**, then capacity accounting must count both sides,
 and the whole point of VRAM capacity is lost to duplicated weights.
 
-Recommendation: **move**, with use-after-move as a checker error. Reasons:
+**Resolved as a move**, with use-after-move as a checker error (B5, 2026-11-03;
+see Stage B item 5 for what landed). Reasons:
 
 - The model-RAII work already established the precedent: `local_set_model`
   clears ownership on transfer (`native.ionic:1814`), and the same mechanism
@@ -341,36 +365,111 @@ lands is archaeology.
      (`fn_pool_poly[]`, computed by `finalize_pool_poly()`).
 2. **Pool declaration and budget scope** (§6.1). The pool size is declared
    once at top level; `@gpu(f)` narrows a scope to a fraction of it.
+   ✅ **Done (the declaration and the fraction's validity) — 2026-11-03.**
 
-   **Parser work this implies.** The `@gpu(...)` form already exists and
-   already occupies the parenthesised slot: `parser/parser.ionic:108-118`
-   reads `@gpu(<float>)` into an `ND_HW` node with `HW_GPU_FRAC`, storing the
-   fraction text in the node's `nd_sv`. So:
-   - The **fraction syntax needs no parser change** — it is already parsed and
-     simply never read. This work gives it a meaning.
-   - The **pool declaration needs no new syntax either** if it is an ordinary
-     top-level `let` of an integer. But an ordinary `let` is not
-     self-describing: `let vram = 25769803776` reads as a number until you
-     know what it is. Options: a distinct declaration form, or a convention
-     (a top-level `let` named by the build, referenced by name). Recommendation:
-     a **named top-level constant** whose name the checker recognises, so the
-     pool size is declared once and every `@gpu` scope inherits it.
-   - There is **no size-literal support** in the lexer
-     (`grep -n 'GB\|MB\|byte\|suffix' src/parser/parser.ionic` → no hits), so
-     the pool is declared in **plain bytes**.
-3. **Static size computation.** A pass that computes each tensor's size from
-   shape and dtype, where knowable.
-4. **Budget checking.** Sum live `tensor@gpu` sizes in scope; error if the
-   total exceeds the scope's share of the pool, or if any contribution is
-   unbounded (decision 4: reject).
-5. **Use-after-move** for transfers (§4.3), per decision 1.
+   What landed, in `src/semantic/checker.ionic`:
+   - `pool_scan_toplevel()` runs in `sc_program` *before* any function body is
+     checked, and reads the top-level `let vram = <int>` into
+     `pool_vram_bytes`. It rejects a duplicate declaration, a non-integer
+     initialiser, and a non-positive size.
+   - `hw_frac_bits()` reads the fraction text the parser already stored in
+     `nd_sv[hw_node]` (it was parsed and never read); `hw_frac_is_valid()`
+     checks `0 < f <= 1` by comparing IEEE-754 bit patterns, so no float
+     arithmetic happens in the checker.
+   - `sc_check_hw_frac()` is called from `sc_fn` and rejects a fraction outside
+     `(0, 1]`, and a fraction when no pool is declared.
+
+   No parser change was needed, as the audit predicted: `@gpu(<float>)` already
+   produced `HW_GPU_FRAC` with the text attached, and `let vram = <int>` is an
+   ordinary global. The name is a convention (`POOL_DECL_NAME`), not a keyword.
+
+   **What this does *not* do:** it does not compute whether a set of live
+   tensors fits the resulting budget. That is B3 (static sizes) + B4 (sum and
+   compare), which landed separately below. Until they landed the fraction was
+   a validated claim about intent rather than a proof about capacity, and
+   `docs/guide.md` / `docs/Tutorial/04-hardware-placement.md` were corrected to
+   say so.
+
+   Regression coverage: `scripts/placement_check.sh` (28 cases across the B2,
+   B3/B4 and B5 sections, all static and accelerator-free, run in both `ci.yml`
+   and the Linux `elf` job in `multitarget.yml`) and
+   `examples/mastery/04_pool_budget.ionic`.
+
+   **Parser work this implied — none.** The `@gpu(...)` form already existed:
+   `parser/parser.ionic:108-118` reads `@gpu(<float>)` into an `ND_HW` node with
+   `HW_GPU_FRAC` and the fraction text in `nd_sv`. The audit's prediction held —
+   the syntax was already parsed and simply never read, so giving it a meaning
+   needed no parser change. The pool declaration is likewise an ordinary
+   top-level `let` of an integer (there is no size-literal support in the lexer,
+   so it is written in plain bytes). The only design choice actually taken was
+   to recognise the declaration **by name** (`POOL_DECL_NAME = "vram"`) rather
+   than add a keyword.
+3. **Static size computation.** ✅ **Done (B3) — 2026-11-03.** A tensor's size
+   is `prod(shape) x dtype_bytes`. `expr_bytes()` derives it for the
+   constructor builtins (`mlx_zeros`, `mlx_ones`, `mlx_full`, `mlx_eye`,
+   `mlx_random_normal`, `mlx_random_uniform`) and for shape-preserving ops
+   (`mlx_add`, `mlx_matmul`, the unary elementwise family, …), which report
+   their first operand's size. `shape_lit_count()` requires every shape element
+   to be a non-negative integer literal, so a shape built at runtime is
+   "unknown" rather than guessed. `dtype_bytes()` mirrors the runtime's
+   `IonicDtype` widths. Sizes travel in a dedicated `sv_bytes[]` column
+   (`sv_set_bytes`/`sv_lookup_bytes`), separate from `sv_svs[]` which already
+   carries a struct name or an array element type.
+4. **Budget checking.** ✅ **Done (B4) — 2026-11-03, with decision 4 narrowed.**
+   A `@gpu` fn body and a bare `gpu { }` block are both budgeted scopes:
+   `budget_begin()` computes the scope's share as `pool_vram_bytes * num / den`
+   in **integer** arithmetic (the fraction text is parsed as an exact ratio by
+   `frac_num`/`frac_den`, so no float rounding can invent a budget), and
+   `budget_charge()` sums each sized `let`-bound `tensor@gpu` local, reporting
+   at the declaration that pushes the total over and naming the byte counts.
+
+   **Decision 4 was narrowed rather than implemented literally.** "Reject
+   unbounded" would reject every tensor *parameter*, since a parameter has no
+   static size — and that breaks all four existing `@gpu fn(tensor@gpu x)`
+   examples CI asserts must compile. So the check applies where a value is
+   *created* in a budgeted scope, and exempts values whose size is unknown (a
+   parameter, or the result of an op the size pass does not model). A parameter
+   was allocated — and charged — in the caller's scope; counting it again here
+   would double-charge it. The consequence is that the check is a **necessary
+   but not sufficient** condition: it catches "I allocated 4 GiB against a 1%
+   budget" and under-approximates. It cannot produce a false rejection, which
+   is the property that matters for a check users cannot turn off.
+5. **Use-after-move** for transfers (§4.3), per decision 1. ✅ **Done (B5).**
+   `x.toGpu()` / `x.toCpu()` consumes `x`; reading the binding afterwards is
+   rejected, and the diagnostic names the transfer and the line it happened on.
+   The checker tracks this in the `sv_mvline` / `sv_mvhow` symbol-table columns:
+   `sc_consume_operand()` marks the transferred identifier, `sv_declare()`
+   clears the mark, and `sc_check_not_moved()` fires from `ND_IDENT` — so every
+   reference is covered by one rule, whether it appears as an argument, an
+   initialiser or a return value.
+
+   **Only transfers move.** Every other operation borrows, which is why
+   `mlx_add(g, g)` stays legal: MLX arrays are refcounted handles, so reading a
+   handle twice is the normal case, and if calls consumed their operands every
+   expression would need a copy of its inputs. What capacity accounting needs
+   is one *owner* per value, and a transfer is the only operation that
+   reassigns ownership.
+
+   Two consequences worth knowing: a temporary has no binding to strand, so
+   `mlx_ones([2, 2], 0).toGpu()` is fine; and rebinding clears the mark, so
+   `let g = a.toGpu(); let a = mlx_ones(...);` is legal — the old value moved,
+   the new one is a distinct value in a reused slot.
+
 6. **Mixed-pool operands** are a compile error when both placements are known
    (§6.2). ✅ **Done** — it is also required for B1's result-pool inference to
    be well defined, so it landed with B1 rather than after it.
 
 **Verify:** `tensor_mismatch.ionic` still fails with the same message ✅;
-`04_placement_types.ionic` still compiles ✅; a new over-budget program is
-rejected with the arithmetic shown — **pending** (needs B2/B4).
+`04_placement_types.ionic` still compiles ✅; a malformed pool declaration or an
+out-of-range `@gpu(f)` is rejected ✅ (B2); an over-budget program is rejected
+with the arithmetic shown ✅ (B3/B4); reading a transferred binding is rejected
+✅ (B5) — see `scripts/placement_check.sh`, whose `static sizes and the scope
+budget` section covers an over-budget allocation, the same allocation under a
+wider fraction, dtype affecting the size, `gpu { }` blocks being budgeted,
+parameters and unsized results being exempt, and "no pool declared means no
+budget", and whose `transfers move` section covers use-after-move in both
+directions, freeing a moved value, and the four patterns that must stay legal
+(builtins borrowing, transferring a temporary, rebinding a name).
 
 **Risk:** the biggest checker change in the project's history. It is also the
 highest-value part, because it is the part that is portable and testable
@@ -380,29 +479,54 @@ everywhere.
 
 **Files:** `src/ionic_model_runtime.c`, `src/codegen/native.ionic`
 
-1. **Pool abstraction.** A tensor handle carries its pool, not just its array.
-   Introduce the concept backend-independently; MLX becomes one implementation.
+Items 1 and 3 are **done** (the pool model is a runtime fact as of 2026-11-03).
+Items 2, 4 and 5 remain, and item 6 was satisfied for the new entry points.
+
+1. ✅ **Pool abstraction.** A tensor handle carries its pool, not just its
+   array. `MlxTensor` gained `int64_t pool` and `int64_t bytes`; `pool_stream()`
+   maps a pool to its stream; per-pool byte counters make occupancy answerable.
+   MLX is the unified-memory implementation of this, not the concept.
 2. **Backend interface.** Operations are dispatched to a backend that owns
-   pools, budgets, and transfers. The MLX backend implements it with the
-   unified-memory semantics; a portable backend implements it with host
-   execution.
-3. **Transfers become real.** `toGpu()`/`toCpu()` move a value between pools
-   and adjust the budgets. On a unified backend this is free; elsewhere it
-   copies and the source is invalidated (move semantics).
+   pools, budgets, and transfers. MLX is one implementation behind that seam;
+   a portable or CUDA/ROCm backend would be another. **Not done** — today the
+   pool model is expressed directly in the MLX runtime, which is enough for the
+   unified-memory case and is the shape a second backend would be factored out
+   of, rather than a shape it would have to be retrofitted into.
+3. ✅ **Transfers become real.** `toGpu()`/`toCpu()` move a value between pools
+   and adjust the counters. On the unified backend no bytes move — the array
+   reference is handed over and the source pool's charge is released — while a
+   discrete backend (`IONIC_POOLS_DISCRETE`) copies onto the destination stream
+   before invalidating the source. Both are a move: the source stops owning its
+   array either way.
 4. **`gpu { }` / `@gpu fn` set the ambient pool**, and the ambient pool is a
    *runtime stack* so that a `return` from inside a `gpu {}` block cannot skip
    a restore. (`gpu { return x; }` compiles today — verified — and the codegen
    has a single-exit epilogue, so codegen-managed restore-on-exit is fragile.)
+   **Not done** — the pool is carried by each handle instead, which removes the
+   need for an ambient stack for the accounting half. An ambient pool would
+   still be needed to *choose a stream* for an operation whose handle is
+   pool-typed but whose operands disagree, and the checker already rejects that
+   (§6.2.1), so there is nothing for it to do yet.
 5. **Refusal without an accelerator** (§4.4a): with no accelerator backend, a
    GPU scope reports that no accelerator is present and the program does not
-   proceed. It does not silently run on the host.
-6. **Stub parity.** The non-MLX branch (`#if IONIC_MLX_ACTIVE`, `:66`) holds
-   69 hand-written stubs whose header (`:1670-1677`) warns that a missing stub
-   is a **link** error on Linux. New entry points must be added there too.
+   proceed. It does not silently run on the host. **Not done.** Note the
+   interaction with the spike outcome: on a build with no CUDA/Metal,
+   `mlx_default_gpu_stream_new()` still returns a stream for a device that does
+   not exist, so the refusal must be decided by asking the backend
+   (`mlx_cuda_is_available` / `mlx_metal_is_available`) and treating the GPU
+   pool as *absent*, not merely empty.
+6. ✅ **Stub parity.** The non-MLX branch (`#if IONIC_MLX_ACTIVE`) holds the
+   hand-written stubs whose header warns that a missing stub is a **link** error
+   on Linux. Every new entry point (`ionic_mlx_to_gpu`, `ionic_mlx_to_cpu`,
+   `ionic_mlx_pool`, `ionic_mlx_pool_bytes`, `ionic_mlx_pool_count`,
+   `ionic_mlx_pools_unified`) was added there too.
 
-**Verify:** the MLX example still produces the same numbers; a deliberate
-over-budget runtime allocation fails loudly rather than corrupting; a GPU
-scope on a machine with no accelerator refuses rather than running on the host.
+**Verify:** the MLX example still produces the same numbers ✅; transfers move
+bytes between pools and are charged exactly once ✅ (the `pool model at runtime`
+section of `scripts/placement_check.sh` asserts both directions, the
+no-double-counting property, and that a free returns the pool to its baseline);
+a GPU scope on a machine with no accelerator refuses rather than running on the
+host — **not yet implemented**, so not yet assertable.
 
 ### Stage D — Capacity enforcement at runtime
 
@@ -417,9 +541,20 @@ depends on the backend existing (Stage C).
 ### Stage E — Tests
 
 1. Mastery test: budget exceeded → compile error, with the arithmetic.
+   ✅ `04_pool_budget.ionic` + the `static sizes and the scope budget` section of
+   `scripts/placement_check.sh`.
 2. Mastery test: transfer moves a value between pools; use-after-move is an
-   error.
+   error. ✅ **Done** — `examples/mastery/fail/use_after_move.ionic` (rejected,
+   asserted in `ci.yml` and the harness) plus the `transfers move` section of
+   `scripts/placement_check.sh`: 8 cases covering both directions, freeing a
+   moved value, and the patterns that must stay legal.
 3. Mastery test: unified backend (MLX) — transfer is free, one pool.
+   ✅ **Done** — the `pool model at runtime` section of
+   `scripts/placement_check.sh` asserts that a transfer on the unified backend
+   moves the *accounting* between pools without double counting, that a
+   constructor is charged to SRAM and not VRAM, that a free returns the pool to
+   its baseline, and that builtin results keep their operands' pool. It skips
+   (and says so) on a build with no MLX backend linked.
 4. Mastery test: refusal — a GPU scope on a machine with no accelerator exits
    with a clear message rather than running on the host.
 5. Runtime test: an allocation exceeding the pool fails cleanly.
@@ -436,7 +571,7 @@ depends on the backend existing (Stage C).
 | 1 | Move or copy for transfers? | **Move.** Use-after-move is a checker error. Copy is an explicit, separately-named operation. |
 | 2 | Budget syntax | **Top-level pool declaration + optional per-function fraction.** See §4.1. |
 | 3 | Budget defaults | **A top-level declaration**, overridable at build time for a different card. |
-| 4 | Unbounded GPU tensors in a budgeted scope | **Reject.** |
+| 4 | Unbounded GPU tensors in a budgeted scope | **Reject** — as implemented, narrowed to values *created* in the scope; a tensor parameter is exempt (see Stage B item 4). |
 | 5 | GPU scope with no accelerator backend | **Refuse** — do not silently fall back. |
 
 The principle behind 4 and 5: **catch as much as possible at compile time.**
@@ -461,9 +596,8 @@ let vram = 25769803776;              // bytes of accelerator memory, deployment-
   it. A build flag (or environment override) changes it for a different card,
   so one source tree serves many deployments.
 - **The existing `@gpu(0.5)` fraction syntax finally gets a meaning** — a
-  fraction *of the declared pool*. It is currently parsed and discarded
-  (§3.4), so this uses syntax that already exists rather than adding new
-  syntax.
+  fraction *of the declared pool*. It was previously parsed and discarded
+  (§3.4); B2 gave it a meaning without adding new syntax.
 - **No per-function byte counts**, and therefore no new surface in function
   signatures.
 
@@ -487,7 +621,11 @@ additional checks become part of Stage B:
    genuinely dynamic case — an inference server whose batch size varies — the
    author must state a bound explicitly rather than get an implicit pass.
    A `tensor@gpu` whose size is unbounded would defeat the budget entirely,
-   so the default is rejection.
+   so the default is rejection. **As implemented (B4)**, "created in the scope"
+   is the boundary: a statically-unsized value *produced* in a budgeted scope is
+   counted as unknown rather than rejected outright, because a tensor
+   *parameter* has no static size and rejecting it would make every function
+   that takes a tensor uncompilable. See Stage B item 4.
 
 ---
 
@@ -508,11 +646,12 @@ additional checks become part of Stage B:
 ## 8. Summary
 
 Ionic's placement types are enforced by a sound checker that separates pools
-correctly but says nothing about **whether the values fit** — which is the
-constraint that matters on a server with a fixed-size accelerator pool. The
-runtime has one implicit pool, `tensor@gpu` is a type no operation can
-consume, and the transfers that express pool membership compile to nothing.
-The work is to make `@cpu`/`@gpu` mean SRAM/VRAM with distinct capacities, to
-let the type system enforce a budget on GPU-resident values, and to make
-transfers real moves between pools — with MLX retained as the unified-memory
-backend it already is, rather than as the definition of the semantics.
+correctly and, since Stage B, also checks whether a scope's values fit its
+declared budget. As of Stage C the runtime matches the types: a tensor handle
+carries its pool, each pool owns a stream, and a transfer is a real move that
+charges the destination pool — so `tensor@cpu` and `tensor@gpu` differ at run
+time and not only in the checker. MLX is retained as the unified-memory backend,
+the point in the design space where a transfer moves accounting but not bytes,
+rather than as the definition of the semantics. Remaining: the pooled-allocator
+enforcement of Stage D, the ambient-pool runtime stack, and the refusal path for
+a GPU scope on a machine with no accelerator.

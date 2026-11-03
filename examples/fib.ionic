@@ -1,0 +1,19 @@
+// The README's front-page example.
+//
+// Compile and run:
+//     ./ionic_new examples/fib.ionic -o /tmp/fib && /tmp/fib
+//
+// Prints fib(0) = 0 through fib(10) = 55.
+
+fn fibonacci(int64 n) -> int64 {
+    if (n <= 1) { return n; }
+    mut a = 0; mut b = 1; mut i = 2;
+    while (i <= n) { let c = a + b; a = b; b = c; i = i + 1; }
+    return b;
+}
+
+mut i = 0;
+while (i <= 10) {
+    println(format("fib({}) = {}", int64_to_str(i), int64_to_str(fibonacci(i))));
+    i = i + 1;
+}

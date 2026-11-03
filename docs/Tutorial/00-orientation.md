@@ -9,8 +9,9 @@ you have seen the whole pipeline run once.
 ## 1. What Ionic is
 
 Ionic is a **statically-typed, self-hosting** language that compiles directly to
-**native ARM64 Mach-O** object files (Linux ELF is also emitted). There is no LLVM
-in the runtime path — a legacy LLVM backend exists (`--llvm`) for debugging only.
+**native ARM64 Mach-O** object files (Linux ELF is also emitted). There is no
+LLVM in the runtime path, and no LLVM backend in the tree: `src/codegen/llvm.ionic`
+was deleted because no code path reached it.
 
 Two properties make it unusual and define everything else:
 
@@ -55,8 +56,10 @@ Note: each compile also writes an object next to the output as `<out>.o`, and
 **the object path is derived from the output name on purpose** (parallel-build
 safety). See `src/main.ionic` near `obj_path`.
 
-> The legacy `compiler.ionic` accepted `--run`; `src/main.ionic` does **not**. Any
-> doc snippet with `--run` should be read as "compile with `-o`, then execute".
+> `src/main.ionic` accepts only `-o <name>` and source files — there is no
+> `--run`. Any doc snippet with `--run` should be read as "compile with `-o`,
+> then execute". (A legacy `src/compiler.ionic` once supported it; that file is
+> gone, and `src/main.ionic` is now the only driver.)
 
 ---
 
@@ -117,9 +120,11 @@ If it fails, you have already learned the most important invariant in the repo.
 
 **00.4 — Discrepancy hunt.** Prove or disprove each of the *seven* "Known
 discrepancies" in the hub using the compiler. In particular: reproduce the
-`mean_f` off-by-one, the `println(names[0])` pointer, the missing `file_exists`,
-and the ignored `main` return value. Reference:
-`examples/mastery/00_discrepancies.ionic`.
+`mean_f` off-by-one, confirm that the `println(names[0])` pointer bug is *gone*
+(it was fixed by the type oracle — see unit 06 §8), check the missing
+`file_exists`, and prove the ignored `main` return value. Reference:
+`examples/mastery/00_discrepancies.ionic` and
+`examples/mastery/02_string_array_print.ionic`.
 
 ---
 

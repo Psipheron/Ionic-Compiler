@@ -40,15 +40,22 @@ fn main() -> int64 {
     // The slot is created by a transfer (the only way a tensor@gpu can exist
     // outside a GPU context) and written inside the block; the block's result
     // is then brought back to SRAM with an explicit .toCpu().
-    let dev = a.toGpu();
-    mut gpu_result = a.toGpu();
+    //
+    // A transfer MOVES its operand, so the two GPU values below cannot both
+    // come from `a`: `a.toGpu()` twice would be a use-after-move. The first
+    // slot transfers a fresh binding, the second transfers a temporary (which
+    // has no name to strand). Note also that `mlx_add(a, a)` above is fine —
+    // builtins borrow, so `a` is read twice and still owned afterwards.
+    let b = mlx_ones([2, 2], 0);
+    let dev = b.toGpu();                        // moves `b`
+    mut gpu_result = mlx_ones([2, 2], 0).toGpu();  // moves a temporary
     gpu {
         let gpu_sum = mlx_add(dev, dev);        // tensor@gpu
         let layered = layer_norm_gpu(gpu_sum);  // tensor@gpu
         gpu_result  = mlx_sum(layered, 0);      // tensor@gpu
     }
 
-    let back = gpu_result.toCpu();              // explicit transfer back to SRAM
+    let back = gpu_result.toCpu();              // moves `gpu_result` back to SRAM
     println(str_concat("gpu result: ", float64_to_str(mlx_item(back))));
 
     mlx_free(a);

@@ -25,6 +25,16 @@ while (!str_eq(cur_arg, "")) {
     } else if (str_eq(cur_arg, "--print-link")) {
         print_link = 1;
     } else {
+        // A named source file that is not there is a hard error. `file_read`
+        // returns an empty string for a missing path, so without this check the
+        // file was silently treated as an empty program: the compile "succeeded"
+        // and produced a stub object with no main body, and the only symptom was
+        // that the program did nothing. `ionic nosuch.ionic -o x` exited 0.
+        if (file_size(cur_arg) < 0) {
+            println(str_concat("ionic: cannot read '", str_concat(cur_arg, "'")));
+            println("  no such file, or not a regular file");
+            exit(1);
+        }
         let content = file_read(cur_arg);
         src_str = str_concat(src_str, str_concat(content, "\n"));
         src_path = cur_arg;

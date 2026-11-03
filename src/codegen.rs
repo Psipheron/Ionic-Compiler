@@ -285,6 +285,11 @@ impl Codegen {
         self.emit("declare i64  @ionic_file_write_binary(ptr, ptr)");
         self.emit("declare i64  @ionic_file_size(ptr)");
         self.emit("declare i64  @ionic_arr_reset(ptr)");
+        // Transfers between memory pools. Unlike the mlx_* surface these are not
+        // in the builtin signature table — Ionic spells them as methods
+        // (`.toGpu()` / `.toCpu()`), so nothing derives their declarations.
+        self.emit("declare ptr  @ionic_mlx_to_gpu(ptr)");
+        self.emit("declare ptr  @ionic_mlx_to_cpu(ptr)");
         self.emit("declare i64  @str_to_float64_bits(ptr)");  // float literal parser helper
         // IEEE-754 bit-pattern float helpers (used by the self-hosted optimizer
         // for compile-time float folding); defined unprefixed in the runtime C.
@@ -499,27 +504,40 @@ impl Codegen {
         // File I/O wrappers
         self.emit("@mode_r = private constant [2 x i8] c\"r\\00\"");
         self.emit("@mode_w = private constant [2 x i8] c\"w\\00\"");
-        self.emit("@empty_str = private constant [1 x i8] c\"\\00\"");
 
         // file_read(path) -> string (reads entire file via fseek/ftell/fread).
         // Must guard against fopen returning NULL: a missing file previously
-        // segfaulted in flockfile() via fseek(NULL). Mirror the C runtime's
-        // `if (!f) return "";` behaviour by returning a static empty string.
+        // segfaulted in flockfile() via fseek(NULL).
+        //
+        // Every return path allocates an owned string. Returning a rodata ""
+        // here would make "returned a TY_STR => the caller owns it" false on
+        // exactly the path a program is most likely to hit, so a release of the
+        // result would free a string literal. This definition must stay in
+        // step with `ionic_file_read` in src/ionic_model_runtime.c, or the
+        // self-hosted and Rust builds diverge. See docs/memory-model.md §11.1.
         self.emit("define ptr @ionic_file_read(ptr %path) {");
         self.emit("entry:");
         self.emit("  %fp = call ptr @fopen(ptr %path, ptr @mode_r)");
         self.emit("  %missing = icmp eq ptr %fp, null");
         self.emit("  br i1 %missing, label %no_file, label %read_file");
         self.emit("no_file:");
-        self.emit("  ret ptr @empty_str");
+        self.emit("  %empty = call ptr @malloc(i64 1)");
+        self.emit("  store i8 0, ptr %empty, align 1");
+        self.emit("  ret ptr %empty");
         self.emit("read_file:");
         self.emit("  call i32 @fseek(ptr %fp, i64 0, i32 2)");   // SEEK_END=2
         self.emit("  %fsz = call i64 @ftell(ptr %fp)");
         self.emit("  call i32 @fseek(ptr %fp, i64 0, i32 0)");   // SEEK_SET=0
-        self.emit("  %bufsz = add i64 %fsz, 1");
+        // ftell returns -1 on a non-seekable stream (a pipe, a tty). Without
+        // this clamp the size propagates as size_t(-1): malloc(0), then an
+        // out-of-bounds store one byte *before* the buffer. Same clamp as the
+        // C runtime.
+        self.emit("  %negative = icmp slt i64 %fsz, 0");
+        self.emit("  %size = select i1 %negative, i64 0, i64 %fsz");
+        self.emit("  %bufsz = add i64 %size, 1");
         self.emit("  %buf = call ptr @malloc(i64 %bufsz)");
-        self.emit("  call i64 @fread(ptr %buf, i64 1, i64 %fsz, ptr %fp)");
-        self.emit("  %end = getelementptr i8, ptr %buf, i64 %fsz");
+        self.emit("  call i64 @fread(ptr %buf, i64 1, i64 %size, ptr %fp)");
+        self.emit("  %end = getelementptr i8, ptr %buf, i64 %size");
         self.emit("  store i8 0, ptr %end, align 1");
         self.emit("  call i32 @fclose(ptr %fp)");
         self.emit("  ret ptr %buf");
@@ -1061,14 +1079,19 @@ impl Codegen {
 
             Expr::ToGpu(inner) => {
                 let (reg, _) = self.emit_expr(inner);
-                self.emit("  ; .toGpu() — Phase 1 stub");
-                (reg, Type::Tensor(Box::new(HwTarget::Gpu)))
+                let out = self.fresh_reg();
+                // A transfer is a real move between memory pools, not a retype:
+                // the runtime hands back a new handle charged to the
+                // accelerator pool. See ionic_mlx_to_gpu in the C runtime.
+                self.emit(&format!("  {} = call ptr @ionic_mlx_to_gpu(ptr {})", out, reg));
+                (out, Type::Tensor(Box::new(HwTarget::Gpu)))
             }
 
             Expr::ToCpu(inner) => {
                 let (reg, _) = self.emit_expr(inner);
-                self.emit("  ; .toCpu() — Phase 1 stub");
-                (reg, Type::Tensor(Box::new(HwTarget::Cpu)))
+                let out = self.fresh_reg();
+                self.emit(&format!("  {} = call ptr @ionic_mlx_to_cpu(ptr {})", out, reg));
+                (out, Type::Tensor(Box::new(HwTarget::Cpu)))
             }
         }
     }

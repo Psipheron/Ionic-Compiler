@@ -87,6 +87,14 @@
 (tensor_type
   ["@cpu" "@gpu"] @keyword.modifier)
 
+;; `model@cpu` / `model@gpu` are placement types too; without these the tag on a
+;; model type highlighted as nothing.
+(model_type
+  "model" @type.builtin)
+
+(model_type
+  ["@cpu" "@gpu"] @keyword.modifier)
+
 (named_type
   (identifier) @type)
 

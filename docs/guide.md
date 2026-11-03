@@ -255,7 +255,7 @@ let inputs_gpu = inputs.toGpu();
 // gpu block — compiler enforces:
 //   - only tensor@gpu variables and compute allowed
 //   - file I/O (print, file_read, file_write) is forbidden here
-//   - the live tensor@gpu values must fit the pool
+//   - the sized tensor@gpu values created here must fit the pool's budget
 gpu {
     let prediction = forward(inputs_gpu, weights);
 }
@@ -278,6 +278,45 @@ let vram = 25769803776;               // bytes of accelerator memory
 
 @gpu(0.5) fn half_gpu(...) -> ... { ... }   // at most half of the pool
 ```
+
+The pool declaration and the fraction are checked: a fraction must be in
+`(0, 1]`, and no fraction is allowed unless a `vram` pool is declared.
+
+The budget is enforced for what the checker can size statically. A tensor's
+size is `prod(shape) × dtype_bytes`, derived from the constructor (`mlx_zeros`,
+`mlx_ones`, `mlx_full`, `mlx_eye`, …) or inherited from a shape-preserving op
+(`mlx_add`, `mlx_matmul`, the elementwise family). Each sized `tensor@gpu` that
+a `@gpu fn` body or `gpu { }` block *creates* is added up, and the declaration
+that pushes the total past the scope's share of the pool is a compile error
+naming both byte counts.
+
+It is a necessary condition, not a proof: a value whose size is not statically
+knowable — a tensor *parameter*, or the result of an op the size pass does not
+model, such as `mlx_reshape` — is exempt rather than rejected. A parameter was
+already allocated and charged in the caller's scope, and rejecting it would make
+every function that takes a tensor uncompilable. So the check under-approximates
+(it can miss an over-budget program) but never falsely rejects one.
+
+Live-range analysis is also not done yet: the sum covers every sized binding in
+the scope, so a value that dies before the next allocation still counts.
+Runtime enforcement of what cannot be proven statically is `docs/plan-placement.md`
+stage D.
+
+A transfer is a **move**. After `let g = x.toGpu();` the binding `x` no longer
+owns a value, and reading it is a compile error that names the transfer and the
+line it happened on:
+
+```ionic
+let a = mlx_ones([2, 2], 0);
+let g = a.toGpu();          // moves `a`
+gpu { let s = mlx_add(g, g); }   // fine: builtins borrow, so `g` is read twice
+let back = g.toCpu();       // moves `g`
+// mlx_free(a);             // error: `a` was moved on line 2
+```
+
+Only transfers move; everything else borrows, which is why `mlx_add(g, g)` stays
+legal. Rebinding a name clears the mark, and transferring a temporary
+(`mlx_ones(...).toGpu()`) consumes no binding at all.
 
 On Apple silicon the two pools are physically the same memory, so a transfer
 does not copy — only the accounting changes. Everywhere else they are separate

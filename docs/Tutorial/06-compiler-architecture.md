@@ -2,8 +2,8 @@
 
 **Goal:** read the compiler as an engineer. Know each stage, its IR, its source
 file, and where to intervene to change behaviour. You will learn the two
-structure-of-arrays representations (tokens and AST) and the exact place the
-string-typing information is lost.
+structure-of-arrays representations (tokens and AST), and the type oracle that
+codegen consults instead of re-deriving types from emission order.
 
 ---
 
@@ -138,29 +138,48 @@ Read: `src/codegen/native.ionic` for `ncg_expr`, `local_find`, `local_get_str`,
 
 ---
 
-## 8. THE central codegen wrinkle: `ncg_last_ty`
+## 8. THE central codegen wrinkle: asking for a type instead of guessing
 
 Printing is overloaded by argument type at codegen. `ncg_last_ty` (0=int, 1=str,
-2=float, `native.ionic:31`) records the type of the most recently evaluated
-expression so `print`/`println` can pick `ionic_print*` vs `ionic_println*` vs
-the `_float64` variant.
+2=float, `native.ionic:31`) is a scratch global recording the type of the most
+recently evaluated expression; `ncg_call` reads it to pick `ionic_print*` vs
+`ionic_println*` vs the `_float64` variant.
 
-**The problem:** `ncg_last_ty` is not set on every expression path.
+**The problem with `ncg_last_ty`:** it is a *side effect of emission*. It is
+assigned along particular paths, so it is only ever as good as the last path
+actually taken. Using it to decide how to print means the decision depends on
+how the argument happened to be emitted rather than on what it is. Historically:
 
-- `ND_INDEX` (array element load, `native.ionic:1159`) computes the element and
-  returns, **without setting `ncg_last_ty`**. So `println(arr[i])` on a
-  `[string]` array falls through to the int64 path and prints the pointer.
-- `ND_LET` with a non-literal string initializer doesn't always record string.
-- Shadowing by name table (`local_find`/`local_get_str` history) caused further
-  misclassification.
+- `ND_INDEX` (array element load) emitted `ionic_array_get` and returned without
+  setting `ncg_last_ty`, so `println(arr[i])` on a `[string]` array fell through
+  to the int64 path and printed the pointer.
+- Parameters were never marked string at all — they never enter the checker's
+  symbol table — so `fn show(string s) { println(s); }` also printed a pointer.
+- `ND_LET` with a non-literal initializer did not always record string-ness.
 
-This one missing piece of information is simultaneously:
+The fix is `ncg_ty_of(n)` / `ncg_elem_ty(n)` — a **pure** oracle over the AST and
+the symbol tables (`native.ionic`, "The codegen type oracle" section). It emits
+nothing and mutates nothing, and answers in its own vocabulary
+(`OTY_INT`/`OTY_STR`/`OTY_FLOAT`/`OTY_OTHER`). `ncg_call` now asks it for the
+first argument of `print`/`println` instead of enumerating builtin names.
 
-1. the cause of the string-array print bug (unit 02 §3.2), and
-2. the **blocker** for the RC memory-model slice (unit 07 §5).
+Two details worth noting, because both were bugs found while writing it:
 
-It is the single highest-leverage fix in the compiler: a uniform static type
-oracle carried into codegen.
+- The oracle's codes are deliberately *not* named `TY_*`. The checker's `TY_*`
+  constants are imported into `native.ionic`, and a same-named redefinition
+  silently shadows them — `TY_STR` is 4 in the checker, so a local
+  `let TY_STR = 1` made every `elem == TY_STR` comparison false.
+- Element types of *locals and parameters* are recorded in per-slot columns
+  (`local_elem`, `local_is_str`) rather than read back from `sv_tys`, because a
+  local shadows the checker's symbol-table entry.
+
+`OTY_OTHER` means "not one of the three value classes". Callers must treat it as
+"unknown", not as int64 — that distinction is what keeps a future refcount pass
+from emitting a release on a value it cannot prove is managed.
+
+The oracle closes the string-print bugs (unit 02 §3.2), but it is only the first
+half of the RC prerequisite: it is deliberately conservative for nested-array
+elements and method calls. See unit 07 §5.
 
 ---
 
@@ -185,12 +204,22 @@ the parser produces (consult `ast.ionic`).
 turn `x += e` into an assignment.
 
 **06.4 — Optimizer proof.** Take a `for (i in 0..6)` loop with a constant body
-and show, via `--llvm` on the legacy path or by reasoning from `opt.ionic`, that
-it is unrolled. Then add a `break` and show it is not unrolled.
+and show, by reasoning from `src/opt/opt.ionic` (and by inspecting the emitted
+object), that it is unrolled. Then add a `break` and show it is not unrolled.
 
-**06.5 — The missing oracle.** Quote the `ND_INDEX` arm of `ncg_expr`
-(`native.ionic:~1159`) and point to the exact line where `ncg_last_ty` *should*
-be set for a string element but isn't. This is your capstone target.
+**06.5 — Trace the oracle.** Read `ncg_ty_of` in `src/codegen/native.ionic` and
+trace, for each of these, which branch answers and what it returns:
+
+  ```ionic
+  let names: [string] = ["a"];
+  println(names[0]);              // ND_INDEX through a local
+  println(load_names()[0]);       // ND_INDEX through a call
+  fn f(string s) { println(s); }  // ND_IDENT, a parameter
+  println(names);                 // ND_IDENT, an array (not a string)
+  ```
+
+Which of the four does the oracle answer *conservatively* (`OTY_OTHER`), and why
+is that the safe answer for a future refcount pass?
 
 **06.6 — Builtin registry.** Add a trivial no-op idea for a new builtin on paper:
 which two files (`checker.register_builtins`, `native.ionic` call lowering, plus
@@ -203,7 +232,9 @@ the C runtime) must change? Don't implement yet — that's the capstone.
 - [ ] You can draw the pipeline from argv to linked binary.
 - [ ] You can explain both SoA representations and why `ND_CONS` exists.
 - [ ] You can name all five optimizer passes and their entry functions.
-- [ ] You can state, precisely, what `ncg_last_ty` is and where it is wrong.
+- [ ] You can state, precisely, what `ncg_last_ty` is and why print dispatch no
+      longer depends on it.
+- [ ] You can explain why the oracle's `OTY_OTHER` must not be treated as int64.
 - [ ] You can point to the exact file:line for placement enforcement.
 
 ## [Next](07-memory-model-and-runtime.md)

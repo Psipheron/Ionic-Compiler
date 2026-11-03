@@ -101,11 +101,20 @@ module.exports = grammar({
     type: $ => choice(
       $.primitive_type,
       $.tensor_type,
+      $.model_type,
       $.array_type,
       $.named_type,
     ),
-    primitive_type: _ => choice('int64', 'float64', 'bool', 'string', 'void', 'model'),
+    primitive_type: _ => choice('int64', 'float64', 'bool', 'string', 'void'),
     tensor_type: $ => seq('tensor', optional(choice('@cpu', '@gpu'))),
+    // `model@cpu` / `model@gpu` are placement types, exactly like `tensor@cpu`
+    // — `parse_type()` in src/parser/parser.ionic reads the tag the same way
+    // for both keywords.
+    //
+    // `model` used to sit in primitive_type with no tag, so `model@cpu` parsed
+    // as `model` followed by a stray `@cpu` and the file reported an ERROR.
+    // That is why examples/mastery/04_placement_types.ionic never parsed.
+    model_type: $ => seq('model', optional(choice('@cpu', '@gpu'))),
     array_type: $ => seq('[', $.type, ']'),
     named_type: $ => $.identifier,
 

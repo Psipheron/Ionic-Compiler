@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use crate::ast::*;
 
 #[derive(Debug, Clone)]
@@ -15,6 +15,10 @@ pub struct SemanticAnalyzer {
     scopes: Vec<Scope>,
     functions: HashMap<String, (Vec<Type>, Type)>,
     structs: HashMap<String, Vec<(String, Type)>>,  // name -> [(field, type)]
+    /// Names that came from a builtin table rather than from the program.
+    /// Only builtins are pool-polymorphic; a user `@cpu fn(tensor@cpu)` stays
+    /// a promise about where the work happens.
+    builtins: HashSet<String>,
     in_gpu_block: bool,
     loop_depth: usize,
     errors: Vec<String>,
@@ -80,6 +84,13 @@ pub fn mlx_builtins(m: &mut HashMap<String, (Vec<Type>, Type)>) {
         m.insert(name.to_string(), (vec![t()], i.clone()));
     }
     m.insert("mlx_dim".to_string(), (vec![t(), i.clone()], i.clone()));
+    // Pool introspection (mirrors the checker's registration in
+    // src/semantic/checker.ionic): which pool a tensor lives in, and how many
+    // bytes each pool holds. Both return int64.
+    m.insert("mlx_pool".to_string(),     (vec![t()], i.clone()));
+    m.insert("mlx_pool_bytes".to_string(), (vec![i.clone()], i.clone()));
+    m.insert("mlx_pool_count".to_string(), (vec![], i.clone()));
+    m.insert("mlx_pools_unified".to_string(), (vec![], i.clone()));
     // Axis reductions
     for name in ["mlx_sum_axis", "mlx_mean_axis", "mlx_argmax"] {
         m.insert(name.to_string(), (vec![t(), i.clone(), i.clone()], t()));
@@ -173,6 +184,7 @@ impl SemanticAnalyzer {
             scopes: vec![Scope { vars: HashMap::new() }],
             functions: HashMap::new(),
             structs: HashMap::new(),
+            builtins: HashSet::new(),
             in_gpu_block: false,
             loop_depth: 0,
             errors: Vec::new(),
@@ -232,6 +244,11 @@ impl SemanticAnalyzer {
         sa.functions.insert("file_read_line".to_string(),  (vec![Type::Int64], Type::Str));
         sa.functions.insert("file_write_line".to_string(), (vec![Type::Int64, Type::Str], Type::Void));
         sa.functions.insert("file_eof".to_string(),        (vec![Type::Int64], Type::Bool));
+
+        // Everything registered so far came from a builtin table, so it is
+        // pool-polymorphic. User functions are inserted into `functions` later
+        // in analyze() and are deliberately absent from this set.
+        sa.builtins = sa.functions.keys().cloned().collect();
         sa
     }
 
@@ -537,6 +554,28 @@ impl SemanticAnalyzer {
                     }
                 }
                 if let Some((_, ret)) = self.functions.get(callee).cloned() {
+                    // Pool polymorphism: a builtin that produces a tensor
+                    // produces it in the pool its operands live in, so
+                    // `mlx_add(gpu_a, gpu_b)` is `tensor@gpu`. Without this the
+                    // result of every builtin was typed `tensor@cpu` and the
+                    // next step in a gpu chain was rejected — which is why this
+                    // bootstrap could not compile the pool-polymorphism
+                    // reference example. Mirrors finalize_pool_poly() in
+                    // src/semantic/checker.ionic.
+                    //
+                    // User functions are deliberately excluded: a
+                    // `@cpu fn(tensor@cpu x)` is a promise about where the work
+                    // happens, not a description of its operands.
+                    if self.builtins.contains(callee) {
+                        if matches!(ret, Type::Tensor(_)) {
+                            if let Some(hw) = arg_types.iter().find_map(|t| match t {
+                                Type::Tensor(hw) => Some(hw.clone()),
+                                _ => None,
+                            }) {
+                                return Type::Tensor(hw);
+                            }
+                        }
+                    }
                     ret
                 } else {
                     // Unregistered names may be extern C symbols linked at

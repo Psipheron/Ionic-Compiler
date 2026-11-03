@@ -42,3 +42,7 @@
 
 # After publishing one model, no more
 models/
+
+# Default output name when -o is omitted
+/a.out
+/a.out.o
