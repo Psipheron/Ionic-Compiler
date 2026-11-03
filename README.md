@@ -600,3 +600,16 @@ only ever see `ionic_new`.
 ## Contributing
 PR's are always welcome.
 If you want a in-depth intro to the compiler and it's intricacies, look at the [Tutorial](docs/Tutorial/README.md)
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+**If you ship a program built with Ionic:** the runtime
+(`src/ionic_model_runtime.c`) is compiled into your binary, so MIT's notice
+requirement reaches your distributed executable. Include Ionic's copyright and
+permission notice with it — a `NOTICE`/`LICENSES` file or an "open source
+licenses" screen is enough. Programs you write in Ionic are yours; the license
+applies to the compiler and runtime, not to your source.

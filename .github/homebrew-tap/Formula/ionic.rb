@@ -30,6 +30,9 @@ class Ionic < Formula
     bin.install_symlink libexec/"ionic"
 
     doc.install "README.md"
+    # The formula declares `license "MIT"`; Homebrew expects the notice to be
+    # installed alongside the software it covers.
+    doc.install "LICENSE"
   end
 
   def caveats

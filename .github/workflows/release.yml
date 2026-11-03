@@ -22,14 +22,14 @@ jobs:
       - name: Build ionic_new from split sources
         run: ./build.sh
 
-      # Self-hosting verify (./build.sh --verify-self-hosting, which runs
-      # ./build.sh against ionic_new then rebuilds and cmp -s the result)
-      # is currently skipped: the self-hosted rebuild hangs in sc_program's
-      # top-stmt traversal of checker.ionic (a known infinite-loop bug
-      # tracked for follow-up). The build step on its own is enough to
-      # produce a working ./ionic_new tarball — releases ship that binary,
-      # and end users use it to compile their own programs (the path that
-      # works today).
+      - name: Verify self-hosting (object files byte-identical)
+        run: ./build.sh --verify-self-hosting
+
+      # Was previously skipped with a note that the self-hosted rebuild "hangs
+      # in sc_program's top-stmt traversal". It does not: the check completes in
+      # ~2 s and the object files match. Re-enabling it means a release cannot
+      # ship a compiler that no longer reproduces itself, which is the property
+      # the whole self-hosting claim rests on.
 
       - name: Package tarball
         run: |
@@ -40,6 +40,10 @@ jobs:
 
           cp ionic_new "${STAGING}/ionic"
           cp README.md "${STAGING}/"
+          # MIT requires the copyright + permission notice to travel with every
+          # copy. The tarball ships the runtime source that gets compiled into
+          # users' programs, so the notice has to be in the tarball itself.
+          cp LICENSE "${STAGING}/"
 
           # Ship the runtime C source + the bundled standard library so the
           # installed `ionic` can compile user programs from any directory.
