@@ -221,6 +221,38 @@ expect_ok "unsized results are exempt, not rejected" \
 }
 fn main() -> int64 { return 0; }'
 
+# Reassignment is the second way to create a GPU-resident value. Only `let` was
+# charged, so a tensor too big for the pool could be assigned into an existing
+# binding and the check never ran:
+#
+#     mut slot = mlx_zeros([1024, 1024], 0).toGpu();
+#     slot = mlx_zeros([20000, 20000], 0).toGpu();   // 1.6 GiB, pool is 1 GiB
+#
+# That compiled. This pins the fix.
+expect_reject "an over-budget tensor reassigned into a slot is rejected" "does not fit the accelerator pool" \
+'let vram = 1073741824;
+@gpu(1.0) fn alloc() -> int64 {
+    mut slot = mlx_zeros([1024, 1024], 0).toGpu();
+    slot = mlx_zeros([20000, 20000], 0).toGpu();
+    return 1;
+}
+fn main() -> int64 { return 0; }'
+
+# ...and the fix must not double-count a reused slot. Each assignment releases
+# the previous value, so five assignments of 256 MiB through one binding peak at
+# 256 MiB, not 1.25 GiB, and must stay accepted.
+expect_ok "a reused slot releases the old value before recharging" \
+'let vram = 1073741824;
+@gpu(1.0) fn alloc() -> int64 {
+    mut slot = mlx_zeros([8192, 8192], 0).toGpu();
+    slot = mlx_zeros([8192, 8192], 0).toGpu();
+    slot = mlx_zeros([8192, 8192], 0).toGpu();
+    slot = mlx_zeros([8192, 8192], 0).toGpu();
+    slot = mlx_zeros([8192, 8192], 0).toGpu();
+    return 1;
+}
+fn main() -> int64 { return 0; }'
+
 # No pool declared means no budget in force: a program that never restricts a
 # GPU scope is not asked to declare one.
 expect_ok "no pool means no budget" \

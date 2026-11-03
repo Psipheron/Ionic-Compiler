@@ -1892,6 +1892,24 @@ fn sc_stmt(int64 node) -> int64 {
                                               str_concat(", value is ", ty_name(val_ty, val_sv_val))),
                                    tensor_convert_hint(val_ty, var_ty)));
                 }
+                // Reassignment is a second way to create a GPU-resident value, and
+                // it was not budget-checked at all: `let` was charged, `x = ...`
+                // was not, so
+                //
+                //     mut slot = mlx_zeros([1024, 1024], 0).toGpu();
+                //     slot = mlx_zeros([20000, 20000], 0).toGpu();   // 1.6 GiB
+                //
+                // compiled against a 1 GiB pool. Replacing the value releases the
+                // old one's bytes, so the accounting is: subtract what the name
+                // currently holds, then charge the new value. Charging without the
+                // subtraction would count a reused slot once per assignment.
+                if (var_ty == TY_TENSOR_GPU && sc_budget_bytes >= 0) {
+                    let old_b = sv_lookup_bytes(tname);
+                    if (old_b > 0) { sc_used_bytes = sc_used_bytes - old_b; }
+                    budget_charge(tname, val_nd, node);
+                } else {
+                    sv_set_bytes(tname, expr_bytes(val_nd));
+                }
             }
         }
         if (tk == ND_FIELD_ACCESS) {
