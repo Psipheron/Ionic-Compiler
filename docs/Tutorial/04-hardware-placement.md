@@ -1,7 +1,7 @@
 # 04 — Hardware Placement
 
-**Goal:** understand Ionic's defining feature — device placement encoded in the
-type system — both as a user and as the checker implements it.
+**Goal:** understand Ionic's defining feature — memory-pool placement encoded
+in the type system — both as a user and as the checker implements it.
 
 ---
 
@@ -29,7 +29,11 @@ let d = h.toGpu();     // tensor@cpu → tensor@gpu   [ND_TO_GPU]
 let back = d.toCpu();  // tensor@gpu → tensor@cpu   [ND_TO_CPU]
 ```
 
-The transfer is the *only* way to change a tensor's placement.
+The transfer is the *only* way to change a tensor's placement, and it is a
+**move**: the source is consumed, so `h` is dead after `h.toGpu()` and using
+it is an error. That is what makes a pool's occupancy meaningful — a value
+occupies exactly one pool at a time, which is what lets the compiler check
+that the GPU pool is not oversubscribed.
 
 Typing rules (`docs/homework_solutions.md` HW 3.2):
 
@@ -90,23 +94,40 @@ Also rejected: an `@gpu` function returning a `tensor@cpu`, or nesting a
 ## 5. Function-level GPU fractions
 
 ```ionic
-@gpu(0.5) fn partial(...) -> ... { ... }   // request 50% of the GPU
+@gpu(0.5) fn partial(...) -> ... { ... }   // at most 50% of the accelerator pool
 ```
+
+The pool size itself is a **deployment** fact — which card is installed — so it
+is declared once, at top level, and every `@gpu` scope inherits it:
+
+```ionic
+let vram = 25769803776;                 // bytes of accelerator memory
+```
+
+The fraction is a share *of that pool*, not an absolute byte count, so the same
+source tree serves a 16 GB card and an 80 GB card.
 
 ---
 
 ## 6. Reality check: is it wired to hardware?
 
 In the shipped tree, the placement rules are a **compile-time discipline**. The
-`@gpu` tags, `gpu { }` blocks, and transfers are enforced by the checker; the
-actual GPU work happens through the ML backends (`load_model`,
-`model_forward`, `gguf_generate`, `piper_forward`) which run on Metal/CoreML
-underneath. Tensor arithmetic in pure Ionic source is not itself lowered to GPU
-kernels. Knowing this boundary is part of mastery: you can rely on the checker to
-*keep devices separate*, but you should not assume arbitrary `tensor@gpu` math
-executes on the GPU.
+`@gpu` tags, `gpu { }` blocks, transfers, and pool budgets are enforced by the
+checker; the actual GPU work happens through the backends (`load_model`,
+`model_forward`, `piper_forward`, `mlx_*`). Tensor arithmetic in pure Ionic
+source is not itself lowered to GPU kernels. Knowing this boundary is part of
+mastery: you can rely on the checker to *keep pools separate* and to *keep the
+GPU pool within budget*, but you should not assume arbitrary `tensor@gpu` math
+executes on an accelerator.
 
-Read: `src/ionic_model_runtime.c` (the model/gguf/onnx/piper entry points) and
+`@cpu` and `@gpu` name **memory pools** — SRAM and VRAM — not devices. On
+Apple silicon the two are physically the same memory, so a transfer there does
+not copy and only the accounting changes; everywhere else they are separate and
+a transfer really does move bytes. MLX is the backend that ships today and
+provides the unified-memory case; a portable or hardware backend implements
+the same interface.
+
+Read: `src/ionic_model_runtime.c` (the model/onnx/piper entry points) and
 `src/semantic/checker.ionic` (the placement checks) to see both sides.
 
 ---

@@ -240,24 +240,28 @@ Full API: [stdlib.md](stdlib.md)
 
 ## 10. Hardware placement
 
-Ionic tracks which device a tensor lives on at compile time.
+Ionic tracks which **memory pool** a tensor lives in, at compile time.
+`@cpu` is host memory (SRAM), `@gpu` is accelerator memory (VRAM), and the two
+have different capacities.
 
 ```ionic
 let weights: tensor@gpu = load_model("model.onnx").forward(inputs);
 let inputs:  tensor@cpu = ...;
 
-// Move data across devices explicitly
+// Move data between pools explicitly. This consumes `inputs` — using it
+// afterwards is an error, because a value occupies exactly one pool.
 let inputs_gpu = inputs.toGpu();
 
 // gpu block — compiler enforces:
 //   - only tensor@gpu variables and compute allowed
 //   - file I/O (print, file_read, file_write) is forbidden here
+//   - the live tensor@gpu values must fit the pool
 gpu {
     let prediction = forward(inputs_gpu, weights);
 }
 ```
 
-Annotate functions with their target device:
+Annotate functions with the pool they run in:
 
 ```ionic
 @gpu fn train_step(tensor@gpu x, tensor@gpu w) -> tensor@gpu {
@@ -268,30 +272,22 @@ Annotate functions with their target device:
     return ...;
 }
 
-@gpu(0.5) fn half_gpu(...) -> ... { ... }   // use 50% of GPU
+// At most a fraction of the accelerator pool. The pool size itself is a
+// deployment fact, declared once:
+let vram = 25769803776;               // bytes of accelerator memory
+
+@gpu(0.5) fn half_gpu(...) -> ... { ... }   // at most half of the pool
 ```
+
+On Apple silicon the two pools are physically the same memory, so a transfer
+does not copy — only the accounting changes. Everywhere else they are separate
+and a transfer really does move bytes.
 
 ---
 
 ## 11. ML model inference
 
-### GGUF (LLM text generation)
-
-```ionic
-fn main() -> int64 {
-    let mdl = load_model("/path/to/model.gguf");
-    gguf_set_temp(mdl, 0.7);
-    gguf_set_top_p(mdl, 0.9);
-    let reply = gguf_generate(mdl, "Explain recursion briefly.", 256);
-    print(reply);
-    model_free(mdl);
-    return 0;
-}
-```
-
-Supports any GGUF model — including Ollama's extension-less blob files. The runtime detects the format from the file's magic bytes and routes to llama.cpp with full Metal GPU acceleration.
-
-### ONNX (general inference + Piper TTS)
+### ONNX (the only model backend)
 
 ```ionic
 fn main() -> int64 {
@@ -299,12 +295,39 @@ fn main() -> int64 {
     let phonemes = [1, 20, 61, 24, 27, 100, 3, 35, 62, 122, 24, 17, 2];
     let samples = piper_forward(mdl, phonemes, 0.667, 1.0, 0.8);
     write_wav("/tmp/out.wav", samples, 0, 16000);
-    model_free(mdl);
+    // no model_free: load_model is RAII and is freed at scope exit. An
+    // explicit model_free(mdl) would also be correct — it suppresses the
+    // implicit destructor, so exactly one free runs either way.
     return 0;
 }
 ```
 
-ONNX models run via ONNX Runtime with CoreML execution provider on Apple Silicon.
+ONNX models run via ONNX Runtime, with the CoreML execution provider enabled on
+Apple Silicon.
+
+### Why not GGUF
+
+GGUF support shipped briefly on top of llama.cpp and was removed. llama.cpp's
+only placement control is `n_gpu_layers` — one integer, set at load time, that
+says how many transformer layers live on the GPU. The whole model moves as a
+unit, and nothing above the llama.cpp API can ask where an individual tensor
+lives. That cannot back `tensor@cpu` / `tensor@gpu`, which the type checker
+enforces per value. Shipping GGUF behind those types would have meant the
+placement guarantee held for ONNX and MLX but was fiction for the format most
+people actually run.
+
+`.gguf` is still recognised so the failure is explicit rather than "unknown
+format":
+
+```
+[ionic] load_model: GGUF inference was removed with llama.cpp;
+        export the model to ONNX instead
+```
+
+Reinstating it means going below llama.cpp to ggml, where a tensor's buffer type
+is reachable per tensor (`ggml_tensor->buffer`, `tensor_buft_overrides`). That is
+the same shape of control ORT's `OrtIoBinding` and MLX's per-stream arrays give,
+which is why those two are the reference implementations for placement.
 
 ### MLX (Apple-silicon tensor runtime)
 
@@ -336,8 +359,10 @@ fn main() -> int64 {
 Key points:
 
 - **Handles are `tensor@cpu`**, not `tensor@gpu`. They are host-side handles to a
-  device graph, so they are usable anywhere; `.toGpu()` is a no-op transfer that
-  only exists to enter a `gpu { }` context.
+  device graph, so they are usable anywhere. On Apple silicon the CPU and GPU
+  share physical memory, so `.toGpu()` does not copy — the bytes stay put and
+  only the accounting pool changes. That is the *unified memory* case: one
+  implementation of the pool model, not the model itself.
 - **Nothing computes until you ask.** Ops build a lazy graph; `mlx_eval` runs it,
   and `mlx_to_array` / `mlx_item` evaluate implicitly. Chain many ops and
   evaluate once.
@@ -372,12 +397,11 @@ Backends are linked per-program, only when the source references them — a plai
 `ionic hello.ionic` links none of them:
 
 - `mlx_*` → `mlx-c` (Apple silicon only)
-- `gguf_*` / `load_model` → llama.cpp
 - `piper_forward` / `model_forward` / `load_model` → ONNX Runtime
 
 On a platform without the library, the program still **compiles and links**: the
 runtime exports every symbol and reports "not compiled in" at runtime. That
-keeps one source tree portable — MLX on Apple silicon, GGUF/llama.cpp elsewhere.
+keeps one source tree portable — MLX on Apple silicon, ONNX Runtime everywhere.
 
 Overrides:
 
@@ -389,7 +413,78 @@ IONIC_MLX_LIB=/opt/mlx/lib ionic model.ionic -o model   # non-Homebrew prefix
 
 ---
 
-## 12. File I/O
+## 12. Local inference server
+
+The runtime also ships the two pieces needed to put a model behind a socket:
+a BPE tokenizer that reads a HuggingFace `tokenizer.json`, and a minimal
+blocking HTTP/1.1 server. Together they turn token ids into text and back.
+
+### BPE tokenizer
+
+```ionic
+let n = bpe_load(str_concat(model_dir, "/tokenizer.json"));   // vocab size, or -1
+print(int64_to_str(n));                                        // 32000
+
+let ids = [0];
+arr_reset(ids);                       // empty the array
+bpe_encode("The capital of France is", ids, 1);   // 1 = prepend BOS
+print(bpe_decode(ids));               // " The capital of France is"
+```
+
+- `bpe_load(path)` — parse `tokenizer.json` and build the vocab hash table.
+  Returns the vocabulary size, or `-1` on failure. Idempotent: loading a second
+  file releases the first.
+- `bpe_encode(text, ids, add_bos)` — append ids to an existing `[int64]` array
+  (it is cleared first). Returns the token count.
+- `bpe_decode(ids)` — the inverse, as a fresh string.
+- `bpe_bos()` / `bpe_eos()` — the special-token ids, resolved from the vocab.
+
+Encoding follows the HF `tokenizers` reference for this model family:
+normalize (`' '` → `▁`), greedy longest-match seeding, lowest-rank pair merging,
+then `<0xNN>` byte fallback for anything still unknown. Ids match HF exactly on
+TinyLlama-1.1B; `testdata/tokenizer_mini.json` is a small hand-built fixture
+that CI uses to exercise the same code path without a model download.
+
+### HTTP server
+
+```ionic
+fn main() -> int64 {
+    let fd = http_serve(8080);          // listener, or -1
+    if (fd < 0) { return 1; }
+
+    while (true) {
+        let req = http_accept(fd);      // *request* handle, or -1
+        if (req >= 0) {
+            let method = http_method(req);        // "GET", "POST", ...
+            let path   = http_path(req);          // query string already stripped
+            let body   = http_req_body(req);      // "" when there is none
+
+            if (str_eq(path, "/health")) {
+                http_respond(req, 200, "text/plain", "ok");
+            } else {
+                http_respond(req, 404, "application/json", "{\"error\":\"not found\"}");
+            }
+            http_req_done(req);         // close the connection, free the request
+        }
+    }
+    http_close(fd);
+    return 0;
+}
+```
+
+One handle owns the whole exchange: `http_accept` returns a request that holds
+its own connection fd, and `http_respond` / `http_req_done` take that same
+handle back. There is no way to mix up a socket fd with a request pointer.
+
+Every response carries `Connection: close`; `http_req_done` closes the socket.
+The loop is single-request-at-a-time by design — this is enough to serve a
+model behind `/v1/chat/completions` for a proof of concept, not a production
+web server. A request that never arrives (client connects and hangs up) makes
+`http_accept` return `-1` without disturbing later accepts.
+
+---
+
+## 13. File I/O
 
 ```ionic
 // Read / write
@@ -397,14 +492,19 @@ let content = file_read("data.txt");
 file_write("out.txt", content);
 
 // Check existence
-if (file_exists("config.json")) {
+if (file_size("config.json") >= 0) {
     let cfg = file_read("config.json");
 }
 ```
 
+`file_size` returns `-1` for a missing path or a non-regular file and the byte
+count otherwise, so `>= 0` is the existence test. It costs one `stat` and
+allocates nothing; `file_read` mallocs the whole file and Ionic strings are
+never freed, which is why existence checks should not use it.
+
 ---
 
-## 13. Interactive input
+## 14. Interactive input
 
 ```ionic
 import std.io.*;
@@ -419,12 +519,12 @@ fn main() -> int64 {
 
 ---
 
-## 14. Command-line arguments
+## 15. Command-line arguments
 
 ```ionic
 fn main() -> int64 {
     let path = get_arg(0);    // first argument after the binary name
-    if (file_exists(path)) {
+    if (file_size(path) >= 0) {
         let data = file_read(path);
         print(data);
     } else {
@@ -436,7 +536,7 @@ fn main() -> int64 {
 
 ---
 
-## 15. Complete example — word frequency counter
+## 16. Complete example — word frequency counter
 
 ```ionic
 import std.str.*;
@@ -493,7 +593,7 @@ if (name == "ionic") { ... }          // type error
 
 **`model` is a keyword** — use a different binding name:
 ```ionic
-let mdl = load_model("model.gguf");   // correct
+let mdl = load_model("model.onnx");   // correct
 let model = load_model("...");         // parse error — `model` is reserved
 ```
 
