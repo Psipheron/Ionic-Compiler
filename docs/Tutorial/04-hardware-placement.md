@@ -159,6 +159,19 @@ yet: the sum covers every sized binding in the scope, so a value that dies befor
 the next allocation still counts. The check therefore under-approximates — it can
 miss an over-budget program, but it never falsely rejects one.
 
+The exemption is **reported**, so it is not the same thing as a pass. When the
+scope closes with values the checker could not size, it prints a warning naming
+the first one and what it could actually size:
+
+```
+[warn] 5:40: 1 GPU value in this scope could not be sized statically, so the budget does not account for it (the 8388608 bytes it could size are only the known total, of a 1073741824 byte budget) — give it a literal shape, or check mlx_pool_bytes() at run time
+```
+
+The build still succeeds — an unbounded value is not provably wrong, and turning
+it into an error would reject every function that takes a tensor. But "this fits"
+and "this was never measured" are now different answers, which a silent pass
+could not express.
+
 ```ionic
 let vram = 25769803776;
 @gpu(0.25) fn helper(tensor@gpu x) -> tensor@gpu { return x; }   // ok
@@ -251,6 +264,16 @@ and remove the use of the moved binding, but transfer the same value twice
 (`let g = a.toGpu(); let h = a.toGpu();`). Confirm the error is reported on the
 *second* transfer, naming the first. (Hint: `sc_move_binding` is idempotent so the
 original provenance survives; `sc_check_not_moved` does the reporting.)
+
+**04.10 — Read the exemption warning.** Write an `@gpu(0.01)` function under a
+1 GiB pool whose only GPU local is `mlx_zeros([n, n], 0).toGpu()` for a parameter
+`int64 n`. Confirm three things: it compiles (exit status 0), it prints a
+`[warn]` naming that line, and the warning says *nothing in this scope could be
+sized*. Now add one sized local — `mlx_zeros([1024, 1024], 0).toGpu()` — and
+confirm the warning text changes to report the 4 MiB it *could* size, while still
+naming the runtime-sized value. Then explain why this is a warning rather than an
+error, and what would go wrong if `@gpu` scopes rejected every value they could
+not size.
 
 ---
 

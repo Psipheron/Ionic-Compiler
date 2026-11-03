@@ -390,9 +390,9 @@ lands is archaeology.
    `docs/guide.md` / `docs/Tutorial/04-hardware-placement.md` were corrected to
    say so.
 
-   Regression coverage: `scripts/placement_check.sh` (28 cases across the B2,
-   B3/B4 and B5 sections, all static and accelerator-free, run in both `ci.yml`
-   and the Linux `elf` job in `multitarget.yml`) and
+   Regression coverage: `scripts/placement_check.sh` (35 assertions across the
+   B2, B3/B4 and B5 sections, all static and accelerator-free, run in both
+   `ci.yml` and the Linux `elf` job in `multitarget.yml`) and
    `examples/mastery/04_pool_budget.ionic`.
 
    **Parser work this implied — none.** The `@gpu(...)` form already existed:
@@ -550,7 +550,7 @@ can miss an over-budget program.
 |---|---|---|
 | **No live-range analysis.** A binding keeps its charge for the whole scope, even after `mlx_free` or after it is provably dead. | Four 256 MiB values plus a freed fifth are rejected: 5 x 256 MiB is counted, though only 4 are live. | Over-approximates the peak, so it can reject a program that would fit. Conservative direction, but it is the *opposite* error from the ones below. |
 | **Interprocedural peak is not modelled.** `let n = inner()` where the caller already holds 1 GiB is not charged for what `inner` allocates. | A `@gpu` fn holding 1 GiB calls another that allocates 1 GiB; both compile, and the real peak is 2 GiB against a 1 GiB pool. | Under-approximates: the classic over-budget-at-3am case, still reachable. |
-| **Runtime-sized shapes are silently unbounded.** A shape element that is not an integer literal makes the size unknown, and unknown values are exempt (decision 4, narrowed). | `mlx_zeros([n, n], 0).toGpu()` in a budgeted scope compiles with no diagnostic, for any `n`. | Under-approximates. `sc_used_unknown` counts these but nothing reports the count. |
+| **Runtime-sized shapes are unbounded, and only warned about.** A shape element that is not an integer literal makes the size unknown, and unknown values are exempt (decision 4, narrowed). | `mlx_zeros([n, n], 0).toGpu()` in a budgeted scope still compiles for any `n`, but now prints a `[warn]` naming the value and the scope's known total. | Under-approximates. The exemption is *reported* rather than counted as a rejection, so "this fits" and "this was never sized" are distinguishable — but nothing enforces it. |
 | **The declared `vram` is never checked against the device.** The pool size is a compile-time literal. | Nothing compares it to the backend's real memory. | A program can declare more VRAM than exists and be "correct". |
 | **`gpu { }` inside `@gpu(f)` resets the running total** instead of adding to it. | Noted at `budget_begin(0)` in `checker.ionic`; the nested block checks its own locals against the whole pool. | Under-approximates for nested scopes. |
 
@@ -562,11 +562,14 @@ catches the rest at run time.
 
 Ordering, if this is to become the goal it claims to be:
 
-1. **Report unknown sizes instead of exempting them silently.** Cheapest and
-   largest honesty gain: `sc_used_unknown` is already counted, so the diagnostic
-   is a `println` away. "3 GPU values in this scope have no static size; the
-   budget cannot bound them" turns a silent pass into a warning the user can
-   act on.
+1. ✅ **Report unknown sizes instead of exempting them silently.** Done, in
+   `budget_end()` (`src/semantic/checker.ionic`): when a budgeted scope closes,
+   it emits a `[warn]` naming the first un-sized value, how many there were, and
+   what the checker could actually size against the budget. It is a warning, not
+   an error — an unbounded value is not provably wrong, so the exemption stays an
+   exemption, it is just no longer invisible. `sc_unknown_count` /
+   `sc_unknown_first` are reset per scope and saved/restored around a nested
+   `gpu { }`, so one value produces one warning.
 2. **Stage D's allocator**, so the program that gets past the checker still
    fails loudly at the allocation rather than at an OOM hours later. This is
    the backstop the whole design assumes and that does not exist yet.

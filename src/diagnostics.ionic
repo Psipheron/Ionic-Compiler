@@ -212,10 +212,36 @@ fn diag_spaces(int64 n) -> string {
 
 // Print a caret diagnostic:
 //   path:line:col:                      (clickable jump link)
-//   [error] line:col: message
-//       in fn foo() -> int64 {          (if error is inside a fn body)
+//   [warn] line:col: message
+//       in fn foo() -> int64 {          (if inside a fn body)
 //       source line text
 //       ^
+//
+// Same layout as print_span, but tagged "[warn]" and coloured yellow.
+//
+// A warning reports something the compiler could not verify rather than
+// something it rejects, so it must not be confused with an error at a glance,
+// and it must not affect the exit status. Everything positional — the
+// clickable link, the enclosing-fn header, the source line, the caret — is
+// identical, because the reason to read it is the same: find the code.
+fn print_span_warn(int64 line, int64 col, string msg) -> int64 {
+    color_autodetect();
+    print_jump_hint(line, col);
+    let tag   = color_wrap(ANSI_BOLD_YELLOW, "[warn]");
+    let loc   = color_wrap(ANSI_CYAN, str_concat(int64_to_str(line), str_concat(":", str_concat(int64_to_str(col), ":"))));
+    println(str_concat(str_concat(tag, " "), str_concat(loc, str_concat(" ", msg))));
+    if (str_len(g_source) > 0) {
+        let lstart = diag_line_start(g_source, line);
+        let text   = diag_extract_line(g_source, lstart);
+        if (sc_ctx_fn_line > 0 && line > sc_ctx_fn_line && str_len(sc_ctx_fn_label) > 0) {
+            println(color_wrap(ANSI_DIM, str_concat("    in ", sc_ctx_fn_label)));
+        }
+        println(str_concat("    ", color_wrap(ANSI_BOLD_YELLOW, text)));
+        println(str_concat(diag_spaces(col + 3), color_wrap(ANSI_BOLD_YELLOW, "^")));
+    }
+    return 0;
+}
+
 fn print_span(int64 line, int64 col, string msg) -> int64 {
     color_autodetect();
     // Emit the clickable jump link first so editors can pick it up even if

@@ -592,6 +592,14 @@ fn hw_ann_name(int64 hw_node) -> string {
     return "";
 }
 
+// Emit a warning at `node`'s position. Not an error: sc_error_count is
+// untouched, so a program that only warns still compiles, links, and runs.
+fn sc_warn_at(int64 node, string msg) -> int64 {
+    if (node == 0) { println(str_concat("[warn] ", msg)); return 0; }
+    print_span_warn(nd_line[node], nd_col[node], msg);
+    return 0;
+}
+
 // ── Memory-pool budget (Stage B2) ────────────────────────────────────────────
 //
 // `@cpu` / `@gpu` name *memory pools*, not devices: SRAM (host memory) and VRAM
@@ -854,14 +862,21 @@ fn expr_bytes(int64 node) -> int64 {
 //     rejection.
 mut sc_budget_bytes  = -1;   // -1 = no budget in force
 mut sc_used_bytes    = 0;
-mut sc_used_unknown  = 0;    // count of un-sized GPU locals (informational)
+// Exempted GPU locals. `sc_unknown_count` is how many the scope produced;
+// `sc_unknown_first` is the node of the first one, so the warning can point at
+// a concrete line instead of making the user hunt for every GPU value in the
+// scope. Only the first is remembered: one warning naming one real line is
+// actionable, and the fix is the same for all of them.
+mut sc_unknown_count = 0;
+mut sc_unknown_first = 0;
 
 // Start a budget for a scope. Returns nothing; sc_budget_bytes/sc_used_bytes are
 // saved and restored by the caller.
 fn budget_begin(int64 hw_node) -> int64 {
-    sc_budget_bytes = scope_budget_bytes(hw_node);
-    sc_used_bytes   = 0;
-    sc_used_unknown = 0;
+    sc_budget_bytes  = scope_budget_bytes(hw_node);
+    sc_used_bytes    = 0;
+    sc_unknown_count = 0;
+    sc_unknown_first = 0;
     return 0;
 }
 
@@ -871,7 +886,8 @@ fn budget_charge(string name, int64 init_nd, int64 node) -> int64 {
     if (sc_budget_bytes < 0) { return 0; }
     let b = expr_bytes(init_nd);
     if (b < 0) {
-        sc_used_unknown = sc_used_unknown + 1;
+        sc_unknown_count = sc_unknown_count + 1;
+        if (sc_unknown_first == 0) { sc_unknown_first = node; }
         return 0;
     }
     sv_set_bytes(name, b);
@@ -883,6 +899,47 @@ fn budget_charge(string name, int64 init_nd, int64 node) -> int64 {
                                   str_concat(int64_to_str(sc_used_bytes), " bytes live in this scope")),
                        str_concat(str_concat(", budget is ", int64_to_str(sc_budget_bytes)),
                                   " (raise the `vram` pool or narrow the scope's fraction)")));
+    }
+    return 0;
+}
+
+// Report the values a budgeted scope could not size, then the caller restores
+// the enclosing scope's budget.
+//
+// The budget check exempts a value whose size it cannot determine, and that
+// exemption used to be invisible: `mlx_zeros([n, n], 0).toGpu()` in a budgeted
+// scope compiled with no diagnostic, so "this fits" and "this was never
+// measured" looked identical. A warning — not an error — makes the difference
+// visible while keeping the compile succeeding, because an unbounded value is
+// not provably wrong.
+//
+// Silent when the scope had a budget that covers everything and nothing was
+// exempted, so a clean program stays clean.
+fn budget_end() -> int64 {
+    if (sc_budget_bytes >= 0 && sc_unknown_count > 0) {
+        // "1 GPU value(s)" reads like an unrendered template, so the plural and
+        // singular forms are written out. The language has no conditional
+        // expression, hence the assignment-then-override. The pronoun moves with
+        // the count for the same reason.
+        mut head = str_concat(int64_to_str(sc_unknown_count), " GPU values in this scope could not be sized statically");
+        mut pron = "them";
+        if (sc_unknown_count == 1) {
+            head = "1 GPU value in this scope could not be sized statically";
+            pron = "it";
+        }
+        // Two wordings for the total, because "the 0 bytes it could size" is
+        // noise when the scope held nothing sizeable at all.
+        mut known = str_concat(str_concat(" (nothing in this scope could be sized, against a ",
+                                          int64_to_str(sc_budget_bytes)),
+                               " byte budget)");
+        if (sc_used_bytes > 0) {
+            known = str_concat(str_concat(" (the ", int64_to_str(sc_used_bytes)),
+                               str_concat(" bytes it could size are only the known total, of a ",
+                                          str_concat(int64_to_str(sc_budget_bytes), " byte budget)")));
+        }
+        let fix   = str_concat(str_concat(" — give ", pron), " a literal shape, or check mlx_pool_bytes() at run time");
+        sc_warn_at(sc_unknown_first,
+            str_concat(head, str_concat(str_concat(str_concat(", so the budget does not account for ", pron), known), fix)));
     }
     return 0;
 }
@@ -2007,9 +2064,15 @@ fn sc_stmt(int64 node) -> int64 {
     if (k == ND_GPU_BLOCK) {
         // Save/restore so a gpu { } nested inside an @gpu fn does not drop the
         // enclosing function's GPU context on exit.
-        let saved_gpu    = sc_in_gpu_block;
-        let saved_budget = sc_budget_bytes;
-        let saved_used   = sc_used_bytes;
+        let saved_gpu     = sc_in_gpu_block;
+        let saved_budget  = sc_budget_bytes;
+        let saved_used    = sc_used_bytes;
+        // The un-sized counters belong to the scope too. Without restoring them
+        // the block's exempted values stay counted in the enclosing function,
+        // which reports them a second time at its own close (one value, two
+        // warnings naming the same line).
+        let saved_unknown = sc_unknown_count;
+        let saved_first   = sc_unknown_first;
         sc_in_gpu_block = 1;
         // A bare `gpu { }` has no fraction of its own, so it inherits the whole
         // declared pool.
@@ -2025,8 +2088,11 @@ fn sc_stmt(int64 node) -> int64 {
         sv_push_frame();
         sc_block_stmts(nd_i2[node]);
         sv_pop_frame();
-        sc_budget_bytes = saved_budget;
-        sc_used_bytes   = saved_used;
+        budget_end();
+        sc_budget_bytes  = saved_budget;
+        sc_used_bytes    = saved_used;
+        sc_unknown_count = saved_unknown;
+        sc_unknown_first = saved_first;
         sc_in_gpu_block = saved_gpu;
         return 0;
     }
@@ -2107,6 +2173,11 @@ fn sc_fn(int64 fn_node) -> int64 {
     }
     sc_block_stmts(body_list);
     sv_pop_frame();
+
+    // Report un-sized GPU locals while the scope's budget is still installed and
+    // the fn context is still on the diagnostic stack, so the warning carries
+    // "    in fn ..." and the right line.
+    if (fn_is_gpu) { budget_end(); }
 
     sc_ctx_pop_fn();
     sc_cur_fn_name   = saved_fn;

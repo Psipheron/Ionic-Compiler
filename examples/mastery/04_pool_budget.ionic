@@ -56,10 +56,15 @@ let vram = 25769803776;   // 24 GiB
 //
 // The `x` parameter is deliberately exempt: it was allocated — and charged —
 // in the caller's scope, so charging it again here would count it twice.
+// Anything derived from it is exempt for the same reason — `mlx_add(x, x)` is
+// as big as `x`, which is a caller fact — so `c` below is reported as unsized
+// rather than counted. That warning is the compiler saying "this fits" and
+// "this was never measured" are different answers; the two literals above are
+// what it actually proved.
 @gpu(0.25) fn activations(tensor@gpu x) -> int64 {
-    let a = mlx_zeros([8192, 1024], 0).toGpu();   // 32 MiB in F32
-    let b = mlx_zeros([8192, 1024], 1).toGpu();   // 16 MiB in F16
-    let c = mlx_add(x, x);                        // sized from x, not a literal
+    let a = mlx_zeros([8192, 1024], 0).toGpu();   // 32 MiB in F32 — sized
+    let b = mlx_zeros([8192, 1024], 1).toGpu();   // 16 MiB in F16 — sized
+    let c = mlx_add(x, x);                        // as big as x: exempt, warned
     return mlx_size(c);
 }
 

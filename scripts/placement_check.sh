@@ -24,7 +24,8 @@
 #   same allocation, wider fraction     -> compiles
 #   dtype counted in the size           -> F16 fits where F32 does not
 #   gpu { } blocks budgeted too         -> rejected
-#   tensor parameters / unsized results -> exempt (never a false rejection)
+#   tensor parameters / unsized results -> exempt (never a false rejection),
+#                                          and unsized ones are reported (warn)
 #   no declared pool                    -> no budget in force
 #   using a transferred value           -> rejected (B5)
 #   builtins borrow / temporaries move  -> compiles (B5)
@@ -80,6 +81,76 @@ expect_reject() {
   else
     echo "FAIL  $name  (rejected, but not because of '$needle')"
     sed -n '1,6p' "$WORK/err.txt"
+    FAIL=1
+  fi
+}
+
+# expect_warns <name> <needle> <source>
+# The program must COMPILE (a warning is not an error) and the compiler must
+# print `needle`. Both halves matter: an exempted value has to stay compilable,
+# and the exemption has to be visible.
+expect_warns() {
+  name=$1; needle=$2; src=$3
+  printf '%s\n' "$src" > "$WORK/t.ionic"
+  rm -f "$WORK/t" "$WORK/t.o"
+  if ! "$COMPILER" "$WORK/t.ionic" -o "$WORK/t" >"$WORK/err.txt" 2>&1; then
+    echo "FAIL  $name  (expected a warning, but it failed to compile)"
+    sed -n '1,6p' "$WORK/err.txt"
+    FAIL=1
+    return
+  fi
+  if NO_COLOR=1 grep -q -- "$needle" "$WORK/err.txt"; then
+    echo "ok    $name  (warned: $needle)"
+  else
+    echo "FAIL  $name  (compiled, but did not warn about '$needle')"
+    sed -n '1,6p' "$WORK/err.txt"
+    FAIL=1
+  fi
+}
+
+# expect_silent <name> <needle> <source>
+# The program must compile AND must not print `needle`. This is the half that
+# keeps the warning worth reading: a diagnostic that fires on every program is
+# one readers learn to skip.
+expect_silent() {
+  name=$1; needle=$2; src=$3
+  printf '%s\n' "$src" > "$WORK/t.ionic"
+  rm -f "$WORK/t" "$WORK/t.o"
+  if ! "$COMPILER" "$WORK/t.ionic" -o "$WORK/t" >"$WORK/err.txt" 2>&1; then
+    echo "FAIL  $name  (expected to compile)"
+    sed -n '1,6p' "$WORK/err.txt"
+    FAIL=1
+    return
+  fi
+  if NO_COLOR=1 grep -q -- "$needle" "$WORK/err.txt"; then
+    echo "FAIL  $name  (warned about '$needle' when it should be silent)"
+    sed -n '1,6p' "$WORK/err.txt"
+    FAIL=1
+  else
+    echo "ok    $name"
+  fi
+}
+
+# expect_warn_count <name> <needle> <count> <source>
+# The program must compile and print `needle` exactly `count` times. `expect_warns`
+# cannot catch a diagnostic emitted twice at the same line: the needle is present
+# either way. Counting is what makes a duplicate a failure.
+expect_warn_count() {
+  name=$1; needle=$2; want=$3; src=$4
+  printf '%s\n' "$src" > "$WORK/t.ionic"
+  rm -f "$WORK/t" "$WORK/t.o"
+  if ! "$COMPILER" "$WORK/t.ionic" -o "$WORK/t" >"$WORK/err.txt" 2>&1; then
+    echo "FAIL  $name  (expected a warning, but it failed to compile)"
+    sed -n '1,6p' "$WORK/err.txt"
+    FAIL=1
+    return
+  fi
+  got=$(NO_COLOR=1 grep -c -- "$needle" "$WORK/err.txt" || true)
+  if [ "$got" = "$want" ]; then
+    echo "ok    $name  ($want x $needle)"
+  else
+    echo "FAIL  $name  (warned $got times, expected $want)"
+    sed -n '1,10p' "$WORK/err.txt"
     FAIL=1
   fi
 }
@@ -213,11 +284,68 @@ fn main() -> int64 { return 0; }'
 # An unsized result (a reshape, whose shape this pass does not model) is exempt
 # for the same reason: the check is a necessary condition, never a false
 # rejection.
-expect_ok "unsized results are exempt, not rejected" \
+#
+# "Exempt" used to mean "silently skipped", which is the one thing a capacity
+# check must not do: a program compiled whether its GPU values were measured or
+# merely ignored. It still compiles — an unbounded value is not provably
+# wrong — but the exemption is now reported, so "this fits" and "this was never
+# sized" are distinguishable.
+expect_warns "unsized results are exempt from the budget, but reported" "could not be sized statically" \
 'let vram = 1073741824;
 @gpu(0.01) fn reshapes(tensor@gpu x) -> tensor@gpu {
     let r = mlx_reshape(x, [4, 4]);
     return r;
+}
+fn main() -> int64 { return 0; }'
+
+# A shape built at runtime — `[n, n]` from an argument — is the case that
+# motivated the warning: `mlx_zeros([n, n], 0).toGpu()` allocates an amount the
+# checker cannot know, and it used to compile against any budget with no hint
+# that nothing was measured.
+expect_warns "a runtime-sized allocation is reported" "could not be sized statically" \
+'let vram = 1073741824;
+@gpu(0.01) fn grow(int64 n) -> int64 {
+    let big = mlx_zeros([n, n], 0).toGpu();
+    return mlx_size(big);
+}
+fn main() -> int64 { return 0; }'
+
+# The warning applies inside a bare gpu { } block too, not only in @gpu fns.
+expect_warns "a gpu block reports its unsized values" "could not be sized statically" \
+'let vram = 1073741824;
+fn main() -> int64 {
+    let t = mlx_zeros([4, 4], 0);
+    gpu {
+        let big = mlx_reshape(t.toGpu(), [8, 8]);
+        let m = mlx_size(big);
+    }
+    return 0;
+}'
+
+# ...and it must stay silent when everything is sized, or a clean program would
+# carry a warning it cannot act on.
+expect_silent "a fully-sized GPU scope does not warn" "could not be sized statically" \
+'let vram = 1073741824;
+@gpu(1.0) fn alloc() -> int64 {
+    let a = mlx_zeros([1024, 1024], 0).toGpu();
+    let b = mlx_zeros([1024, 1024], 0).toGpu();
+    return mlx_size(b);
+}
+fn main() -> int64 { return 0; }'
+
+# A `gpu { }` nested inside an @gpu fn is its own budgeted scope. It must report
+# its own unsized value exactly once: the counters have to be saved and restored
+# around the block, or the fn's own close reports the same value a second time
+# and the user sees one problem printed twice with the same line and column.
+expect_warn_count "a nested gpu block reports once, not at both closes" "could not be sized statically" 1 \
+'let vram = 1073741824;
+@gpu(1.0) fn outer(int64 n) -> int64 {
+    let a = mlx_zeros([1024, 1024], 0).toGpu();
+    gpu {
+        let big = mlx_zeros([n, n], 0).toGpu();
+        let s = mlx_size(big);
+    }
+    return mlx_size(a);
 }
 fn main() -> int64 { return 0; }'
 

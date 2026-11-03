@@ -35,6 +35,10 @@ fn main() -> int64 {
     let dev = host.toGpu();              // declared here, referenced only in gpu{}
 
     gpu {
+        // `run(dev)` has no static size: `run` is a user function, and this
+        // pass does not model its return. Both values here are therefore
+        // exempt from the pool budget, and the compiler says so — the scope
+        // compiles, but "fits" is not claimed. A warning is not an error.
         let y = run(dev);                // ok: tensor@gpu into @gpu fn
         let z = run_half(y);
     }

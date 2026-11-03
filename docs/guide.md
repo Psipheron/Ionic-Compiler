@@ -297,6 +297,18 @@ already allocated and charged in the caller's scope, and rejecting it would make
 every function that takes a tensor uncompilable. So the check under-approximates
 (it can miss an over-budget program) but never falsely rejects one.
 
+An exemption is **reported**, not silent. When a budgeted scope closes with
+values it could not size, the compiler prints a `[warn]` naming the first one,
+how many there were, and what it could actually size:
+
+```
+[warn] 5:40: 1 GPU value in this scope could not be sized statically, so the budget does not account for it (nothing in this scope could be sized, against a 1073741824 byte budget) — give it a literal shape, or check mlx_pool_bytes() at run time
+```
+
+A warning does not fail the build — an unbounded value is not provably wrong —
+but it makes "this fits" and "this was never measured" different answers, which
+a silent exemption did not.
+
 Live-range analysis is also not done yet: the sum covers every sized binding in
 the scope, so a value that dies before the next allocation still counts.
 Runtime enforcement of what cannot be proven statically is `docs/plan-placement.md`
