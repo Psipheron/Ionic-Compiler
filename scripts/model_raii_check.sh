@@ -44,7 +44,11 @@ count_frees() {
     FAIL=1
     return
   fi
-  actual=$(nm -u "$WORK/t.o" | grep -c '_ionic_model_free')
+  # `grep -c` exits 1 when the count is zero. This script runs under `set -u`
+  # only, so it survives; `|| true` keeps it working under `set -e` as well,
+  # which the identical check in ci.yml does not (and it silently killed the
+  # zero-free case there).
+  actual=$(nm -u "$WORK/t.o" | grep -c '_ionic_model_free' || true)
   if [ "$actual" = "$expected" ]; then
     echo "ok    $name  (frees=$actual)"
   else

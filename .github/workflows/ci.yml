@@ -173,7 +173,12 @@ jobs:
             rm -f /tmp/raii /tmp/raii.o
             ./ionic_new /tmp/raii.ionic -o /tmp/raii >/tmp/raii.log 2>&1 || {
               echo "COMPILE-FAIL $name"; cat /tmp/raii.log; fail=1; return; }
-            actual=$(nm -u /tmp/raii.o | grep -c '_ionic_model_free')
+            # `grep -c` exits 1 when the count is zero, which under the
+            # runner's default `set -e -o pipefail` killed this step on the
+            # "no model" case before `exit $fail` could run — so the case that
+            # asserts *no* destructor is emitted never actually reported. `|| true`
+            # keeps the count while dropping the failure status.
+            actual=$(nm -u /tmp/raii.o | grep -c '_ionic_model_free' || true)
             if [ "$actual" != "$expected" ]; then
               echo "FAIL $name: expected $expected frees, got $actual"; fail=1
             else
