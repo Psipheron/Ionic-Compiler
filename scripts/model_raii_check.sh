@@ -26,7 +26,13 @@
 # across the destructor. Without that the caller sees a heap address instead of
 # the value it returned.
 set -u
-cd /Users/henry/Developer/Ionic || exit 1
+# Run from the repo root regardless of where the script is invoked from, but
+# derive it from the script's own location: a hard-coded absolute path made this
+# script pass locally and fail in CI, where the checkout lives elsewhere.
+case "$0" in
+  */*) cd "$(dirname "$0")/.." || exit 1 ;;
+  *)   cd . || exit 1 ;;
+esac
 
 COMPILER="${COMPILER:-./ionic_new}"
 WORK=/tmp/ionic_raii
