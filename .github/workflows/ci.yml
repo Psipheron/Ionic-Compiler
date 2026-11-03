@@ -266,11 +266,21 @@ jobs:
       # placement-typed — that is why tensor_mismatch.ionic must still fail.
       #
       # These run without any accelerator: the checks are purely static.
+      #
+      # The *runtime* half of the first case needs mlx-c. With no backend linked
+      # the example still compiles and exits 0, but prints "MLX backend not
+      # compiled in on this platform" instead of the result, so asserting on its
+      # output would fail on a clean runner for the right reason in the wrong
+      # place. Compile-only there; assert the output only where MLX exists.
       - name: Pool polymorphism — builtins accept tensor@gpu
         run: |
           ./ionic_new examples/mastery/04_pool_polymorphism.ionic -o /tmp/poolpoly
-          /tmp/poolpoly | grep -q "pool polymorphism: ok" \
-            || (echo "pool-polymorphism program failed"; exit 1)
+          if [ -f /opt/homebrew/include/mlx/c/mlx.h ]; then
+            /tmp/poolpoly | grep -q "pool polymorphism: ok" \
+              || (echo "pool-polymorphism program failed"; exit 1)
+          else
+            echo "mlx-c not installed; compiled only (static checks still run)"
+          fi
 
       - name: Pool polymorphism — user functions stay strict
         run: |
