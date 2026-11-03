@@ -1,16 +1,16 @@
 class Ionic < Formula
   desc "Statically-typed compiled language for data science and AI workloads"
-  homepage "https://github.com/henrytunguz/ionic"
+  homepage "https://github.com/Psipheron/Ionic-Compiler"
   version "v0.2.1"
   license "MIT"
 
   on_arm do
-    url "https://github.com/henrytunguz/ionic/releases/download/#{version}/ionic-#{version}-aarch64-apple-darwin.tar.gz"
+    url "https://github.com/Psipheron/Ionic-Compiler/releases/download/#{version}/ionic-#{version}-aarch64-apple-darwin.tar.gz"
     sha256 "PLACEHOLDER_ARM64_SHA256"
   end
 
   on_intel do
-    url "https://github.com/henrytunguz/ionic/releases/download/#{version}/ionic-#{version}-x86_64-apple-darwin.tar.gz"
+    url "https://github.com/Psipheron/Ionic-Compiler/releases/download/#{version}/ionic-#{version}-x86_64-apple-darwin.tar.gz"
     sha256 "PLACEHOLDER_X86_SHA256"
   end
 

@@ -98,8 +98,8 @@ program still needs a C compiler on `PATH`; nothing else is required.
 ### Quick start (using the prebuilt `ionic_self`)
 
 ```sh
-git clone https://github.com/Pkill-MyDaemons/Ionic.git
-cd Ionic
+git clone https://github.com/Psipheron/Ionic-Compiler.git
+cd Ionic-Compiler
 ./build.sh                                  # ~3 s; produces ./ionic_new
 ./ionic_new examples/hello_world.ionic -o /tmp/hw && /tmp/hw
 ```

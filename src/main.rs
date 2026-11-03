@@ -105,22 +105,23 @@ fn main() {
 
     // Backend detection. Only link a backend the program actually references:
     // linking unconditionally would make every Ionic binary (including
-    // hello-world) depend on mlx/llama/onnx and pay their init cost at startup.
+    // hello-world) depend on mlx/onnx and pay their init cost at startup.
     // Mirrors the same usage gate in src/main.ionic.
     let src = fs::read_to_string(&source_path).unwrap_or_default();
     let uses_mlx   = src.contains("mlx_");
-    let uses_llama = src.contains("gguf_") || src.contains("load_model");
     let uses_ort   = src.contains("piper_forward")
                      || src.contains("model_forward")
                      || src.contains("load_model");
 
-    let ort_inc  = if uses_ort { ort_include_path() } else { None };
-    let ort_lib  = if uses_ort { ort_lib_path() } else { None };
+    // IONIC_NO_ORT=1 forces ONNX off, mirroring IONIC_NO_MLX. build.sh sets
+    // both when it builds the compiler, because the compiler's own source
+    // contains every builtin name ("mlx_add", ...) and so trips the usage gate
+    // above -- which made the compiler itself depend on mlxc/onnxruntime at
+    // load time and refuse to start on a machine without them.
+    let ort_allowed = std::env::var("IONIC_NO_ORT").map(|v| v != "1").unwrap_or(true);
+    let ort_inc  = if uses_ort && ort_allowed { ort_include_path() } else { None };
+    let ort_lib  = if uses_ort && ort_allowed { ort_lib_path() } else { None };
     let has_ort  = ort_inc.is_some() && ort_lib.is_some();
-
-    let llama_inc = if uses_llama { llama_include_path() } else { None };
-    let llama_lib = if uses_llama { llama_lib_path() } else { None };
-    let has_llama = llama_inc.is_some() && llama_lib.is_some();
 
     // MLX is Apple-silicon only. IONIC_NO_MLX=1 forces it off for a
     // half-installed mlx-c that would otherwise fail the link.
@@ -154,12 +155,6 @@ fn main() {
                 compile_args.push(format!("-I{}", inc));
             }
         }
-        if has_llama {
-            compile_args.push(format!("-DIONIC_HAVE_LLAMA"));
-            if let Some(ref inc) = llama_inc {
-                compile_args.push(format!("-I{}", inc));
-            }
-        }
         if has_mlx {
             compile_args.push(format!("-DIONIC_HAVE_MLX"));
             if let Some(ref inc) = mlx_inc {
@@ -186,13 +181,6 @@ fn main() {
         if let Some(ref lib) = ort_lib {
             clang_args.push(format!("-L{}", lib));
             clang_args.push("-lonnxruntime".to_string());
-            clang_args.push(format!("-Wl,-rpath,{}", lib));
-        }
-    }
-    if has_llama {
-        if let Some(ref lib) = llama_lib {
-            clang_args.push(format!("-L{}", lib));
-            clang_args.push("-lllama".to_string());
             clang_args.push(format!("-Wl,-rpath,{}", lib));
         }
     }
@@ -353,38 +341,6 @@ fn find_clang() -> String {
 fn die(msg: &str) -> ! {
     eprintln!("{}", msg);
     std::process::exit(1);
-}
-
-/// Return the llama.cpp include directory if found.
-fn llama_include_path() -> Option<String> {
-    let candidates = [
-        "/opt/homebrew/include",
-        "/opt/homebrew/Cellar/llama.cpp/9260/include",
-        "/usr/local/include",
-    ];
-    for c in &candidates {
-        if Path::new(c).join("llama.h").exists() {
-            return Some(c.to_string());
-        }
-    }
-    None
-}
-
-/// Return the llama.cpp library directory if found.
-fn llama_lib_path() -> Option<String> {
-    let candidates = [
-        "/opt/homebrew/lib",
-        "/opt/homebrew/Cellar/llama.cpp/9260/lib",
-        "/usr/local/lib",
-    ];
-    for c in &candidates {
-        if Path::new(c).join("libllama.dylib").exists()
-            || Path::new(c).join("libllama.so").exists()
-        {
-            return Some(c.to_string());
-        }
-    }
-    None
 }
 
 /// Return the MLX (C API) include directory if found. `#include "mlx/c/mlx.h"`

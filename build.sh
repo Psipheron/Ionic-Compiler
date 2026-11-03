@@ -35,10 +35,27 @@ IONIC="${IONIC:-./ionic_self}"
 OUT="${OUT:-ionic_new}"
 
 # ── Optional ML backends ────────────────────────────────────────────────────
-# The compiler binary itself never links ML libraries — those are linked into
-# the *programs* it produces, and only when a program's source references them
-# (see the usage gate in src/main.ionic). So there is nothing to configure here
-# for a normal build.
+# The usage gate in src/main.ionic links a backend when the *source text*
+# mentions it. That works for user programs, but it misfires when the thing
+# being compiled is the compiler itself: src/codegen/native.ionic contains the
+# builtin name table, 73 string literals of the form "mlx_add", so building
+# `ionic_new` looks like a program that uses MLX and the compiler ends up with
+# mlxc.dylib as a load-time dependency.
+#
+# That is not cosmetic. A committed `ionic_self` built that way aborts at
+# startup on any machine without Homebrew's mlx-c ("Library not loaded:
+# libmlxc.dylib"), which is exactly what broke CI on a clean macOS runner and
+# what the README's "a missing library is never a build failure" promises
+# cannot happen.
+#
+# The compiler is the wrong place to link these: its ML entry points are the
+# runtime symbols it emits calls to, not something the compiler executes. So
+# the bootstrap always builds backend-free. Users who want a backend in a
+# *program* still get one: the usage gate runs in the compiler, per program,
+# using whatever that program references.
+IONIC_NO_MLX=1
+IONIC_NO_ORT=1
+export IONIC_NO_MLX IONIC_NO_ORT
 #
 # What you may want on a machine with a half-installed mlx-c is to force the
 # backend off when compiling a program:

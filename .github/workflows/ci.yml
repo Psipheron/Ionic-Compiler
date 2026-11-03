@@ -70,6 +70,15 @@ jobs:
       # sources — no committed ionic_self required. The freshly built compiler
       # must then itself work.
       - name: Rust bootstrap compiles the self-hosted sources
+        # IONIC_NO_MLX/IONIC_NO_ORT: the compiler's own source contains the
+        # builtin name table ("mlx_add", ...), so the source-text usage gate
+        # thinks the compiler uses MLX and links mlxc into it. The compiler only
+        # ever emits calls to those symbols; it never calls them. Linking them
+        # in makes the binary fail to load anywhere they are absent, so a
+        # compiler build always goes backend-free. build.sh does the same.
+        env:
+          IONIC_NO_MLX: "1"
+          IONIC_NO_ORT: "1"
         run: |
           ./target/release/ionic src/main.ionic -o /tmp/ionic_from_rust
           echo 'fn main() -> int64 { print(int64_to_str(6 & 3)); return 0; }' > /tmp/bw.ionic

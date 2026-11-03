@@ -225,12 +225,18 @@ if (uses_mlx == 1 && g_target_linux == 0) {
 
 // ONNX Runtime is the only model-loader backend, and it is probed regardless of
 // target: on Linux it is the only ML path at all.
+//
+// IONIC_NO_ORT=1 forces it off, mirroring IONIC_NO_MLX. build.sh sets both when
+// building the compiler, because the compiler's own source mentions every
+// builtin name and so trips the usage gate above.
 if (uses_ort == 1) {
-    let ort_inc = find_ort_include();
-    let ort_lib = find_ort_lib();
-    if (!str_eq(ort_inc, "") && !str_eq(ort_lib, "")) {
-        backend_defs = str_concat(backend_defs, str_concat(" -DIONIC_HAVE_ORT -I", ort_inc));
-        backend_libs = str_concat(backend_libs, str_concat(" -L", str_concat(ort_lib, " -lonnxruntime")));
+    if (str_eq(getenv("IONIC_NO_ORT"), "") || str_eq(getenv("IONIC_NO_ORT"), "0")) {
+        let ort_inc = find_ort_include();
+        let ort_lib = find_ort_lib();
+        if (!str_eq(ort_inc, "") && !str_eq(ort_lib, "")) {
+            backend_defs = str_concat(backend_defs, str_concat(" -DIONIC_HAVE_ORT -I", ort_inc));
+            backend_libs = str_concat(backend_libs, str_concat(" -L", str_concat(ort_lib, " -lonnxruntime")));
+        }
     }
 }
 

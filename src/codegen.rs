@@ -249,9 +249,6 @@ impl Codegen {
         self.emit("declare void @ionic_model_free(ptr)");
         self.emit("declare ptr  @ionic_piper_forward(ptr, ptr, double, double, double)");
         self.emit("declare void @ionic_write_wav(ptr, ptr, i64, i64)");
-        self.emit("declare ptr  @ionic_gguf_generate(ptr, ptr, i64)");
-        self.emit("declare void @ionic_gguf_set_temp(ptr, double)");
-        self.emit("declare void @ionic_gguf_set_top_p(ptr, double)");
         self.emit("declare ptr  @ionic_fgets_stdin(ptr, i32)");
         // MLX backend declarations, derived from the shared signature table so
         // a builtin added there is declared here automatically.
@@ -1259,29 +1256,6 @@ impl Codegen {
                     path, arr, ns, sr));
                 ("0".to_string(), Type::Void)
             }
-            "gguf_generate" => {
-                let (mdl, _)  = &args[0];
-                let (prompt, _) = &args[1];
-                let (max_tok, _) = &args[2];
-                let r = self.fresh_reg();
-                self.emit(&format!(
-                    "  {} = call ptr @ionic_gguf_generate(ptr {}, ptr {}, i64 {})",
-                    r, mdl, prompt, max_tok));
-                (r, Type::Str)
-            }
-            "gguf_set_temp" => {
-                let (mdl, _)  = &args[0];
-                let (temp, _) = &args[1];
-                self.emit(&format!("  call void @ionic_gguf_set_temp(ptr {}, double {})", mdl, temp));
-                ("0".to_string(), Type::Void)
-            }
-            "gguf_set_top_p" => {
-                let (mdl, _)   = &args[0];
-                let (top_p, _) = &args[1];
-                self.emit(&format!("  call void @ionic_gguf_set_top_p(ptr {}, double {})", mdl, top_p));
-                ("0".to_string(), Type::Void)
-            }
-
             // ── MLX tensor backend ────────────────────────────────────────────
             // Every mlx_* entry point takes only i64/ptr and returns i64/ptr,
             // so a single data-driven arm covers the whole surface. The return
