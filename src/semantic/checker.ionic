@@ -154,7 +154,22 @@ mut sv_muts    = [0];   // 0=let, 1=mut
 // This is the size channel the pool budget (stage B3/B4) is charged against; it
 // is deliberately a separate column rather than folded into `sv_svs` (which
 // already carries a struct name or an array element type).
+//
+// It must be kept current, including being set BACK to -1: a binding reassigned
+// to a runtime-shaped value is no longer the size it was declared with, and a
+// later `mlx_add(a, a)` that reads a stale size is charged for bytes it cannot
+// know — which is how an unknown-size value turns into a false rejection.
 mut sv_bytes   = [-1];
+// Which budget scope this binding's bytes are currently counted in, or 0 when
+// they are not counted anywhere.
+//
+// Reassignment releases the value a name holds before charging the new one, and
+// "release" means subtracting from `sc_used_bytes`. That is only valid if the
+// bytes were added to the *same* total: a nested `gpu { }` starts its running
+// total at zero, so subtracting an enclosing scope's charge from it would
+// under-count and let an over-budget program through. Recording the scope id
+// makes the subtraction check that it is subtracting what it actually added.
+mut sv_charged = [0];
 // Where this binding was consumed by a transfer, or 0 if it still owns a value.
 //
 // A transfer is a MOVE: the value occupies exactly one pool, so after
@@ -196,6 +211,7 @@ fn sv_declare(string name, int64 ty, string sv, int64 mut_flag) -> int64 {
         sv_svs[sv_count]    = sv;
         sv_muts[sv_count]   = mut_flag;
         sv_bytes[sv_count]  = -1;
+        sv_charged[sv_count] = 0;
         sv_mvline[sv_count] = 0;
         sv_mvhow[sv_count]  = "";
     } else {
@@ -204,6 +220,7 @@ fn sv_declare(string name, int64 ty, string sv, int64 mut_flag) -> int64 {
         push(sv_svs,    sv);
         push(sv_muts,   mut_flag);
         push(sv_bytes,  -1);
+        push(sv_charged, 0);
         push(sv_mvline, 0);
         push(sv_mvhow,  "");
     }
@@ -249,6 +266,34 @@ fn sv_lookup_bytes(string name) -> int64 {
     let i = sv_lookup_idx(name);
     if (i == 0) { return -1; }
     return sv_bytes[i];
+}
+
+// Record that `name`'s bytes are now counted in budget scope `sid` (0 = not
+// counted anywhere). Called by budget_charge on both paths, and read back by
+// sv_release_charge.
+fn sv_charged_in_set(string name, int64 sid) -> int64 {
+    let i = sv_lookup_idx(name);
+    if (i == 0) { return 0; }
+    sv_charged[i] = sid;
+    return 0;
+}
+
+// Release `name`'s charge from the current scope's running total, if this scope
+// is where it was charged.
+//
+// Called before a binding is reassigned or re-declared in the same slot. The
+// scope check is what makes it safe: a nested `gpu { }` starts its total at zero,
+// so releasing an enclosing scope's bytes from it would drive the total below
+// what this scope actually holds and let an over-budget body through. When the
+// charge belongs to another scope, this scope never counted it and has nothing
+// to release.
+fn sv_release_charge(string name) -> int64 {
+    let i = sv_lookup_idx(name);
+    if (i == 0) { return 0; }
+    if (sv_charged[i] == 0 || sv_charged[i] != sc_scope_id) { return 0; }
+    if (sv_bytes[i] > 0) { sc_used_bytes = sc_used_bytes - sv_bytes[i]; }
+    sv_charged[i] = 0;
+    return 0;
 }
 
 fn sv_lookup_idx(string name) -> int64 {
@@ -862,6 +907,10 @@ fn expr_bytes(int64 node) -> int64 {
 //     rejection.
 mut sc_budget_bytes  = -1;   // -1 = no budget in force
 mut sc_used_bytes    = 0;
+// Unique id for the scope currently accumulating, so a binding can record which
+// scope its bytes were added to. Incremented by budget_begin, which is why an
+// id is never reused and a stale record cannot match a later scope.
+mut sc_scope_id      = 0;
 // Exempted GPU locals. `sc_unknown_count` is how many the scope produced;
 // `sc_unknown_first` is the node of the first one, so the warning can point at
 // a concrete line instead of making the user hunt for every GPU value in the
@@ -873,6 +922,7 @@ mut sc_unknown_first = 0;
 // Start a budget for a scope. Returns nothing; sc_budget_bytes/sc_used_bytes are
 // saved and restored by the caller.
 fn budget_begin(int64 hw_node) -> int64 {
+    sc_scope_id      = sc_scope_id + 1;
     sc_budget_bytes  = scope_budget_bytes(hw_node);
     sc_used_bytes    = 0;
     sc_unknown_count = 0;
@@ -882,15 +932,26 @@ fn budget_begin(int64 hw_node) -> int64 {
 
 // Charge one GPU-resident declaration. `name` is the binding, `init_nd` its
 // initialiser, `node` the declaration node (for the diagnostic position).
+//
+// Both paths must leave the binding's size record correct, because a later
+// `mlx_add(a, a)` is sized from it. Recording a size on the sized path and
+// leaving the old one in place on the exempt path is what turned an unknown
+// value into a false rejection: `a = mlx_reshape(a, [n, n])` kept `a`'s old
+// byte count, so every derived value was charged bytes `a` no longer provably
+// had.
 fn budget_charge(string name, int64 init_nd, int64 node) -> int64 {
     if (sc_budget_bytes < 0) { return 0; }
     let b = expr_bytes(init_nd);
     if (b < 0) {
+        // Exempt: the new value's size is unknown, so the record must say so.
+        sv_set_bytes(name, -1);
+        sv_charged_in_set(name, 0);
         sc_unknown_count = sc_unknown_count + 1;
         if (sc_unknown_first == 0) { sc_unknown_first = node; }
         return 0;
     }
     sv_set_bytes(name, b);
+    sv_charged_in_set(name, sc_scope_id);
     sc_used_bytes = sc_used_bytes + b;
     if (sc_used_bytes > sc_budget_bytes) {
         sc_active_node = node;
@@ -1913,6 +1974,11 @@ fn sc_stmt(int64 node) -> int64 {
             decl_ty = ann_ty;
             decl_sv_val = ann_sv_val;
         }
+        // A re-`let` in the same scope reuses the symbol slot, so the previous
+        // binding's charge must be released first — the new declaration resets
+        // sv_bytes/sv_charged to -1/0 and would otherwise leave the old bytes
+        // counted in a scope that no longer holds them.
+        sv_release_charge(name);
         sv_declare(name, decl_ty, decl_sv_val, mut_flag);
         // Stage B3/B4: a GPU-resident binding is charged against the enclosing
         // scope's budget. Sized values are summed; unsized ones are exempt (see
@@ -1957,12 +2023,13 @@ fn sc_stmt(int64 node) -> int64 {
                 //     slot = mlx_zeros([20000, 20000], 0).toGpu();   // 1.6 GiB
                 //
                 // compiled against a 1 GiB pool. Replacing the value releases the
-                // old one's bytes, so the accounting is: subtract what the name
+                // old one's bytes, so the accounting is: release what the name
                 // currently holds, then charge the new value. Charging without the
-                // subtraction would count a reused slot once per assignment.
+                // release would count a reused slot once per assignment — and
+                // releasing *another scope's* charge would under-count this one,
+                // which is why the release is scope-checked (sv_release_charge).
                 if (var_ty == TY_TENSOR_GPU && sc_budget_bytes >= 0) {
-                    let old_b = sv_lookup_bytes(tname);
-                    if (old_b > 0) { sc_used_bytes = sc_used_bytes - old_b; }
+                    sv_release_charge(tname);
                     budget_charge(tname, val_nd, node);
                 } else {
                     sv_set_bytes(tname, expr_bytes(val_nd));

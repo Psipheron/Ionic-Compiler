@@ -381,6 +381,78 @@ expect_ok "a reused slot releases the old value before recharging" \
 }
 fn main() -> int64 { return 0; }'
 
+# A binding reassigned to a runtime-shaped value must stop being sized. The size
+# record feeds `expr_bytes`, so leaving the old count in place charges every
+# value derived from it:
+#
+#     mut a = mlx_zeros([8192, 8192], 0).toGpu();  // 256 MiB
+#     a = mlx_reshape(a, [n, n]);                  // unknown, NOT 256 MiB
+#     let b = mlx_add(a, a);                       // must be exempt, not 256 MiB
+#
+# Before the fix the five derived values were charged a stale 256 MiB each and
+# the program was rejected — a false rejection, the one thing this check
+# promises never to produce.
+expect_warns "a value derived from an unsized binding is exempt, not charged stale bytes" "could not be sized statically" \
+'let vram = 1073741824;
+@gpu(1.0) fn f(int64 n) -> int64 {
+    mut a = mlx_zeros([8192, 8192], 0).toGpu();
+    a = mlx_reshape(a, [n, n]);
+    let b = mlx_add(a, a);
+    let c = mlx_add(a, a);
+    let d = mlx_add(a, a);
+    let e = mlx_add(a, a);
+    let g = mlx_add(a, a);
+    return mlx_size(g);
+}
+fn main() -> int64 { return 0; }'
+
+# Releasing a reassigned binding's bytes is only valid in the scope that counted
+# them. A nested `gpu { }` starts its running total at zero, so subtracting an
+# enclosing scope's charge from it drives the total below what the body actually
+# holds:
+#
+#     gpu { mut a = ...256 MiB...;      // charged to the OUTER scope
+#       gpu { a = ...1 GiB + 64 KiB...; // inner total must start at 0, not -256 MiB
+#       } }
+#
+# That compiled with the unconditional subtraction. The 16385 makes the inner
+# value exceed the pool by a margin, so the assertion discriminates rather than
+# relying on the two byte counts coincidentally matching.
+expect_reject "a nested scope does not release an outer scope's charge" "does not fit the accelerator pool" \
+'let vram = 1073741824;
+fn main() -> int64 {
+    gpu {
+        mut a = mlx_zeros([8192, 8192], 0).toGpu();
+        gpu {
+            a = mlx_zeros([16384, 16385], 0).toGpu();
+            let u = mlx_size(a);
+        }
+    }
+    return 0;
+}'
+
+# The warning's total wording switches when the scope held nothing sizeable.
+# `the 0 bytes it could size are only the known total` would read as noise, so
+# that case says so plainly instead.
+expect_warns "a scope that sized nothing says so" "nothing in this scope could be sized" \
+'let vram = 1073741824;
+@gpu(1.0) fn f(int64 n) -> int64 {
+    let a = mlx_zeros([n, n], 0).toGpu();
+    return mlx_size(a);
+}
+fn main() -> int64 { return 0; }'
+
+# ...and the other wording appears when the scope did size something, so the
+# report distinguishes "0 of a 1 GiB budget" from "256 MiB of a 1 GiB budget".
+expect_warns "a partly-sized scope reports the known total" "bytes it could size are only the known total" \
+'let vram = 1073741824;
+@gpu(1.0) fn f(int64 n) -> int64 {
+    let a = mlx_zeros([8192, 8192], 0).toGpu();
+    let b = mlx_zeros([n, n], 0).toGpu();
+    return mlx_size(b);
+}
+fn main() -> int64 { return 0; }'
+
 # No pool declared means no budget in force: a program that never restricts a
 # GPU scope is not asked to declare one.
 expect_ok "no pool means no budget" \
