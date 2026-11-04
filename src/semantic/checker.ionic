@@ -1444,6 +1444,12 @@ fn register_builtins() -> int64 {
     // either way; this only makes the number readable.
     register_builtin("mlx_pool_capacity", 1, TY_INT64,   "");
     bparam(1, TY_INT64);
+    // The other half of that comparison: how many bytes the device backing a
+    // pool really offers, or 0 when it cannot be determined. Without it a
+    // program could only learn what it *asked* for, never whether the machine
+    // could provide it.
+    register_builtin("mlx_device_capacity", 1, TY_INT64,   "");
+    bparam(1, TY_INT64);
     register_builtin("mlx_pool_count",    0, TY_INT64,   "");
     register_builtin("mlx_pools_unified", 0, TY_INT64,   "");
     // Elementwise binary

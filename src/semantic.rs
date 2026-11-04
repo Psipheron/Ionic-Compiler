@@ -89,6 +89,8 @@ pub fn mlx_builtins(m: &mut HashMap<String, (Vec<Type>, Type)>) {
     // bytes each pool holds. Both return int64.
     m.insert("mlx_pool".to_string(),     (vec![t()], i.clone()));
     m.insert("mlx_pool_bytes".to_string(), (vec![i.clone()], i.clone()));
+    m.insert("mlx_pool_capacity".to_string(),   (vec![i.clone()], i.clone()));
+    m.insert("mlx_device_capacity".to_string(), (vec![i.clone()], i.clone()));
     m.insert("mlx_pool_count".to_string(), (vec![], i.clone()));
     m.insert("mlx_pools_unified".to_string(), (vec![], i.clone()));
     // Axis reductions

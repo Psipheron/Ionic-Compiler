@@ -136,6 +136,25 @@ int64_t ionic_mlx_pool_capacity(int64_t pool) {
     return g_pool_capacity[pool];
 }
 
+/* Physical host memory in bytes, or 0 when it cannot be determined.
+ *
+ * This is the capacity of the SRAM pool, and it is a fact about the machine
+ * rather than about any backend, so it lives outside the MLX conditional: a
+ * program can be told what its host pool really holds on every platform. */
+static int64_t host_ram_bytes(void) {
+#if defined(_WIN32)
+    MEMORYSTATUSEX ms;
+    ms.dwLength = sizeof(ms);
+    if (!GlobalMemoryStatusEx(&ms)) return 0;
+    return (int64_t)ms.ullTotalPhys;
+#else
+    long pages = sysconf(_SC_PHYS_PAGES);
+    long psize = sysconf(_SC_PAGESIZE);
+    if (pages <= 0 || psize <= 0) return 0;
+    return (int64_t)pages * (int64_t)psize;
+#endif
+}
+
 /* ── System runtime ───────────────────────────────────────────────────────── */
 
 static int    ionic_argc = 0;
@@ -911,6 +930,98 @@ static void pool_capacity_panic(int64_t pool, int64_t bytes) {
     exit(1);
 }
 
+/* How many bytes the device backing `pool` can actually hold, or 0 if unknown.
+ *
+ * For VRAM this is Metal's `max_recommended_working_set_size`, not the card's
+ * nominal memory: on Apple silicon the GPU may address only a slice of the
+ * unified RAM, and that slice is the number an allocator will honour. Asking
+ * for `memory_size` instead would report 8 GiB on a machine that Metal caps at
+ * 5.3 GiB, and the whole point of the comparison is to catch exactly that gap.
+ *
+ * For SRAM it is physical host memory — the pool has no other limit, because
+ * `vram` names the accelerator pool (see g_pool_capacity above). */
+static int64_t mlx_device_capacity(int64_t pool) {
+    if (pool == IONIC_POOL_CPU) return host_ram_bytes();
+    if (pool != IONIC_POOL_GPU) return 0;
+
+    ionic_mlx_init();
+    mlx_device      dev  = mlx_device_new_type(MLX_GPU, 0);
+    mlx_device_info info = mlx_device_info_new();   /* empty; get() fills it */
+    int64_t         out  = 0;
+
+    if (mlx_ck(mlx_device_info_get(&info, dev)) == 0) {
+        size_t v = 0;
+        if (mlx_ck(mlx_device_info_get_size(
+                &v, info, "max_recommended_working_set_size")) == 0) {
+            out = (int64_t)v;
+        }
+    }
+    mlx_device_info_free(info);
+    mlx_device_free(dev);
+    return out;
+}
+
+/* Ionic-facing: how many bytes pool `p` really holds, or 0 when unknown.
+ *
+ * `mlx_pool_capacity(p)` answers "how much did the program say it may use",
+ * this answers "how much is there". A program (or a test) needs both to reason
+ * about whether its declaration is honest on the machine it is running on. */
+int64_t ionic_mlx_device_capacity(int64_t pool) { return mlx_device_capacity(pool); }
+
+/* Pools whose declaration has already been compared against the hardware.
+ *
+ * The comparison is a warning, and a warning printed once per pool is a
+ * diagnostic; one printed per allocation is noise the user will scroll past. */
+static int g_pool_checked[IONIC_POOL_COUNT] = {0, 0};
+
+/* Format a byte count as GiB with one decimal, for diagnostics.
+ *
+ * Byte counts are unreadable at ten digits and the question this answers is
+ * "which of these two numbers is bigger", so the comparison is shown in the
+ * units it is actually made in. Integer arithmetic on tenths avoids rounding
+ * surprises; `bytes * 10` cannot overflow for any plausible capacity. */
+static void fmt_gib(char *buf, size_t cap, int64_t bytes) {
+    int64_t tenths = (bytes * 10) / (int64_t)(1024 * 1024 * 1024);
+    snprintf(buf, cap, "%lld.%lld GiB",
+             (long long)(tenths / 10), (long long)(tenths % 10));
+}
+
+/* Report, once, when a declared pool is larger than the device backing it.
+ *
+ * Deliberately a warning and not a refusal. The declaration is a budget the
+ * program promises to stay under, and a budget larger than today's device is
+ * a program that will run on a bigger machine — refusing that would make the
+ * declaration a hardware requirement it was never documented to be. What is
+ * not acceptable is silence: `let vram = 25769803776;` on an 8 GiB laptop is a
+ * number that can never be honoured here, and an author who wrote it deserves
+ * to be told which two numbers disagree.
+ *
+ * Called from pool_charge() rather than ionic_pool_set_capacity(). Setting the
+ * capacity happens before any user code runs, and this repo's own `vram`
+ * examples are compile-only references that declare 24 GiB and never allocate;
+ * comparing at startup would warn on programs that are simply not running yet.
+ * The declaration only becomes a claim about this machine when the program asks
+ * this machine for accelerator bytes. */
+static void pool_check_declaration(int64_t pool) {
+    if (!pool_valid(pool) || g_pool_checked[pool]) return;
+    g_pool_checked[pool] = 1;
+
+    int64_t declared = g_pool_capacity[pool];
+    int64_t device   = mlx_device_capacity(pool);
+    if (declared <= 0 || device <= 0 || declared <= device) return;
+
+    char want[32], have[32];
+    fmt_gib(want, sizeof(want), declared);
+    fmt_gib(have, sizeof(have), device);
+    fprintf(stderr,
+        "ionic: warning: %s is declared as %s but this device offers %s\n"
+        "       the first allocation will be charged against the %s figure, so "
+        "this program cannot use the budget it declares on this machine. The "
+        "declaration is legal (it will fit a larger device); lower `let vram` to "
+        "match if this program is meant to run here.\n",
+        pool_name(pool), want, have, have);
+}
+
 /* Charge `bytes` to `pool`, refusing the allocation if it would not fit.
  *
  * Release is unconditional: giving bytes back can never over-fill. The
@@ -918,6 +1029,7 @@ static void pool_capacity_panic(int64_t pool, int64_t bytes) {
  * negative sum and slip past the check. */
 static void pool_charge(int64_t pool, int64_t bytes) {
     if (!pool_valid(pool)) return;
+    if (bytes > 0) pool_check_declaration(pool);
     if (bytes > 0 && g_pool_capacity[pool] > 0
         && bytes > g_pool_capacity[pool] - g_pool_bytes[pool]) {
         pool_capacity_panic(pool, bytes);
@@ -2026,6 +2138,12 @@ void   *ionic_mlx_to_gpu(void *h) { (void)h; mlx_unavailable(); return NULL; }
 void   *ionic_mlx_to_cpu(void *h) { (void)h; mlx_unavailable(); return NULL; }
 int64_t ionic_mlx_pool(void *h) { (void)h; return -1; }
 int64_t ionic_mlx_pool_bytes(int64_t p) { (void)p; return -1; }
+/* The host pool's real size is a fact about the machine, so it is answerable
+ * here too; VRAM is 0 because without an accelerator there is no such device
+ * to report, and 0 means "unknown", not "empty". */
+int64_t ionic_mlx_device_capacity(int64_t p) {
+    return p == IONIC_POOL_CPU ? host_ram_bytes() : 0;
+}
 /* No ionic_mlx_pool_capacity stub is needed here: capacity is a language-level
  * fact, so it lives outside the MLX conditional with ionic_pool_set_capacity and
  * answers correctly on every platform. A program that declares `vram` can read

@@ -34,6 +34,7 @@
 #   mastery/fail/use_after_move.ionic   -> rejected (the tutorial's fail-case)
 #   over-budget allocation at run time  -> refused by the allocator (Stage D)
 #   declared pool readable at run time  -> matches what was written
+#   device capacity readable at run time-> the other half of the comparison
 #
 # Everything above the "runtime" sections is decided statically, so it runs on
 # any OS with no accelerator present. That is the point: the checker's behaviour
@@ -784,6 +785,43 @@ fn main() -> int64 {
 }'
 
 expect_runtime "the declared pool size is published to the runtime" "$CAPACITY_TEST"
+
+# The other half of the comparison: what the machine actually offers. A
+# declaration is only meaningful against a real number, and before this the
+# runtime could only ever report what the program *asked* for.
+#
+# The assertions are deliberately shape-only rather than numeric — the host's
+# RAM and the GPU's working set differ on every machine, so pinning either would
+# make the suite pass only on the author's laptop. What must hold everywhere:
+#
+#   * SRAM has a positive capacity (physical RAM is a fact of every host, and
+#     the value is answered even where no accelerator exists);
+#   * VRAM is non-negative — 0 means "unknown", which is the honest answer on a
+#     build without a backend, so it is allowed but a negative is not;
+#   * a pool id that does not exist reports 0, not a stray number.
+DEVICE_TEST='
+let vram = 67108864;
+fn main() -> int64 {
+    let sram = mlx_device_capacity(0);
+    if (sram <= 0) {
+        println(str_concat("FAIL: host memory reported as ", int64_to_str(sram)));
+        return 1;
+    }
+    let vram_cap = mlx_device_capacity(1);
+    if (vram_cap < 0) {
+        println(str_concat("FAIL: VRAM capacity reported as ", int64_to_str(vram_cap)));
+        return 1;
+    }
+    if (mlx_device_capacity(2) != 0) {
+        println("FAIL: a non-existent pool reported a device capacity");
+        return 1;
+    }
+    println(str_concat("ok: device capacities readable (SRAM ",
+                       int64_to_str(sram)));
+    return 0;
+}'
+
+expect_runtime "the device capacity is readable alongside the declaration" "$DEVICE_TEST"
 
 echo
 if [ "$FAIL" = 0 ]; then

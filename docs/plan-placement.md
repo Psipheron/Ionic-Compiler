@@ -1,8 +1,8 @@
 # Functional Hardware-Placement Awareness
 
 Status: **Stage A complete, Stage B (B1–B6) complete, Stage C partially complete
-(pool as a runtime fact), Stage D item 2 complete (allocator backstop)** —
-revised 2026-11-03
+(pool as a runtime fact), Stage D items 2 and 5 complete (allocator backstop,
+device-capacity comparison)** — revised 2026-11-03
 Author: audit + design pass
 Scope: `src/semantic/checker.ionic`, `src/ionic_model_runtime.c`,
 `src/codegen/native.ionic`, `docs/`
@@ -540,7 +540,8 @@ allocation**, not corrupt memory later.
 This is where the "different capacities" part of the model becomes real rather
 than advisory.
 
-**Item 2 (the allocator backstop) is done — 2026-11-03.** Items 3–5 remain.
+**Item 2 (the allocator backstop) is done — 2026-11-03, and so is item 5 (the
+device-capacity comparison).** Items 3 and 4 remain.
 
 What landed:
 
@@ -576,6 +577,36 @@ What landed:
   returns `-1` for a pool id that does not exist and `0` for a declared-but-
   unbounded pool, so "no such pool" and "no limit" stay distinguishable.
 
+**Item 5 (comparing the declaration against the device) is done — 2026-11-03.**
+What landed:
+
+- **`mlx_device_capacity(pool)`** answers the other half of the question: what
+  the machine offers, rather than what the source asked for. For VRAM that is
+  Metal's `max_recommended_working_set_size`, reached through
+  `mlx_device_new_type` → `mlx_device_info_new` → `mlx_device_info_get` →
+  `mlx_device_info_get_size`. It is deliberately **not** `memory_size`: on this
+  8 GiB machine `memory_size` reports 8 GiB while the working set is 5.33 GiB,
+  and the gap between those two numbers is exactly what the check exists to
+  catch.
+- **The comparison is a warning, and it is lazy.** `pool_check_declaration()`
+  runs from `pool_charge()` on the first allocation that touches a pool, once
+  per pool. It warns when the declaration exceeds the device and says which two
+  numbers disagree. It does not refuse: a budget larger than today's machine is
+  a program that will run on a bigger one, and the allocator still refuses any
+  individual allocation that does not fit. Startup would have been the wrong
+  site — the repo's own `vram` examples declare 24 GiB and never allocate, so a
+  startup check would warn on programs that are simply not running yet. A
+  declaration only becomes a claim about *this* machine when the program asks
+  this machine for accelerator bytes.
+- **Non-MLX stub parity.** `ionic_mlx_device_capacity` exists in both branches:
+  SRAM is answerable everywhere (physical host RAM is a fact about any machine),
+  and VRAM reports `0` — "unknown" — where no accelerator is linked in, rather
+  than pretending.
+
+Verified on this machine: SRAM 8.0 GiB, VRAM 5.3 GiB, and a `let vram = 24 GiB;`
+program that allocates prints the warning exactly once and continues.
+
+
 **Why the probe that motivated this was the right probe.** `let vram = 67108864;`
 plus `mlx_zeros([n, n], 0).toGpu()` with `n = 65536` allocates 16 GiB. The static
 check exempts it and warns, by design (D.0); before this change the program then
@@ -599,11 +630,6 @@ also checks that the declared number is the one the runtime reports.
   nor the allocator sees the combination until the *sum* exceeds the pool at the
   second allocation — which does abort, but with the inner function named rather
   than the caller.
-- **Comparing the declared `vram` against the device.** `mlx_pool_capacity` makes
-  the declared number readable, so this is now a startup check: compare it with
-  the backend's real budget and warn when the source of truth is a fiction. The
-  piece that is still missing is the "real budget" query — `mlx_active_memory` and
-  `mlx_peak_memory` describe *this process's* use, not the card's capacity.
 - **A pool-agnostic charge path.** `pool_charge` currently lives in the MLX
   section because that is where `g_pool_bytes[]` is maintained. A second backend
   would need it to move out alongside `g_pool_capacity[]`, which is the Stage C
@@ -622,7 +648,7 @@ can miss an over-budget program.
 | **No live-range analysis.** A binding keeps its charge for the whole scope, even after `mlx_free` or after it is provably dead. | Four 256 MiB values plus a freed fifth are rejected: 5 x 256 MiB is counted, though only 4 are live. | Over-approximates the peak, so it can reject a program that would fit. Conservative direction, but it is the *opposite* error from the ones below. |
 | **Interprocedural peak is not modelled.** `let n = inner()` where the caller already holds 1 GiB is not charged for what `inner` allocates. | A `@gpu` fn holding 1 GiB calls another that allocates 1 GiB; both compile, and the real peak is 2 GiB against a 1 GiB pool. | Under-approximates: the classic over-budget-at-3am case, still reachable. |
 | **Runtime-sized shapes are unbounded, and only warned about.** A shape element that is not an integer literal makes the size unknown, and unknown values are exempt (decision 4, narrowed). | `mlx_zeros([n, n], 0).toGpu()` in a budgeted scope still compiles for any `n`, but now prints a `[warn]` naming the value and the scope's known total. | Under-approximates. The exemption is *reported* rather than counted as a rejection, so "this fits" and "this was never sized" are distinguishable — but nothing enforces it. |
-| **The declared `vram` is never checked against the device.** The pool size is a compile-time literal. | Nothing compares it to the backend's real memory. | A program can declare more VRAM than exists and be "correct". |
+| **The declared `vram` is never checked against the device** *statically*. The pool size is a compile-time literal and no compilation step knows what machine will run the binary. | Nothing at build time compares it to the backend's real memory. The runtime now compares it at the first allocation and warns. | A program can still declare more VRAM than exists and be "correct"; it is now told so when it runs, rather than believing it. |
 | **`gpu { }` inside `@gpu(f)` resets the running total** instead of adding to it. | Noted at `budget_begin(0)` in `checker.ionic`; the nested block checks its own locals against the whole pool. | Under-approximates for nested scopes. |
 
 Two of these are the difference between "catches obvious mistakes" and "makes
@@ -648,9 +674,10 @@ Ordering, if this is to become the goal it claims to be:
    into an accurate one and makes the check *sufficient* for values it can size.
 4. **Interprocedural peak** — needs call-graph summaries (what a callee allocates
    and whether it frees), which is the largest piece of work here.
-5. **Device-capacity check at startup**, comparing the declared `vram` to
-   `mlx_pool_bytes` / the backend's real budget and warning when the source of
-   truth is a fiction.
+5. **A compile-time device-capacity check** is not possible and never will be: a
+   compile knows nothing about the machine that will run the binary. The
+   *runtime* comparison landed instead (Stage D item 5) — it warns, once per
+   pool, at the first allocation that touches it.
 
 ### Stage E — Tests
 
@@ -775,14 +802,16 @@ correctly and, since Stage B, also checks whether a scope's values fit its
 declared budget. As of Stage C the runtime matches the types: a tensor handle
 carries its pool, each pool owns a stream, and a transfer is a real move that
 charges the destination pool — so `tensor@cpu` and `tensor@gpu` differ at run
-time and not only in the checker. Since Stage D item 2 the declaration is also
-enforced rather than merely checked: the runtime is told the declared capacity
-at startup and refuses an allocation that would not fit, so a program that gets
-past the static check cannot go on to allocate ten thousand times its stated
-budget. MLX is retained as the unified-memory backend, the point in the design
-space where a transfer moves accounting but not bytes, rather than as the
-definition of the semantics. Remaining: live-range analysis and interprocedural
-peak (which together make the *static* check sufficient rather than necessary),
-comparing the declared `vram` against the real device capacity, the ambient-pool
-runtime stack, and the refusal path for a GPU scope on a machine with no
-accelerator.
+time and not only in the checker. Since Stage D items 2 and 5 the declaration is
+both enforced and checked against reality: the runtime is told the declared
+capacity at startup, refuses an allocation that would not fit, and warns — once
+per pool, at the first allocation — when the declaration exceeds what the device
+actually offers. So a program that gets past the static check cannot go on to
+allocate ten thousand times its stated budget, and a program whose declaration is
+fiction for this machine is told which two numbers disagree instead of believing
+it. MLX is retained as the unified-memory backend, the point in the design space
+where a transfer moves accounting but not bytes, rather than as the definition of
+the semantics. Remaining: live-range analysis and interprocedural peak (which
+together make the *static* check sufficient rather than necessary), the
+ambient-pool runtime stack, and the refusal path for a GPU scope on a machine with
+no accelerator.

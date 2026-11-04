@@ -416,6 +416,15 @@ for that pool (0 for an unbounded pool, -1 for a pool id that does not exist),
 transfer between them is free on this backend. They exist so the pool model is
 observable, and therefore testable, from Ionic.
 
+`mlx_device_capacity(p)` is the other half of `mlx_pool_capacity(p)`: what the
+machine actually offers the pool, rather than what the source asked for. For
+VRAM that is Metal's `max_recommended_working_set_size` — deliberately not the
+card's nominal memory, because on Apple silicon the GPU may address only a slice
+of the unified RAM and that slice is the number an allocator will honour (8 GiB
+of physical memory generally reports about 5.3 GiB here). For SRAM it is physical
+host memory. It returns 0 when the answer cannot be determined, which on a build
+with no accelerator linked in is the honest VRAM answer rather than a guess.
+
 The declared capacity is not merely reported: the runtime is told it at startup
 and **enforces it at each allocation**. A request that would not fit aborts the
 process with `ionic: accelerator pool exhausted: …`, naming the request, the

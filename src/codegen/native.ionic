@@ -1749,6 +1749,7 @@ fn ncg_call(int64 node) -> int64 {
     if (str_eq(callee, "mlx_pool"))            { real_callee = "ionic_mlx_pool"; }
     if (str_eq(callee, "mlx_pool_bytes"))      { real_callee = "ionic_mlx_pool_bytes"; }
     if (str_eq(callee, "mlx_pool_capacity"))   { real_callee = "ionic_mlx_pool_capacity"; }
+    if (str_eq(callee, "mlx_device_capacity")) { real_callee = "ionic_mlx_device_capacity"; }
     if (str_eq(callee, "mlx_pool_count"))      { real_callee = "ionic_mlx_pool_count"; }
     if (str_eq(callee, "mlx_pools_unified"))   { real_callee = "ionic_mlx_pools_unified"; }
     if (str_eq(callee, "mlx_add"))             { real_callee = "ionic_mlx_add"; }

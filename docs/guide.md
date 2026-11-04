@@ -322,16 +322,24 @@ line. So the two halves compose: the checker rejects what it can *prove*, and th
 allocator rejects the rest where the bytes are actually taken.
 
 `mlx_pool_capacity(pool)` reports what the program declared (0 for an unbounded
-pool, -1 for a pool id that does not exist), so a program can compare its
-declaration against the device and warn before allocating rather than after:
+pool, -1 for a pool id that does not exist), and `mlx_device_capacity(pool)`
+reports what the machine actually offers (0 when it cannot be determined). A
+program can compare the two before allocating rather than after:
 
 ```ionic
 let vram = 25769803776;
-if (mlx_pool_capacity(1) < needed) {
-    println("declared pool is too small for this model");
-    return 1;
+let have = mlx_device_capacity(1);
+if (have > 0 && mlx_pool_capacity(1) > have) {
+    println("this device cannot honour the declared pool; running with less");
 }
 ```
+
+The runtime makes that same comparison itself, once per pool, at the first
+allocation: a declaration larger than the device produces a warning naming both
+numbers. It does not refuse — a budget bigger than today's machine is a program
+that will run on a bigger one — but it is not silent either. The comparison is
+lazy rather than done at startup because a declaration is only a claim about
+*this* machine once the program actually asks this machine for accelerator bytes.
 
 A transfer is a **move**. After `let g = x.toGpu();` the binding `x` no longer
 owns a value, and reading it is a compile error that names the transfer and the
