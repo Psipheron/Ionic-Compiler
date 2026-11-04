@@ -1,7 +1,8 @@
 # Functional Hardware-Placement Awareness
 
 Status: **Stage A complete, Stage B (B1–B6) complete, Stage C partially complete
-(pool as a runtime fact), Stage D pending** — revised 2026-11-03
+(pool as a runtime fact), Stage D item 2 complete (allocator backstop)** —
+revised 2026-11-03
 Author: audit + design pass
 Scope: `src/semantic/checker.ionic`, `src/ionic_model_runtime.c`,
 `src/codegen/native.ionic`, `docs/`
@@ -526,7 +527,9 @@ bytes between pools and are charged exactly once ✅ (the `pool model at runtime
 section of `scripts/placement_check.sh` asserts both directions, the
 no-double-counting property, and that a free returns the pool to its baseline);
 a GPU scope on a machine with no accelerator refuses rather than running on the
-host — **not yet implemented**, so not yet assertable.
+host — **not yet implemented**, so not yet assertable. What that case needs is
+an accelerator-free *build* of the MLX backend; a non-MLX build answers "no
+backend" rather than "backend present, no device", which is a different question.
 
 ### Stage D — Capacity enforcement at runtime
 
@@ -535,8 +538,76 @@ enforcement: an allocation that exceeds the pool must fail **at the
 allocation**, not corrupt memory later.
 
 This is where the "different capacities" part of the model becomes real rather
-than advisory, and it needs a per-backend allocator. Deferred because it
-depends on the backend existing (Stage C).
+than advisory.
+
+**Item 2 (the allocator backstop) is done — 2026-11-03.** Items 3–5 remain.
+
+What landed:
+
+- **The declared capacity is published, not just checked.** `ionic_pool_set_capacity(pool, bytes)`
+  is emitted by `ncg_main_wrapper` immediately after `ionic_runtime_init`, taking
+  the number from the same `let vram = N;` the checker read. `vram` is an
+  immutable integer literal, so codegen inlines it as a compile-time constant and
+  it has **no runtime storage** — which is exactly why the value has to be
+  emitted at startup rather than read from a global. One declaration, one number,
+  both halves.
+- **Pool identity and capacity live outside `#if IONIC_MLX_ACTIVE`.** The pool
+  model is a language concept, not a backend detail, so `IONIC_POOL_CPU` /
+  `_GPU` / `_NONE` / `_COUNT` and `g_pool_capacity[]` are declared near the top of
+  `src/ionic_model_runtime.c`. Only the MLX half — streams and byte accounting —
+  stays inside the conditional. Consequence: `mlx_pool_capacity()` answers
+  correctly on a platform with no backend at all, because the question "what did
+  the program declare" does not require an accelerator.
+- **The refusal is at the charge site.** `pool_charge()` is the single place
+  bytes are accounted, so the check lives there: a positive request that does not
+  fit `capacity - used` calls `pool_capacity_panic()`, which reports the request,
+  the pool, the current occupancy, the declared capacity, and where the capacity
+  came from. The comparison is written as `bytes > cap - used` rather than
+  `used + bytes > cap` so a huge request cannot overflow into a negative sum and
+  slip past.
+- **`exit(1)`, not a NULL handle.** Ionic has no way to observe NULL from an
+  `mlx_*` call — every one returns a tensor or a scalar — so returning NULL would
+  turn an over-budget program into a segfault at an unrelated line, which is the
+  "corrupt memory later" this exists to prevent. `ionic_bounds_panic` makes the
+  same choice for the same reason, and §4.4a's "refuse rather than fall back"
+  principle is the same argument one level up.
+- **`mlx_pool_capacity(pool)` is a new builtin** so a program can read back what
+  it declared and compare it against the device (item 5's prerequisite). It
+  returns `-1` for a pool id that does not exist and `0` for a declared-but-
+  unbounded pool, so "no such pool" and "no limit" stay distinguishable.
+
+**Why the probe that motivated this was the right probe.** `let vram = 67108864;`
+plus `mlx_zeros([n, n], 0).toGpu()` with `n = 65536` allocates 16 GiB. The static
+check exempts it and warns, by design (D.0); before this change the program then
+ran to completion and exited 0, so the 64 MiB declaration was pure fiction. It
+now aborts with `ionic: accelerator pool exhausted: a 17179869184-byte allocation
+does not fit VRAM (0 of 67108864 bytes in use)` and exit 1. Both halves are
+asserted in `scripts/placement_check.sh` (`the allocator backstop` section), which
+also checks that the declared number is the one the runtime reports.
+
+**Still missing:**
+
+- **Live-range analysis**, so a value that is provably dead stops being charged.
+  Today the runtime release is driven by `mlx_free` and by a transfer, so a value
+  that simply falls out of scope keeps its charge until the process ends. That is
+  the same over-approximation the static check makes, and the same piece of work
+  fixes both.
+- **Interprocedural peak.** A callee's allocation is charged to the callee's
+  frame and released on return, which is correct for a real peak but means the
+  caller's budget is not consulted. A caller holding 1 GiB can call a function
+  that allocates another 1 GiB against a 1 GiB pool, and neither the static check
+  nor the allocator sees the combination until the *sum* exceeds the pool at the
+  second allocation — which does abort, but with the inner function named rather
+  than the caller.
+- **Comparing the declared `vram` against the device.** `mlx_pool_capacity` makes
+  the declared number readable, so this is now a startup check: compare it with
+  the backend's real budget and warn when the source of truth is a fiction. The
+  piece that is still missing is the "real budget" query — `mlx_active_memory` and
+  `mlx_peak_memory` describe *this process's* use, not the card's capacity.
+- **A pool-agnostic charge path.** `pool_charge` currently lives in the MLX
+  section because that is where `g_pool_bytes[]` is maintained. A second backend
+  would need it to move out alongside `g_pool_capacity[]`, which is the Stage C
+  item 2 factoring.
 
 ### D.0 What the static check does *not* catch — measured, not assumed
 
@@ -570,9 +641,9 @@ Ordering, if this is to become the goal it claims to be:
    exemption, it is just no longer invisible. `sc_unknown_count` /
    `sc_unknown_first` are reset per scope and saved/restored around a nested
    `gpu { }`, so one value produces one warning.
-2. **Stage D's allocator**, so the program that gets past the checker still
-   fails loudly at the allocation rather than at an OOM hours later. This is
-   the backstop the whole design assumes and that does not exist yet.
+2. ✅ **Stage D's allocator.** Done — see Stage D. The program that gets past
+   the checker now fails loudly at the allocation rather than at an OOM hours
+   later. The ordering list below stays because items 3–5 are still open.
 3. **Live-range analysis**, which converts the conservative over-approximation
    into an accurate one and makes the check *sufficient* for values it can size.
 4. **Interprocedural peak** — needs call-graph summaries (what a callee allocates
@@ -600,10 +671,21 @@ Ordering, if this is to become the goal it claims to be:
    (and says so) on a build with no MLX backend linked.
 4. Mastery test: refusal — a GPU scope on a machine with no accelerator exits
    with a clear message rather than running on the host.
+   **Not done**, and not assertable yet: it needs an *accelerator-free build* of
+   the MLX backend (backend present, no Metal device). A non-MLX build answers
+   "no backend", which is a different question and is already the case today.
 5. Runtime test: an allocation exceeding the pool fails cleanly.
+   ✅ **Done** — `the allocator backstop` section of `scripts/placement_check.sh`:
+   a 16 GiB request against a declared 64 MiB pool aborts with
+   `accelerator pool exhausted` and a non-zero exit, and a second case asserts
+   that `mlx_pool_capacity(1)` returns exactly what `let vram = N;` declared (and
+   `-1` for a pool id that does not exist). The harness distinguishes "refused"
+   from "crashed differently" by also requiring the runtime's own message, and
+   skips (loudly) on a build with no backend.
 6. **CI coverage on Linux** for 1–4. The checker behaviour is testable there
    without any accelerator; the refusal path (4) is a single well-defined exit
-   that CI can assert.
+   that CI can assert. Note that the *allocator* half (5) cannot run on Linux
+   until a second backend exists — the pool charge path lives in the MLX section.
 
 ---
 
@@ -693,8 +775,14 @@ correctly and, since Stage B, also checks whether a scope's values fit its
 declared budget. As of Stage C the runtime matches the types: a tensor handle
 carries its pool, each pool owns a stream, and a transfer is a real move that
 charges the destination pool — so `tensor@cpu` and `tensor@gpu` differ at run
-time and not only in the checker. MLX is retained as the unified-memory backend,
-the point in the design space where a transfer moves accounting but not bytes,
-rather than as the definition of the semantics. Remaining: the pooled-allocator
-enforcement of Stage D, the ambient-pool runtime stack, and the refusal path for
-a GPU scope on a machine with no accelerator.
+time and not only in the checker. Since Stage D item 2 the declaration is also
+enforced rather than merely checked: the runtime is told the declared capacity
+at startup and refuses an allocation that would not fit, so a program that gets
+past the static check cannot go on to allocate ten thousand times its stated
+budget. MLX is retained as the unified-memory backend, the point in the design
+space where a transfer moves accounting but not bytes, rather than as the
+definition of the semantics. Remaining: live-range analysis and interprocedural
+peak (which together make the *static* check sufficient rather than necessary),
+comparing the declared `vram` against the real device capacity, the ambient-pool
+runtime stack, and the refusal path for a GPU scope on a machine with no
+accelerator.

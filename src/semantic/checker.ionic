@@ -1439,6 +1439,11 @@ fn register_builtins() -> int64 {
     bparam(1, TY_TENSOR_CPU);
     register_builtin("mlx_pool_bytes",    1, TY_INT64,   "");
     bparam(1, TY_INT64);
+    // The declared size of a pool (0 = unbounded), so a program can compare what
+    // it declared against what the device actually has. The runtime enforces it
+    // either way; this only makes the number readable.
+    register_builtin("mlx_pool_capacity", 1, TY_INT64,   "");
+    bparam(1, TY_INT64);
     register_builtin("mlx_pool_count",    0, TY_INT64,   "");
     register_builtin("mlx_pools_unified", 0, TY_INT64,   "");
     // Elementwise binary

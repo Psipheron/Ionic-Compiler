@@ -311,8 +311,27 @@ a silent exemption did not.
 
 Live-range analysis is also not done yet: the sum covers every sized binding in
 the scope, so a value that dies before the next allocation still counts.
-Runtime enforcement of what cannot be proven statically is `docs/plan-placement.md`
-stage D.
+
+What the compiler cannot prove is caught at run time instead. The declared pool
+size is published to the runtime at startup, and every allocation is charged
+against it; one that would not fit aborts with a message naming the request, the
+pool, the current occupancy, and the declared capacity. That is `exit(1)` rather
+than a NULL handle, because Ionic has no way to observe NULL from an `mlx_*` call
+— returning one would turn an over-budget program into a segfault at an unrelated
+line. So the two halves compose: the checker rejects what it can *prove*, and the
+allocator rejects the rest where the bytes are actually taken.
+
+`mlx_pool_capacity(pool)` reports what the program declared (0 for an unbounded
+pool, -1 for a pool id that does not exist), so a program can compare its
+declaration against the device and warn before allocating rather than after:
+
+```ionic
+let vram = 25769803776;
+if (mlx_pool_capacity(1) < needed) {
+    println("declared pool is too small for this model");
+    return 1;
+}
+```
 
 A transfer is a **move**. After `let g = x.toGpu();` the binding `x` no longer
 owns a value, and reading it is a compile error that names the transfer and the

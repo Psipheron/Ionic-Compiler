@@ -32,10 +32,16 @@
 #   mastery/04_placement_types.ionic    -> still compiles (the tutorial's reference)
 #   mastery/04_pool_polymorphism.ionic  -> still compiles (transfers, done correctly)
 #   mastery/fail/use_after_move.ionic   -> rejected (the tutorial's fail-case)
+#   over-budget allocation at run time  -> refused by the allocator (Stage D)
+#   declared pool readable at run time  -> matches what was written
 #
-# Everything here is decided statically, so it runs on any OS with no
-# accelerator present. That is the point: the checker's behaviour is portable
-# even when the backend is not.
+# Everything above the "runtime" sections is decided statically, so it runs on
+# any OS with no accelerator present. That is the point: the checker's behaviour
+# is portable even when the backend is not. The runtime sections do the opposite
+# on purpose — they execute the binary, because a budget the checker merely
+# *believes* is not a budget. They report "skip" rather than "ok" when no backend
+# is linked in, so a platform without one cannot look like it verified something
+# it never ran.
 set -u
 # Run from the repo root regardless of where the script is invoked from, but
 # derive it from the script's own location: a hard-coded absolute path made this
@@ -608,9 +614,49 @@ expect_runtime() {
   fi
 }
 
+# expect_runtime_refuses <name> <needle> <source>
+#
+# The program must compile, and then must FAIL at run time with `needle` on its
+# output. This is the Stage D backstop: the static checker exempts what it cannot
+# size, so an over-budget allocation has to be caught where the bytes are
+# charged. A pass here means the program did NOT run to completion — the mirror
+# image of expect_runtime, and the reason both exist.
+#
+# The same SKIP convention applies: without a backend there is nothing to
+# allocate, so the program reports the skip and exits 0.
+expect_runtime_refuses() {
+  name=$1; needle=$2; src=$3
+  printf '%s\n' "$src" > "$WORK/r.ionic"
+  rm -f "$WORK/r" "$WORK/r.o"
+  if ! "$COMPILER" "$WORK/r.ionic" -o "$WORK/r" >"$WORK/err.txt" 2>&1; then
+    echo "FAIL  $name  (did not compile)"
+    sed -n '1,6p' "$WORK/err.txt"
+    FAIL=1
+    return
+  fi
+  "$WORK/r" >"$WORK/out.txt" 2>&1
+  rc=$?
+  if [ "$rc" = 0 ] && grep -q '^SKIP:' "$WORK/out.txt"; then
+    echo "skip  $name  ($(sed -n '1p' "$WORK/out.txt"))"
+    return
+  fi
+  if [ "$rc" = 0 ]; then
+    echo "FAIL  $name  (ran to completion; the pool backstop did not fire)"
+    sed -n '1,20p' "$WORK/out.txt"
+    FAIL=1
+    return
+  fi
+  if NO_COLOR=1 grep -q -- "$needle" "$WORK/out.txt"; then
+    echo "ok    $name  (refused: $needle)"
+  else
+    echo "FAIL  $name  (failed, but not because of '$needle')"
+    sed -n '1,20p' "$WORK/out.txt"
+    FAIL=1
+  fi
+}
+
 echo
 echo "=== pool model at runtime (Stage C) ==="
-
 RUNTIME_TEST='
 fn check(string name, bool ok) -> int64 {
     if (ok) {
@@ -671,6 +717,73 @@ fn main() -> int64 {
 }'
 
 expect_runtime "transfers move bytes between pools, accounting once" "$RUNTIME_TEST"
+
+echo
+echo "=== the allocator backstop (Stage D) ==="
+
+# The static check above is a necessary condition, not a sufficient one: it
+# exempts every value it cannot size, and it warns while doing so. That leaves a
+# hole a declaration-only pool cannot survive — the declared `vram` becomes a
+# fiction and a program allocates whatever the machine will give it.
+#
+#     let vram = 67108864;              // 64 MiB
+#     @gpu(1.0) fn grow(int64 n) -> int64 {
+#         let big = mlx_zeros([n, n], 0).toGpu();   // 16 GiB when n = 65536
+#     }
+#
+# Before the backstop this compiled (with the unsized warning) and ran to
+# completion at exit 0, having allocated 16 GiB against a 64 MiB declaration.
+# The allocation is refused now, at the line that made it.
+#
+# The program is written so that "did not fit" is distinguishable from "crashed
+# for another reason": it prints the pool total first and never reaches the
+# second line, so the harness sees a non-zero exit AND the runtime's own message.
+BACKSTOP_TEST='
+let vram = 67108864;                 // 64 MiB declared
+@gpu(1.0) fn grow(int64 n) -> int64 {
+    let big = mlx_zeros([n, n], 0).toGpu();   // n = 65536 -> 16 GiB
+    return mlx_pool_bytes(1);
+}
+fn main() -> int64 {
+    if (mlx_available() == 0) {
+        println("SKIP: no MLX backend compiled in");
+        return 0;
+    }
+    println(str_concat("pool capacity: ", int64_to_str(mlx_pool_capacity(1))));
+    let used = grow(65536);
+    println(str_concat("UNREACHED used: ", int64_to_str(used)));
+    return 0;
+}'
+
+expect_runtime_refuses "an over-budget allocation is refused at run time" \
+  "accelerator pool exhausted" "$BACKSTOP_TEST"
+
+# The declaration must be *published*, not merely checked: a program that asks
+# the runtime what it declared has to be told. This is what stops the checker and
+# the allocator from disagreeing about the number — each keeping its own copy is
+# exactly how a 64 MiB declaration ends up compared against a 24 GiB assumption.
+#
+# No allocation happens here, so this runs (rather than skipping) wherever MLX
+# is absent too: capacity is a language-level fact and is answered on every
+# platform.
+CAPACITY_TEST='
+let vram = 67108864;
+fn main() -> int64 {
+    let cap = mlx_pool_capacity(1);
+    if (cap != 67108864) {
+        println(str_concat("FAIL: declared 67108864, runtime reports ",
+                           int64_to_str(cap)));
+        return 1;
+    }
+    if (mlx_pool_capacity(2) != -1) {
+        println("FAIL: a non-existent pool did not report -1");
+        return 1;
+    }
+    println("ok: the declared pool size is readable at run time");
+    return 0;
+}'
+
+expect_runtime "the declared pool size is published to the runtime" "$CAPACITY_TEST"
 
 echo
 if [ "$FAIL" = 0 ]; then

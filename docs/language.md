@@ -149,13 +149,20 @@ exactly one pool at a time, so the compiler can check that the GPU pool is
 not oversubscribed. A copy is available as a separate, explicitly-named
 operation for when the source must stay usable.
 
-### Capacity is checked at compile time
+### Capacity is checked at compile time and enforced at run time
 
 The compiler sums the sizes of the `tensor@gpu` values live in a scope and
-rejects the program if the total exceeds that scope's share of the pool. A
-tensor whose size cannot be determined statically is rejected in a GPU scope
-rather than silently allowed: an unbounded GPU allocation would defeat the
-budget.
+rejects the program if the total exceeds that scope's share of the pool. A value
+whose size cannot be determined statically is exempt rather than rejected — a
+tensor *parameter*, or the result of an op the size pass does not model — and the
+exemption is reported as a warning, because rejecting it would make every
+function that takes a tensor uncompilable.
+
+What the compiler cannot prove is caught at the allocation instead. The declared
+pool size is published to the runtime at startup, and a request that would not
+fit aborts with a message naming the request, the pool, its occupancy, and the
+declared capacity. So "the values fit" is a claim the two halves establish
+together: the checker rejects what it can prove, the allocator rejects the rest.
 
 ### Unified memory
 
@@ -403,9 +410,20 @@ is why MLX is the *unified memory* backend — it is one implementation of the p
 model, not the model itself.
 
 `mlx_pool(t)` reports which pool a handle lives in, `mlx_pool_bytes(p)` how many
-bytes that pool currently holds, `mlx_pool_count()` how many pools there are, and
-`mlx_pools_unified()` whether a transfer between them is free on this backend.
-They exist so the pool model is observable, and therefore testable, from Ionic.
+bytes that pool currently holds, `mlx_pool_capacity(p)` what the program declared
+for that pool (0 for an unbounded pool, -1 for a pool id that does not exist),
+`mlx_pool_count()` how many pools there are, and `mlx_pools_unified()` whether a
+transfer between them is free on this backend. They exist so the pool model is
+observable, and therefore testable, from Ionic.
+
+The declared capacity is not merely reported: the runtime is told it at startup
+and **enforces it at each allocation**. A request that would not fit aborts the
+process with `ionic: accelerator pool exhausted: …`, naming the request, the
+pool, its current occupancy, and the declared capacity. That is `exit(1)` rather
+than a NULL handle because Ionic has no way to observe NULL from an `mlx_*` call
+— returning one would turn an over-budget program into a segfault at an unrelated
+line. `mlx_pool_capacity()` exists so a program can compare its declaration
+against the device *before* allocating.
 
 Unlike `load_model`, **handles are not RAII-freed**: call `mlx_free()`
 explicitly.

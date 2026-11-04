@@ -172,6 +172,23 @@ it into an error would reject every function that takes a tensor. But "this fits
 and "this was never measured" are now different answers, which a silent pass
 could not express.
 
+What the checker cannot see is caught by the **allocator** instead. The declared
+`vram` is published to the runtime at startup (it is a compile-time constant, so
+there is no global variable to read), and every allocation is charged against the
+pool's live occupancy. One that would not fit aborts there and then:
+
+```
+ionic: accelerator pool exhausted: a 17179869184-byte allocation does not fit
+VRAM (0 of 67108864 bytes in use)
+       the declared budget came from `let vram = 67108864;`; the static checker
+       could not size this value, so what it measured was a lower bound. …
+```
+
+So the two halves compose: the checker rejects what it can *prove*, and the
+allocator rejects the rest where the bytes are actually taken. Neither is
+sufficient alone, which is why `mlx_pool_capacity(pool)` exists — a program can
+read back what it declared before it allocates.
+
 ```ionic
 let vram = 25769803776;
 @gpu(0.25) fn helper(tensor@gpu x) -> tensor@gpu { return x; }   // ok
@@ -197,8 +214,12 @@ statically-sized allocations exceed its share of the pool* (stage B4), and to
 but not yet to prove every possible over-budget program is caught, and you
 should not assume arbitrary `tensor@gpu` math executes on an accelerator.
 
-Nor is the *runtime* enforcing capacity yet: an over-budget program that the
-static pass cannot see is not stopped at the allocation. That is stage D.
+Nor is the checker a *proof*: it catches what it can prove and reports the values
+it could not size. What it cannot see is stopped by the runtime instead — the
+declared pool size is published at startup and every allocation is charged against
+it, so an over-budget program aborts at the allocation with a message naming the
+request, the pool, and the declared capacity. Both halves are real; neither is
+sufficient alone.
 
 `@cpu` and `@gpu` name **memory pools** — SRAM and VRAM — not devices. On
 Apple silicon the two are physically the same memory, so a transfer there does
@@ -283,8 +304,9 @@ not size.
 - [ ] You can predict whether a given `gpu { }` body is rejected, and why.
 - [ ] You can explain why a tensor *parameter* is exempt from the scope budget.
 - [ ] You can explain why only transfers move while builtins borrow.
-- [ ] You know where placement is enforced and where it is *not* (no kernel lowering,
-      no runtime capacity enforcement).
+- [ ] You know where placement is enforced and where it is *not* (no kernel
+      lowering), and that the declared pool is enforced at the allocation as well
+      as at compile time.
 - [ ] You can produce both the mismatch hint and the contradiction error.
 
 ## [Next](05-stdlib-and-modules.md)

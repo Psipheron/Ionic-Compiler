@@ -96,6 +96,46 @@ static void ionic_array_push_i64(IonicArray *a, int64_t v) {
     ((int64_t *)a->data)[a->len++] = v;
 }
 
+/* ── Memory pools: identity and capacity (Stages C–D) ─────────────────────────
+ * `tensor@cpu` / `tensor@gpu` name *pools*, not devices — SRAM (host memory,
+ * capacity = system RAM) and VRAM (accelerator memory, capacity = the card).
+ *
+ * These live outside the MLX conditional because the pool model is a
+ * *language* concept: `let vram = N;` is checked at compile time and enforced at
+ * run time whether or not a backend is linked in. Keeping the ids and the
+ * declared capacity in one place is what lets the checker and the allocator
+ * agree on a number instead of each holding its own copy.
+ *
+ * IONIC_POOL_NONE is for a tensor that has not been assigned to a pool yet;
+ * every handle produced by a backend ends up in CPU or GPU.
+ */
+#define IONIC_POOL_CPU  0
+#define IONIC_POOL_GPU  1
+#define IONIC_POOL_NONE (-1)
+#define IONIC_POOL_COUNT 2
+
+/* Declared capacity of each pool, in bytes; 0 means "unbounded".
+ *
+ * Set once at startup by ionic_pool_set_capacity(), which codegen emits from
+ * the same `let vram = N;` the checker read. SRAM stays unbounded: `vram` names
+ * the accelerator pool, and the host pool's capacity is the machine's, not the
+ * source's. */
+static int64_t g_pool_capacity[IONIC_POOL_COUNT] = {0, 0};
+
+/* Publish the declared size of `pool`. Called from the generated `main` before
+ * any user code runs. A negative or zero size is "unbounded" — the checker
+ * already rejects a non-positive `vram`, so the only caller that can pass 0 is
+ * a program that declares no pool at all. */
+void ionic_pool_set_capacity(int64_t pool, int64_t bytes) {
+    if (pool < 0 || pool >= IONIC_POOL_COUNT) return;
+    g_pool_capacity[pool] = bytes > 0 ? bytes : 0;
+}
+
+int64_t ionic_mlx_pool_capacity(int64_t pool) {
+    if (pool < 0 || pool >= IONIC_POOL_COUNT) return -1;
+    return g_pool_capacity[pool];
+}
+
 /* ── System runtime ───────────────────────────────────────────────────────── */
 
 static int    ionic_argc = 0;
@@ -755,26 +795,17 @@ static int64_t mlx_dtype_to_ionic(mlx_dtype d) {
 static char  g_mlx_err[512] = {0};
 static int   g_mlx_inited = 0;
 
-/* ── Memory pools ────────────────────────────────────────────────────────────
- * `tensor@cpu` / `tensor@gpu` name *pools*, not devices — SRAM (host memory,
- * capacity = system RAM) and VRAM (accelerator memory, capacity = the card).
- * The checker enforces the pool a value belongs to statically; the runtime's
- * job is to make that accountancy real, so a transfer can be observed and a
- * pool's occupancy can be read back.
+/* ── Memory pools: MLX-side state ─────────────────────────────────────────────
+ * Pool ids and declared capacity live near the top of this file, outside the
+ * MLX conditional, because the pool model is a *language* concept: it is checked
+ * and enforced whether or not a backend is linked in. What remains here is the
+ * MLX half — the per-pool streams and the live byte accounting.
  *
  * On Apple silicon (unified memory) both pools address the same physical bytes:
  * a transfer changes which pool the value is *charged to* and moves no data.
  * On a discrete backend the streams differ and the transfer copies. Keeping the
  * pool in the handle is what makes those two cases distinguishable at all.
- *
- * IONIC_POOL_NONE is for a tensor that has not been assigned to a pool yet;
- * every handle produced by a backend ends up in CPU or GPU.
  */
-#define IONIC_POOL_CPU  0
-#define IONIC_POOL_GPU  1
-#define IONIC_POOL_NONE (-1)
-#define IONIC_POOL_COUNT 2
-
 static mlx_stream g_mlx_cpu_stream;   /* SRAM stream; created at init */
 static mlx_stream g_mlx_gpu_stream;   /* VRAM stream; created at init */
 
@@ -848,8 +879,49 @@ static int pools_unified(void) {
 #endif
 }
 
+/* Report and abort when `bytes` would not fit in `pool`.
+ *
+ * This is Stage D's backstop. The static checker rejects what it can *prove* is
+ * over budget and exempts the rest with a warning (see budget_end() in
+ * src/semantic/checker.ionic), so the exemptions must be caught here or the
+ * declaration is a fiction: a 64 MiB `vram` happily charged 16 GiB and the
+ * program exited 0. Failing at the allocation is the point — the alternative is
+ * an OOM hours later, or silent overcommit on a device that has one.
+ *
+ * exit(1) rather than a NULL handle: Ionic has no way to observe NULL from an
+ * mlx_* call (every one returns a tensor or a scalar), so returning NULL would
+ * turn an over-budget program into a segfault at an unrelated line — exactly
+ * the "corrupt memory later" this exists to prevent. `ionic_bounds_panic`
+ * makes the same choice for the same reason.
+ *
+ * Refusing rather than falling back is also decision §4.4a of the plan: a
+ * program that believes it ran on the accelerator must never silently not have.
+ */
+static void pool_capacity_panic(int64_t pool, int64_t bytes) {
+    fprintf(stderr,
+        "ionic: accelerator pool exhausted: a %lld-byte allocation does not fit "
+        "%s (%lld of %lld bytes in use)\n"
+        "       the declared budget came from `let vram = %lld;`; the static "
+        "checker could not size this value, so what it measured was a lower "
+        "bound. Raise the pool, narrow the scope's fraction, or free what is no "
+        "longer live.\n",
+        (long long)bytes, pool_name(pool),
+        (long long)g_pool_bytes[pool], (long long)g_pool_capacity[pool],
+        (long long)g_pool_capacity[pool]);
+    exit(1);
+}
+
+/* Charge `bytes` to `pool`, refusing the allocation if it would not fit.
+ *
+ * Release is unconditional: giving bytes back can never over-fill. The
+ * comparison avoids `used + bytes` so a huge request cannot overflow into a
+ * negative sum and slip past the check. */
 static void pool_charge(int64_t pool, int64_t bytes) {
     if (!pool_valid(pool)) return;
+    if (bytes > 0 && g_pool_capacity[pool] > 0
+        && bytes > g_pool_capacity[pool] - g_pool_bytes[pool]) {
+        pool_capacity_panic(pool, bytes);
+    }
     g_pool_bytes[pool] += bytes;
     if (g_pool_bytes[pool] < 0) g_pool_bytes[pool] = 0;  /* defensive */
 }
@@ -1954,7 +2026,11 @@ void   *ionic_mlx_to_gpu(void *h) { (void)h; mlx_unavailable(); return NULL; }
 void   *ionic_mlx_to_cpu(void *h) { (void)h; mlx_unavailable(); return NULL; }
 int64_t ionic_mlx_pool(void *h) { (void)h; return -1; }
 int64_t ionic_mlx_pool_bytes(int64_t p) { (void)p; return -1; }
-int64_t ionic_mlx_pool_count(void) { return 2; }
+/* No ionic_mlx_pool_capacity stub is needed here: capacity is a language-level
+ * fact, so it lives outside the MLX conditional with ionic_pool_set_capacity and
+ * answers correctly on every platform. A program that declares `vram` can read
+ * it back even where the backend is absent. */
+int64_t ionic_mlx_pool_count(void) { return IONIC_POOL_COUNT; }
 int64_t ionic_mlx_pools_unified(void) { return 0; }
 
 /* ── Construction ─────────────────────────────────────────────────────────── */

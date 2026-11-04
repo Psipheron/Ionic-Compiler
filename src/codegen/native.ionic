@@ -1748,6 +1748,7 @@ fn ncg_call(int64 node) -> int64 {
     if (str_eq(callee, "mlx_dtype"))           { real_callee = "ionic_mlx_dtype"; }
     if (str_eq(callee, "mlx_pool"))            { real_callee = "ionic_mlx_pool"; }
     if (str_eq(callee, "mlx_pool_bytes"))      { real_callee = "ionic_mlx_pool_bytes"; }
+    if (str_eq(callee, "mlx_pool_capacity"))   { real_callee = "ionic_mlx_pool_capacity"; }
     if (str_eq(callee, "mlx_pool_count"))      { real_callee = "ionic_mlx_pool_count"; }
     if (str_eq(callee, "mlx_pools_unified"))   { real_callee = "ionic_mlx_pools_unified"; }
     if (str_eq(callee, "mlx_add"))             { real_callee = "ionic_mlx_add"; }
@@ -2461,6 +2462,26 @@ fn ncg_main_wrapper(int64 top_list) -> int64 {
     a64_store_fp(REG_X0, local_offset(local_def("__argc", 0)));
     a64_store_fp(REG_X1, local_offset(local_def("__argv", 0)));
     a64_bl_sym(init_sym);
+
+    // Publish the declared accelerator-pool size before any user code runs.
+    //
+    // The checker read `let vram = N;` statically and rejects what it can prove
+    // is over budget; the runtime enforces the rest at each allocation. Both
+    // halves must be looking at the same N, so the number is taken from the same
+    // declaration rather than duplicated as a constant in the C runtime.
+    //
+    // `vram` is an immutable integer literal, so `ncg_build_globals` inlined it
+    // as a compile-time constant and it has no runtime storage. That is exactly
+    // why this has to be emitted here: there is no global variable to read.
+    mut vram_bytes = -1;
+    let vram_ci = ncg_const_find("vram");
+    if (vram_ci >= 0) { vram_bytes = const_vals[vram_ci]; }
+    if (vram_bytes > 0) {
+        let cap_sym = sym_undef("ionic_pool_set_capacity");
+        a64_load_imm(REG_X0, 1);        // IONIC_POOL_GPU
+        a64_load_imm(REG_X1, vram_bytes);
+        a64_bl_sym(cap_sym);
+    }
 
     // Process top-level statements.
     // ND_LET nodes are handled via the global tables built by ncg_build_globals.
