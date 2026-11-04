@@ -33,7 +33,7 @@ fib(10) = 55
 ## Features
 
 - **Self-hosting** — `ionic_new` is compiled by itself; the entire compiler is written in Ionic
-- **Direct ARM64 code generation** — emits Mach-O `.o` files directly, linked with `ld`; no LLVM at runtime
+- **Direct ARM64 code generation** — emits Mach-O `.o` and Linux ELF files directly, linked with `ld`; no LLVM at runtime
 - **Static types, inferred where obvious** — `let x = 42` is `int64`; `let f = 3.14` is `float64`
 - **Full float64 support** — arithmetic, `sqrt`, `pow`, `floor`, `ceil`, `fabs`, `int64_to_float64`, `float64_to_str`
 - **Rich string builtins** — `format`, `str_concat`, `str_len`, `str_slice`, `str_replace`, `str_contains`, `str_starts_with`, `str_ends_with`, `int64_to_str`
