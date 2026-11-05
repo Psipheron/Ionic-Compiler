@@ -554,6 +554,16 @@ mut local_is_float = [0];   // 1 if float64
 mut local_is_str   = [0];   // 1 if string type
 mut local_stypes   = [""];  // struct type name, or "" for non-struct locals
 mut local_model    = [0];   // 1 if this local owns a `model` resource (RAII)
+// 1 if this local owns one *reference* to a counted string (memory-model §8
+// step 4, stage 2). Distinct from local_is_str: a string parameter has the type
+// but is a borrow, so it must never be released.
+mut local_own_str  = [0];
+// 1 once this slot has ever been given a value that `ionic_rc_release` must not
+// see: a parameter, `getenv`, `get_arg`, an element load, a struct field, a user
+// function's result. Permanent, and it forbids the slot from ever owning again.
+// See `ncg_str_releasable` for why this is a property of the *value* rather
+// than of control flow.
+mut local_poison   = [0];
 // Element type of an array-typed local, as a checker TY_* code (0 = not an
 // array, or the element type is unknown). Recorded from the declaration's type
 // annotation — or inferred from an array literal — so an element load can be
@@ -572,6 +582,32 @@ mut local_count    = 0;
 mut model_names    = [""];
 mut model_slots    = [0];
 mut model_count    = 0;
+
+// ── String ownership (memory-model §8 step 4, stage 2) ────────────────────────
+//
+// A string local owns exactly one reference. "Owns" is a claim about *this
+// slot*, recorded at compile time and discharged exactly once — in the single
+// exit block, the same discipline `model` RAII uses. Every rule below exists to
+// keep the count of releases equal to the count of retains that produced it:
+//
+//   let s = <producer>     slot owns 1; the producer returned rc=1
+//   let t = s              slot owns 1 AND s must retain, because two names now
+//                          point at one count
+//   s = <expr>             release the old value, then take the new one
+//   return s               ownership leaves with the value: clear the slot so
+//                          the exit block does not also release it
+//   fall off the end       the exit block releases every slot still owning
+//
+// `local_owns_str` is the slot's own claim, so it is *not* a copy of
+// `local_is_str` (a type column). A string-typed parameter is a borrow, for
+// instance: it has the type but does not own a reference, so it is marked
+// is_str=1 and owns_str=0.
+//
+// `str_slots` lists slots that have *ever* been marked owning, so the exit block
+// can walk them without scanning every local. A slot whose claim was cleared —
+// moved out by `return`, or escaped into a container — is skipped there.
+mut str_slots = [0];
+mut str_count = 0;
 
 // Tracks the struct type name of the most recently evaluated expression.
 // Set by ncg_expr whenever it evaluates a struct-typed expression.
@@ -608,17 +644,22 @@ fn local_reset() -> int64 {
     arr_reset(local_is_str);
     arr_reset(local_stypes);
     arr_reset(local_model);
+    arr_reset(local_own_str);
+    arr_reset(local_poison);
     arr_reset(local_elem);
     arr_reset(local_is_tensor);
     arr_reset(model_names);
     arr_reset(model_slots);
     model_count = 0;
+    arr_reset(str_slots);
+    str_count = 0;
     n_csr = 0;
     csr_base_slot = 0;
     spill_base = 0;
     // Cleared here and re-established by ncg_fn_node; ncg_main_wrapper has no
     // exit block, so it must not inherit the previous function's slot.
     cur_ret_slot = -1;
+    cur_tmp_slot = -1;
     return 0;
 }
 
@@ -654,6 +695,8 @@ fn local_def(string name, int64 is_float) -> int64 {
     local_is_str.push(0);
     local_stypes.push("");
     local_model.push(0);
+    local_own_str.push(0);
+    local_poison.push(0);
     local_elem.push(0);
     local_is_tensor.push(0);
     local_count = local_count + 1;
@@ -732,6 +775,448 @@ fn local_is_float_slot(string name) -> int64 {
     while (i < local_count) {
         if (local_names[i] == h) { return local_is_float[i]; }
         i = i + 1;
+    }
+    return 0;
+}
+
+// ── String reference counting: emission (memory-model §8 step 4, stage 2) ────
+//
+// Ownership is a compile-time claim about a *slot*, discharged once in the exit
+// block. A claim is raised when a slot is *initialised or assigned* a value that
+// `ncg_str_releasable` admits, and the slot has never been poisoned:
+//
+//   let s = <literal>         `ionic_str_lit` returns a pinned counted copy
+//   let s = <producer call>   the producer returned a fresh rc=1 block
+//   let s = <owning local>    a second name for one count -> retain first
+//   s = <either of those>     the old value is released, then the new one claimed
+//
+// and it ends in one of three ways:
+//
+//   fall out of scope         the exit block releases it
+//   return s                  ownership leaves with the value
+//   escape into a container   a struct field, an array element, a global, a
+//                             `push` — the container keeps a pointer this pass
+//                             cannot prove it still owns, so the claim is dropped
+//                             and the value leaks. Leaking is the safe
+//                             direction: releasing there would free a pointer a
+//                             live container still holds, which is a
+//                             use-after-free rather than a leak.
+//
+// Two things are deliberately *not* covered in this stage. Element loads
+// (`let s = arr[0]`) and user-function results stay unowned: this pass cannot
+// prove the block is ours to free. Parameters and `getenv`/`get_arg`/`exe_dir`
+// are borrows of somebody else's pointer for the same reason. Any of those
+// landing in a slot sets `local_poison`, which is what stops a later producer
+// assignment from making an unsound claim.
+
+fn local_set_own_str(int64 slot, int64 v) -> int64 {
+    if (slot < 0) { return 0; }
+    local_own_str[slot] = v;
+    if (v == 1) {
+        mut i = 0;
+        mut dup = 0;
+        while (i < str_count) {
+            if (str_slots[i] == slot) { dup = 1; }
+            i = i + 1;
+        }
+        if (dup == 0) {
+            str_slots.push(slot);
+            str_count = str_count + 1;
+        }
+    }
+    return 0;
+}
+
+fn local_set_own_str_name(string name, int64 v) -> int64 {
+    let slot = local_find(name);
+    if (slot < 0) { return 0; }
+    return local_set_own_str(slot, v);
+}
+
+fn local_owns_str(string name) -> int64 {
+    let slot = local_find(name);
+    if (slot < 0) { return 0; }
+    return local_own_str[slot];
+}
+
+// Load a local slot into `r`, honouring register-promoted parameters.
+fn ncg_load_slot(int64 r, int64 slot) -> int64 {
+    if (slot < n_csr) { a64_mov(r, REG_X19 + slot); return 0; }
+    let off = local_offset(slot);
+    if (off >= 0) { a64_ldr(r, REG_X29, off >> 3); return 0; }
+    let neg = 0 - off;
+    if (neg <= 255) { a64_ldur(r, REG_X29, off); return 0; }
+    a64_sub_imm(REG_X16, REG_X29, neg);
+    a64_ldr(r, REG_X16, 0);
+    return 0;
+}
+
+// Emit `ionic_rc_release_pub(r)`. A BL clobbers every caller-saved register, so
+// all live scratch registers are spilled first — the same discipline the call
+// sites in ncg_expr already use. `r` is not preserved afterwards: it is dead by
+// construction, which is what makes the release safe.
+fn ncg_emit_release_r(int64 r) -> int64 {
+    let live = scratch_depth;
+    mut si = 0;
+    while (si < live) {
+        a64_store_fp(REG_X9 + si, (spill_base + 2 + si) * 8);
+        si = si + 1;
+    }
+    let sym = sym_undef("ionic_rc_release_pub");
+    a64_mov(REG_X0, r);
+    a64_bl_sym(sym);
+    si = 0;
+    while (si < live) {
+        a64_load_fp(REG_X9 + si, (spill_base + 2 + si) * 8);
+        si = si + 1;
+    }
+    return 0;
+}
+
+// Emit `r = ionic_rc_retain_pub(r)`. The shim returns its argument, so `r` keeps
+// the same pointer; the move is there so `r` holds the value the callee returned
+// rather than the pre-call spill copy.
+fn ncg_emit_retain_r(int64 r) -> int64 {
+    let live = scratch_depth;
+    mut si = 0;
+    while (si < live) {
+        a64_store_fp(REG_X9 + si, (spill_base + 2 + si) * 8);
+        si = si + 1;
+    }
+    let sym = sym_undef("ionic_rc_retain_pub");
+    a64_mov(REG_X0, r);
+    a64_bl_sym(sym);
+    si = 0;
+    while (si < live) {
+        a64_load_fp(REG_X9 + si, (spill_base + 2 + si) * 8);
+        si = si + 1;
+    }
+    a64_mov(r, REG_X0);
+    return 0;
+}
+
+// Release every string slot that still owns a reference. Runs in the single exit
+// block, so a slot is discharged exactly once no matter how many `return`s the
+// body has.
+fn ncg_release_strs() -> int64 {
+    mut i = 0;
+    while (i < str_count) {
+        let slot = str_slots[i];
+        if (local_own_str[slot] == 1) {
+            let r = scratch_push();
+            ncg_load_slot(r, slot);
+            ncg_emit_release_r(r);
+            scratch_pop();
+            local_own_str[slot] = 0;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Is `callee` a builtin that hands back a *fresh* counted block (rc == 1)?
+//
+// Narrower than "returns a string", on purpose. The four exceptions return a
+// pointer owned by someone else (argv, the environment, the executable path, a
+// backend error buffer); a release on one would free a foreign pointer. §8 step
+// 6 replaces this list with a type-level owned/borrowed distinction, which is why
+// the list is explicit here rather than a prefix rule. A user-declared
+// `-> string` function is also excluded: it may legally return a parameter, and
+// a release would then free the caller's value.
+fn ncg_str_producer(string callee) -> int64 {
+    if (str_eq(callee, "get_arg"))        { return 0; }
+    if (str_eq(callee, "getenv"))         { return 0; }
+    if (str_eq(callee, "exe_dir"))        { return 0; }
+    if (str_eq(callee, "mlx_last_error")) { return 0; }
+    if (str_eq(callee, "str_concat"))     { return 1; }
+    if (str_eq(callee, "str_slice"))      { return 1; }
+    if (str_eq(callee, "str_replace"))    { return 1; }
+    if (str_eq(callee, "str_join"))       { return 1; }
+    if (str_eq(callee, "int64_to_str"))   { return 1; }
+    if (str_eq(callee, "float64_to_str")) { return 1; }
+    if (str_eq(callee, "char_to_str"))    { return 1; }
+    if (str_eq(callee, "format"))         { return 1; }
+    if (str_eq(callee, "read_line"))      { return 1; }
+    if (str_eq(callee, "file_read"))      { return 1; }
+    if (str_eq(callee, "http_get"))       { return 1; }
+    if (str_eq(callee, "http_post"))      { return 1; }
+    if (str_eq(callee, "http_body"))      { return 1; }
+    if (str_eq(callee, "http_urlencode")) { return 1; }
+    if (str_eq(callee, "http_method"))    { return 1; }
+    if (str_eq(callee, "http_path"))      { return 1; }
+    if (str_eq(callee, "http_req_body"))  { return 1; }
+    if (str_eq(callee, "bpe_decode"))     { return 1; }
+    return 0;
+}
+
+// Does `callee` read its string arguments and keep no pointer to them?
+//
+// This is the mirror image of the escape set: `push` parks the pointer inside a
+// container the pass cannot follow, so the claim is dropped and the value leaks
+// (see `ncg_note_arg_escapes`). Everything listed here instead *copies* the
+// bytes, so a producer result passed as an argument is garbage the moment the
+// call returns — and nothing was releasing it, which is why
+//
+//     s = str_concat(int64_to_str(i), "-x");
+//
+// leaked one block per iteration even after the assignment path learned to
+// release the destination's old value. The destination was handled; the
+// temporary feeding it was not.
+//
+// Deliberately an allowlist and not a deny-list. A user function is excluded
+// because its body is not visible here and it may retain the pointer; being
+// wrong in that direction is a use-after-free, not a leak.
+fn ncg_str_copies_args(string callee) -> int64 {
+    if (str_eq(callee, "str_concat"))      { return 1; }
+    if (str_eq(callee, "str_join"))        { return 1; }
+    if (str_eq(callee, "str_replace"))     { return 1; }
+    if (str_eq(callee, "format"))          { return 1; }
+    if (str_eq(callee, "print"))           { return 1; }
+    if (str_eq(callee, "println"))         { return 1; }
+    if (str_eq(callee, "str_eq"))          { return 1; }
+    if (str_eq(callee, "str_len"))         { return 1; }
+    if (str_eq(callee, "str_index"))       { return 1; }
+    if (str_eq(callee, "str_contains"))    { return 1; }
+    if (str_eq(callee, "str_starts_with")) { return 1; }
+    if (str_eq(callee, "str_ends_with"))   { return 1; }
+    if (str_eq(callee, "str_to_int64"))    { return 1; }
+    if (str_eq(callee, "str_hash"))        { return 1; }
+    if (str_eq(callee, "file_write"))      { return 1; }
+    return 0;
+}
+
+// Will this body emit a post-call release? Asked before the body is emitted, to
+// reserve the slots that stash the pointers across the call and park the result
+// across the releases. Same over-approximating contract as `ncg_may_own_str`.
+fn ncg_needs_call_tmp(int64 n) -> int64 {
+    if (n == 0) { return 0; }
+    let k = nd_kind[n];
+    if (k == ND_CALL && ncg_str_copies_args(nd_sv[n]) == 1) {
+        mut a = nd_i2[n];
+        while (a != 0) {
+            let e = nd_i2[a];
+            if (e != 0 && nd_kind[e] == ND_CALL && ncg_str_releasable(e) == 1) {
+                return 1;
+            }
+            a = nd_i3[a];
+        }
+    }
+    if (ncg_needs_call_tmp(nd_i2[n]) == 1) { return 1; }
+    if (ncg_needs_call_tmp(nd_i3[n]) == 1) { return 1; }
+    if (ncg_needs_call_tmp(nd_i4[n]) == 1) { return 1; }
+    return 0;
+}
+
+fn ncg_stmts_need_call_tmp(int64 list) -> int64 {
+    mut c = list;
+    while (c != 0) {
+        if (ncg_needs_call_tmp(nd_i2[c]) == 1) { return 1; }
+        c = nd_i3[c];
+    }
+    return 0;
+}
+
+// ── Reclaiming argument temporaries ──────────────────────────────────────────
+//
+// A producer result passed straight into a copying builtin has no slot to be
+// discharged from: nobody binds it to a name, so no claim is ever raised and
+// nothing releases it. `s = str_concat(int64_to_str(i), "-x")` therefore leaked
+// the block `int64_to_str` minted, once per iteration, even though the
+// destination `s` was handled correctly.
+//
+// The fix is the C calling convention's own answer: the callee's arguments are
+// in X0..X7 and the temporary is dead once the call returns. So stash the
+// pointer, make the call, park the result, release the stashed pointers, put the
+// result back in X0.
+//
+// Two decisions worth stating, because both are about *not* breaking things:
+//
+//   Only `ncg_str_copies_args` callees are eligible. A user function may retain
+//   the pointer past the return, so releasing it would be a use-after-free —
+//   the same reason its results are not claimable in the first place.
+//
+//   The release here deliberately does *not* go through `ncg_emit_release_r`.
+//   That helper spills `scratch_depth` registers to the scratch spill area, but
+//   at this point those are the call's own argument registers and the spill area
+//   already holds the *caller's* live values — spilling would overwrite them and
+//   the post-call restore would hand back argument values instead. The argument
+//   registers are dead once the callee has read them, so the releases just use a
+//   raw BL and touch no spill slot.
+
+// Does argument `e` need its own release after the call?
+fn ncg_arg_temp(int64 e) -> int64 {
+    if (e == 0) { return 0; }
+    if (nd_kind[e] != ND_CALL) { return 0; }
+    return ncg_str_producer(nd_sv[e]);
+}
+
+// Does this call have any argument worth reclaiming? The single gate for all
+// three steps below: the stash and the release both re-walk with the same
+// predicate, and neither runs unless this returned more than zero.
+fn ncg_count_arg_temps(string callee, int64 args) -> int64 {
+    if (cur_tmp_slot < 0) { return 0; }
+    if (ncg_str_copies_args(callee) == 0) { return 0; }
+    mut n = 0;
+    mut a = args;
+    mut i = 0;
+    while (a != 0 && i < 8) {
+        if (ncg_arg_temp(nd_i2[a]) == 1) { n = n + 1; }
+        a = nd_i3[a];
+        i = i + 1;
+    }
+    return n;
+}
+
+// Copy each eligible argument out of its ABI register into its own frame slot.
+// Runs after the arguments have been moved into X0..X7 and before the BL.
+//
+// Re-checks the allowlist itself rather than trusting the caller to have done
+// it: the whole scheme is sound only because the callee copies, so a future call
+// site that forgot the check would silently free a pointer a user function still
+// holds.
+fn ncg_stash_arg_temps(string callee, int64 args) -> int64 {
+    if (cur_tmp_slot < 0) { return 0; }
+    if (ncg_str_copies_args(callee) == 0) { return 0; }
+    mut a = args;
+    mut i = 0;
+    while (a != 0 && i < 8) {
+        if (ncg_arg_temp(nd_i2[a]) == 1) {
+            a64_store_fp(i, local_offset(cur_tmp_slot + i));
+        }
+        a = nd_i3[a];
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Release the stashed temporaries. The caller parks X0 in the ninth slot first,
+// because each release passes its pointer in X0.
+fn ncg_release_arg_temps(string callee, int64 args) -> int64 {
+    if (cur_tmp_slot < 0) { return 0; }
+    if (ncg_str_copies_args(callee) == 0) { return 0; }
+    let sym = sym_undef("ionic_rc_release_pub");
+    mut a = args;
+    mut i = 0;
+    while (a != 0 && i < 8) {
+        if (ncg_arg_temp(nd_i2[a]) == 1) {
+            a64_load_fp(REG_X0, local_offset(cur_tmp_slot + i));
+            a64_bl_sym(sym);
+        }
+        a = nd_i3[a];
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Give up the claim on a value that is being stored somewhere this pass cannot
+// follow. Called on the *value* node, never on the destination.
+fn ncg_note_str_escape(int64 n) -> int64 {
+    if (n == 0) { return 0; }
+    if (nd_kind[n] != ND_IDENT) { return 0; }
+    local_set_own_str_name(nd_sv[n], 0);
+    return 0;
+}
+
+// Could this subtree create a string ownership claim? Asked *before* the body is
+// emitted, to reserve the exit-block return slot: every release passes its value
+// in X0 and clobbers it, so a function that releases anything needs somewhere to
+// park its return value.
+//
+// Deliberately broad. A false positive costs one 8-byte stack slot and one
+// reload; a false negative would silently corrupt a return value.
+fn ncg_may_own_str(int64 n) -> int64 {
+    if (n == 0) { return 0; }
+    let k = nd_kind[n];
+    if (k == ND_CALL && ncg_str_producer(nd_sv[n]) == 1) { return 1; }
+    // A binding whose value is a name or a call can become an owner (the name
+    // case retains); the types are not known this early, so both shapes count.
+    //
+    // A *literal* must count too, and for a different reason: it is already
+    // owning, because `ionic_str_lit` hands back a pinned counted copy. Missing
+    // it is not a missed optimisation — a body whose only owning sources are
+    // literals gets no `cur_ret_slot`, so the exit block still emits its
+    // releases but with nowhere to park the return value, and `return 42`
+    // returns whatever `ionic_rc_release` left in X0. Reproduced as exit code
+    // 216 from a function whose only strings were `""`.
+    let init = nd_i3[n];
+    if (k == ND_LET &&
+        (nd_kind[init] == ND_IDENT || nd_kind[init] == ND_CALL ||
+         nd_kind[init] == ND_STR)) {
+        return 1;
+    }
+    if (ncg_may_own_str(nd_i2[n]) == 1) { return 1; }
+    if (ncg_may_own_str(nd_i3[n]) == 1) { return 1; }
+    if (ncg_may_own_str(nd_i4[n]) == 1) { return 1; }
+    return 0;
+}
+
+fn ncg_stmts_may_own_str(int64 list) -> int64 {
+    mut c = list;
+    while (c != 0) {
+        if (ncg_may_own_str(nd_i2[c]) == 1) { return 1; }
+        c = nd_i3[c];
+    }
+    return 0;
+}
+
+// Can `ionic_rc_release` be called on the value this expression produces, on
+// *any* path through the function?
+//
+// This is the whole soundness condition for the pass, and it is a property of
+// the value, not of where the code sits. The reason is the exit block: one
+// release is emitted per claiming slot, and it runs on every path that reaches
+// the fall-through. So after `let s = ...; if (c) { s = producer(); }` the exit
+// block must be safe whether or not the branch ran — meaning *both* values the
+// slot can hold must be releasable, not just the one the assignment stored.
+//
+// The set is therefore narrow, and each entry earns its place:
+//
+//   string literal    `ionic_str_lit` hands out a PINNED counted copy, so a
+//                     release is a no-op. It is releasable precisely because a
+//                     claim may be raised over it and still be discharged safely.
+//   producer call     fresh rc=1 block; the one clear case.
+//   owning local      the same claim, borrowed: releasing it drops one of the
+//                     counts that exist for it.
+//
+// Everything else is a pointer the pass did not mint — a parameter (the
+// caller's), `getenv`/`get_arg`/`exe_dir` (the kernel's or libc's), an element
+// load or struct field (a container's, and arrays are not counted at all yet),
+// or a user function's result (it may legally return its parameter). Releasing
+// one of those frees memory that is still live.
+fn ncg_str_releasable(int64 n) -> int64 {
+    if (n == 0) { return 0; }
+    let k = nd_kind[n];
+    if (k == ND_STR) { return 1; }
+    if (k == ND_CALL) { return ncg_str_producer(nd_sv[n]); }
+    if (k == ND_IDENT) {
+        // A global, or a name the checker knows but this frame does not: the
+        // pass has no claim on it and no proof about it either.
+        let slot = local_find(nd_sv[n]);
+        if (slot < 0) { return 0; }
+        return local_own_str[slot];
+    }
+    return 0;
+}
+
+// Record that `slot` has held a value a release must not see. Permanent: a
+// later assignment cannot un-poison it, because the old value may still be in
+// the slot on a path that skipped that assignment.
+fn local_set_poison(int64 slot, int64 v) -> int64 {
+    if (slot < 0) { return 0; }
+    if (v == 1) { local_poison[slot] = 1; }
+    return 0;
+}
+
+// Clear the claim on every named argument of a call that stores its arguments
+// in a container this pass cannot follow. Only the container-writing builtins
+// are listed: `println(s)` copies its argument and keeps no pointer, so treating
+// it as an escape would leak one block per print.
+fn ncg_note_arg_escapes(string callee, int64 args) -> int64 {
+    if (!str_eq(callee, "push") && !str_eq(callee, "arr_push_i64")) { return 0; }
+    mut a = args;
+    while (a != 0) {
+        ncg_note_str_escape(nd_i2[a]);
+        a = nd_i3[a];
     }
     return 0;
 }
@@ -922,10 +1407,6 @@ fn local_set_model(string name, int64 v) -> int64 {
 // when the function has one. Without that, `return 42;` in a function that owns
 // a model would return whatever ionic_model_free left in X0.
 fn ncg_release_models() -> int64 {
-    // Park the return value before the first call clobbers X0.
-    if (cur_ret_slot >= 0) {
-        a64_store_fp(REG_X0, local_offset(cur_ret_slot));
-    }
     mut i = 0;
     while (i < model_count) {
         let nm = model_names[i];
@@ -1167,14 +1648,45 @@ fn ncg_expr(int64 node) -> int64 {
     }
 
     if (kind == ND_STR) {
-        // Intern the string, emit ADRP+ADD with relocation to __cstring
+        // Intern the string, emit ADRP+ADD with relocation to __cstring, then
+        // hand that address to `ionic_str_lit`, which returns the *managed*
+        // copy: a pinned, counted block holding the same bytes.
+        //
+        // The copy is what makes literals safely releasable. Without it a
+        // literal evaluates to a bare `__cstring` pointer with no count in
+        // front of it, and the exit block releases every slot whose claim is
+        // set — but `let s = ""; s = str_concat(a, b);` sets the claim while
+        // the path that never reached the assignment still leaves the raw
+        // rodata pointer in the slot. Releasing that is a SIGBUS on a
+        // read-only page, which is exactly how the first version of this pass
+        // broke the compiler. Pinned means release is a no-op, so the claim
+        // becomes safe no matter which path reaches the exit block.
         let str_val = nd_sv[node];
         let pool_idx = cstr_intern(str_val);
         // Add a symbol for this cstring offset
         let sym_name = str_concat("__str", int64_to_str(pool_idx));
         let sym_idx  = sym_add(sym_name, SYM_DEFINED, 2, cstr_offsets[pool_idx]);
+
+        // ADRP+ADD emit no call, so the only clobber to protect against is the
+        // BL below; spill the registers live at this point, exactly as the
+        // other call sites in this function do.
+        let live = scratch_depth;
+        mut li = 0;
+        while (li < live) {
+            a64_store_fp(REG_X9 + li, (spill_base + 2 + li) * 8);
+            li = li + 1;
+        }
         let r = scratch_push();
         a64_adrp_add(r, sym_idx);
+        let lit_sym = sym_undef("ionic_str_lit");
+        a64_mov(REG_X0, r);
+        a64_bl_sym(lit_sym);
+        li = 0;
+        while (li < live) {
+            a64_load_fp(REG_X9 + li, (spill_base + 2 + li) * 8);
+            li = li + 1;
+        }
+        a64_mov(r, REG_X0);
         ncg_last_ty = 1;
         return r;
     }
@@ -1702,6 +2214,13 @@ fn ncg_call(int64 node) -> int64 {
         }
     }
 
+    // A string passed to a container-writing builtin escapes: the container now
+    // holds the pointer, and this pass cannot prove it is still the unique owner.
+    // Doing this *before* the arguments are evaluated would be wrong — the call
+    // may itself be the value being bound (`let s = ...`), so the claim is
+    // dropped here, at the call, after the callee has been identified.
+    ncg_note_arg_escapes(callee, args);
+
     // Reset type tracker before evaluating args
     ncg_last_ty = 0;
 
@@ -1913,9 +2432,26 @@ fn ncg_call(int64 node) -> int64 {
     if (str_eq(callee, "mlx_weights_get"))     { real_callee = "ionic_mlx_weights_get"; }
     if (str_eq(callee, "mlx_save_safetensors")) { real_callee = "ionic_mlx_save_safetensors"; }
 
+    // Reclaim any producer temporaries among the arguments. The stash has to
+    // happen here — after Phase 2 put the values in X0..X7 and before the BL —
+    // because the ABI registers are the only place the pointers exist: no slot
+    // was ever created for them.
+    let n_temps = ncg_count_arg_temps(callee, args);
+    if (n_temps > 0) { ncg_stash_arg_temps(callee, args); }
+
     // Phase 3: Emit BL with relocation
     let sym = sym_undef(real_callee);
     a64_bl_sym(sym);
+
+    // Park X0 and release the stashed temporaries. Skipped entirely when no
+    // argument was a temporary, so the overwhelmingly common call — one with
+    // plain names or literals as arguments — emits exactly the instructions it
+    // did before.
+    if (n_temps > 0) {
+        a64_store_fp(REG_X0, local_offset(cur_tmp_slot + 8));
+        ncg_release_arg_temps(callee, args);
+        a64_load_fp(REG_X0, local_offset(cur_tmp_slot + 8));
+    }
 
     // Phase 4: Pop all arg scratch registers
     mut pop_i = 0;
@@ -2025,6 +2561,43 @@ fn ncg_stmt(int64 node) -> int64 {
         // Note the *narrower* question here: marking the slot asks "does this
         // hold a handle", retaining asks "is this a second name for one".
         if (is_tensor == 1) { ncg_retain_r(r, init); }
+
+        // String ownership. A claim is raised only for a *releasable* initial
+        // value — see `ncg_str_releasable` — and never on a slot that has
+        // already held something else, because the exit block cannot tell which
+        // of the two values survived.
+        //
+        // KNOWN GAP — a `let` re-executed by a loop. The claim is discharged
+        // once, in the exit block, so a body that runs N times mints N blocks
+        // and releases one:
+        //
+        //     for (i in 0..n) { let t = int64_to_str(i); s = t; }   // ~48 B/iter
+        //
+        // The obvious repair — release the slot's old value on re-entry — is
+        // unsound with a single-exit design, because the slot's contents on the
+        // second iteration are whatever the *previous* iteration left there, and
+        // nothing in the AST at the `let` says whether that was this producer's
+        // block or, on another path, a `getenv` borrow parked in the same slot.
+        // Releasing a borrowed pointer is a use-after-free, so this needs either
+        // a proof that no other statement writes the slot (then release is safe)
+        // or a per-iteration scope destructor (then it is unconditional). Neither
+        // exists yet; leaking is the safe direction. Note that `s = t` is handled
+        // — the assignment path releases `s`'s old value — so the leak is one
+        // block per iteration, not two.
+        //
+        // A literal qualifies: `ionic_str_lit` returns a pinned counted copy, so
+        // a release on one is a no-op. That is what makes
+        // `let s = ""; if (c) { s = str_concat(a, b); }` safe — the claim is
+        // discharged whichever branch ran.
+        let releasable  = ncg_str_releasable(init);
+        mut owns_str = 0;
+        if (releasable == 1 && local_poison[slot] == 0) { owns_str = 1; }
+        if (owns_str == 1 && nd_kind[init] == ND_IDENT) {
+            ncg_emit_retain_r(r);
+        }
+        if (releasable == 0) { local_set_poison(slot, 1); }
+        local_set_own_str(slot, owns_str);
+
         // Store to stack
         if (off >= 0) { a64_str(r, REG_X29, off >> 3); }
         else {
@@ -2072,6 +2645,35 @@ fn ncg_stmt(int64 node) -> int64 {
                     a64_mov(REG_X0, or_);
                     a64_bl_sym(fsm);
                     scratch_pop();
+                }
+                // String assignment: the old value is released before the new
+                // one takes its place, so `s = s` is skipped entirely — releasing
+                // there would free the very pointer about to be stored back, and
+                // the claim is already correct.
+                //
+                // The new claim follows the same rule as `let`: only a
+                // releasable value, and only on a slot that has never held
+                // anything else. Poison is *sticky* — once a slot has held a
+                // parameter or an element load, a later producer assignment
+                // cannot make the claim sound again, because the earlier value
+                // may still be in the slot on a path that skipped this store.
+                let self_assign = nd_kind[val] == ND_IDENT && str_eq(nd_sv[val], name);
+                if (!self_assign) {
+                    if (local_own_str[slot] == 1) {
+                        let oldr = scratch_push();
+                        ncg_load_slot(oldr, slot);
+                        ncg_emit_release_r(oldr);
+                        scratch_pop();
+                        local_set_own_str(slot, 0);
+                    }
+                    let releasable = ncg_str_releasable(val);
+                    if (releasable == 0) { local_set_poison(slot, 1); }
+                    mut owns_new = 0;
+                    if (releasable == 1 && local_poison[slot] == 0) {
+                        owns_new = 1;
+                        if (nd_kind[val] == ND_IDENT) { ncg_emit_retain_r(vr); }
+                    }
+                    local_set_own_str(slot, owns_new);
                 }
                 if (slot < n_csr) {
                     // Register-promoted param: write to callee-saved reg X19+slot
@@ -2167,6 +2769,11 @@ fn ncg_stmt(int64 node) -> int64 {
             // RAII: returning a model transfers ownership; don't free the source.
             if (nd_kind[val] == ND_IDENT && local_owns_model(nd_sv[val]) == 1) {
                 local_set_model(nd_sv[val], 0);
+            }
+            // Same rule for a string: the reference leaves with the value, so
+            // the exit block must not release it a second time.
+            if (nd_kind[val] == ND_IDENT && local_owns_str(nd_sv[val]) == 1) {
+                local_set_own_str_name(nd_sv[val], 0);
             }
             a64_mov(REG_X0, r);
             scratch_pop();
@@ -2332,6 +2939,12 @@ mut cur_frame_size = 0;
 // the exit block. The destructor passes the model handle in X0, so X0 cannot be
 // live across it; -1 means "this function has no exit slot" (no owner locals).
 mut cur_ret_slot   = -1;
+// First of nine consecutive frame slots used to reclaim argument temporaries:
+// slots [cur_tmp_slot, cur_tmp_slot+7] stash one pointer per argument (a call
+// takes at most eight) and cur_tmp_slot+8 parks the call's own result while the
+// releases run. -1 means "not reserved", in which case no temporary is stashed
+// and none is released — a leak, never a use-after-free.
+mut cur_tmp_slot   = -1;
 
 // Jump targets for the single destructor + epilogue emitted at the end of each
 // function body. Every `return` appends here; the target address is only known
@@ -2356,8 +2969,17 @@ fn ncg_reset_patches() -> int64 {
 // the fall-through path zeroes it before falling in.
 fn ncg_emit_exit() -> int64 {
     let exit_addr = text_len();
+    // Park X0 *here*, not inside a destructor. Every release and free passes its
+    // argument in X0 and clobbers it, and the parking must happen even when
+    // there is nothing of one kind to release: a function that owns a string but
+    // no model would otherwise reload a slot that was never written.
+    if (cur_ret_slot >= 0) {
+        a64_store_fp(REG_X0, local_offset(cur_ret_slot));
+    }
     ncg_release_models();
-    // Reload the parked return value: the destructor left its last handle in X0.
+    ncg_release_strs();
+    // Reload the parked return value: the destructors left their last handle in
+    // X0.
     if (cur_ret_slot >= 0) {
         a64_load_fp(REG_X0, local_offset(cur_ret_slot));
     }
@@ -2419,6 +3041,17 @@ fn ncg_fn_epilogue() -> int64 {
     return 0;
 }
 
+// Count the slots this body will define. This has to agree with the number of
+// `local_def` calls `ncg_stmt` makes, because two things depend on it: the frame
+// size, and the prologue's zero-fill range. Undercounting the range leaves body
+// slots uninitialised while the exit block still discharges their claims — the
+// SIGBUS this pass was fixed to avoid. Overcounting costs frame bytes and is
+// harmless, so every container the statement walker descends into is counted
+// here, including the two the previous version missed:
+//
+//   ND_BLOCK       an inlined block left by dead-branch elimination, which
+//                  `ncg_stmt` emits by recursing into its statement list
+//   ND_GPU_BLOCK   a `gpu { ... }` body, emitted through `nd_i2[nd_i2[node]]`
 fn count_locals_deep(int64 list) -> int64 {
     mut n = 0;
     mut node = list;
@@ -2426,6 +3059,12 @@ fn count_locals_deep(int64 list) -> int64 {
         let stmt = nd_i2[node];
         let k = nd_kind[stmt];
         if (k == ND_LET) { n = n + 1; }
+        if (k == ND_BLOCK) {
+            n = n + count_locals_deep(nd_i2[stmt]);
+        }
+        if (k == ND_GPU_BLOCK) {
+            n = n + count_locals_deep(nd_i2[nd_i2[stmt]]);
+        }
         if (k == ND_IF) {
             let then_block = nd_i3[stmt];
             let else_block = nd_i4[stmt];
@@ -2489,18 +3128,32 @@ fn ncg_fn_node(int64 fn_node) -> int64 {
     // indices below it are unaffected.
     cur_ret_slot = -1;
     mut ret_extra = 0;
-    if (ncg_stmts_use_load_model(body_list) == 1) {
+    if (ncg_stmts_use_load_model(body_list) == 1 ||
+        ncg_stmts_may_own_str(body_list) == 1) {
         cur_ret_slot = n_params + n_body_base;
         ret_extra    = 1;
+    }
+
+    // The nine argument-temporary slots, reserved on the same pre-scan principle
+    // as the return slot: `ncg_needs_call_tmp` over-approximates, so a body that
+    // will never actually emit a post-call release pays nine frame slots and
+    // nothing else. Not reserving them would mean `cur_tmp_slot < 0` at the call
+    // site, which silently disables reclamation — the leak this whole section
+    // exists to remove.
+    cur_tmp_slot = -1;
+    mut tmp_extra = 0;
+    if (ncg_stmts_need_call_tmp(body_list) == 1) {
+        cur_tmp_slot = n_params + n_body_base + ret_extra;
+        tmp_extra    = 9;
     }
 
     // Promote all params (up to 8) to callee-saved regs X19..X(19+n_params-1)
     mut n_prom = n_params;
     if (n_prom > 8) { n_prom = 8; }
     n_csr         = n_prom;
-    csr_base_slot = n_params + n_body_base + ret_extra;      // CSR saves after all locals
-    spill_base    = csr_base_slot + 8;                       // scratch spills after CSR saves
-    let n_locals  = n_params + n_body_base + 16 + ret_extra; // 8 CSR + 8 scratch headroom
+    csr_base_slot = n_params + n_body_base + ret_extra + tmp_extra;   // CSR saves after all locals
+    spill_base    = csr_base_slot + 8;                                // scratch spills after CSR saves
+    let n_locals  = n_params + n_body_base + 16 + ret_extra + tmp_extra;
 
     // Register as defined global symbol
     let fn_addr = text_len();
@@ -2543,6 +3196,26 @@ fn ncg_fn_node(int64 fn_node) -> int64 {
     }
 
     ncg_fn_prologue(n_locals);
+
+    // Zero every body local. A claim is compile-time state, so a `let` on a path
+    // that was not taken leaves its slot unwritten while the exit block still
+    // discharges the claim; releasing uninitialised stack is a SIGBUS, which is
+    // exactly how the first version of this pass broke the compiler.
+    //
+    // `ionic_rc_release(NULL)` is a no-op, so zero is the right initial value: it
+    // makes "never written" indistinguishable from "already released".
+    //
+    // The range is contiguous — params take slots [0, n_params) and body locals
+    // follow — so this needs no mapping from the AST, unlike a per-declaration
+    // zeroing pass would.
+    if (n_body_base > 0) {
+        a64_load_imm(REG_X16, 0);
+        mut zi = 0;
+        while (zi < n_body_base) {
+            a64_store_fp(REG_X16, local_offset(n_params + zi));
+            zi = zi + 1;
+        }
+    }
 
     // Move incoming args X0..X7 to their destinations.
     // Promoted params (slot < n_csr) go to callee-saved X19+slot.
@@ -2937,10 +3610,14 @@ fn codegen_program(int64 structs_list, int64 fns_list, int64 top_list, string ou
     local_is_str   = [0]; arr_reset(local_is_str);
     local_stypes   = [""]; arr_reset(local_stypes);
     local_model    = [0];  arr_reset(local_model);
+    local_own_str  = [0];  arr_reset(local_own_str);
+    local_poison   = [0];  arr_reset(local_poison);
     local_elem     = [0];  arr_reset(local_elem);
     model_names    = [""]; arr_reset(model_names);
     model_slots    = [0];  arr_reset(model_slots);
     model_count    = 0;
+    str_slots      = [0];  arr_reset(str_slots);
+    str_count      = 0;
     local_count    = 0;
     scratch_depth  = 0;
     fn_ret_stype_hashes = [0]; arr_reset(fn_ret_stype_hashes);

@@ -203,6 +203,28 @@ static void *ionic_rc_realloc(void *p, size_t n) {
     return base + 8;
 }
 
+/* ── Exported surface for emitted code (memory-model §8 step 4, stage 2) ──────
+ *
+ * The primitives above are `static` because nothing in this file's own code
+ * should bypass them. Emitted code cannot call a static symbol, though, so
+ * stage 2 needs a public entry point for each operation the codegen emits.
+ *
+ * These are deliberately thin wrappers, not re-exports: keeping the `static`
+ * originals means the compiler cannot accidentally resolve a call to the shim
+ * instead of the real thing, and it keeps `scripts/rcprobe.c` (which includes
+ * this TU directly) able to test the actual implementation.
+ *
+ * `ionic_rc_retain` returns its argument so a retain can be used as a value
+ * expression (`x = retain(y)`) rather than only as a statement.
+ */
+
+void *ionic_rc_retain_pub(void *p) { return ionic_rc_retain(p); }
+
+/* Release is a statement in the emitted code: the value is dead afterwards, so
+ * returning anything would invite a caller to use it. Stage 2 emits a `bl` and
+ * ignores X0. */
+void ionic_rc_release_pub(void *p) { ionic_rc_release(p); }
+
 /* ── String literals as managed values ───────────────────────────────────────
  *
  * A literal lives in `__cstring` (read-only, no count in front of it), so it
