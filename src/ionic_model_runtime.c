@@ -96,6 +96,193 @@ static void ionic_array_push_i64(IonicArray *a, int64_t v) {
     ((int64_t *)a->data)[a->len++] = v;
 }
 
+/* ── Reference counting: primitives (memory-model §8 step 4, stage 1) ──────────
+ *
+ * A counted object carries an 8-byte count immediately *before* its payload, and
+ * the payload pointer is what the program holds. That layout is the whole point:
+ * a string stays one `i64` at the ABI, so no call site, no struct, and no array
+ * slot changes shape. It costs 8 bytes per object and one non-atomic increment
+ * per reference copy.
+ *
+ *     base: [ rc | payload ................ ]
+ *            ^     ^
+ *            |     `-- what Ionic sees
+ *            `-------- what free() takes
+ *
+ * Release on a **pinned** object is a no-op. Pinned is how string literals and
+ * foreign pointers participate uniformly instead of needing an exemption at
+ * every use site: a literal's managed copy is pinned, so releasing it is safe
+ * and does nothing (see ionic_str_lit).
+ *
+ * Nothing in this file *calls* these yet. Stage 1 is deliberately behaviour-free:
+ * the producers allocate through rc_alloc, but no retain or release is emitted,
+ * so the generated code is unchanged and `--verify-self-hosting` still produces
+ * a byte-identical object. Emission is stage 2, and it is where the risk lives —
+ * a misplaced release turns a benign leak into a use-after-free.
+ *
+ * Alignment: payload sits at base+8, so it is 8-byte aligned (malloc gives 16).
+ * Fine for strings and pointers; not for anything needing 16-byte alignment.
+ */
+#define IONIC_RC_PINNED (-1)
+
+/* Allocate `n` bytes of payload with a count of 1. Returns the payload, or NULL
+ * on OOM (the one case where the "caller owns the result" contract cannot be
+ * honoured, as elsewhere in this runtime). */
+static void *ionic_rc_alloc(size_t n) {
+    size_t total = n + 8;
+    char  *base  = (char *)malloc(total);
+    if (!base) return NULL;
+    *((int64_t *)base) = 1;
+    return base + 8;
+}
+
+/* Allocate a payload that is never freed. Used for the managed copies of string
+ * literals: the copy is made once and outlives every reference to it. */
+static void *ionic_rc_alloc_pinned(size_t n) {
+    size_t total = n + 8;
+    char  *base  = (char *)malloc(total);
+    if (!base) return NULL;
+    *((int64_t *)base) = IONIC_RC_PINNED;
+    return base + 8;
+}
+
+/* Add a reference. Null-tolerant, and a no-op on a pinned object: the count of
+ * a pinned object is not tracked because it can never reach zero. */
+static void *ionic_rc_retain(void *p) {
+    if (!p) return NULL;
+    int64_t *rc = ((int64_t *)p) - 1;
+    if (*rc != IONIC_RC_PINNED) { *rc += 1; }
+    return p;
+}
+
+/* Drop a reference, freeing the block when the last one goes. Null-tolerant.
+ *
+ * Release is **not** idempotent and this cannot make it so: once the count hits
+ * zero the block is freed, so a second release necessarily reads reclaimed
+ * memory — the read is the use-after-free, before any guard could look at the
+ * count. (Measured: an ASan probe of `release(p); release(p);` reports a
+ * heap-use-after-free on the header load, not a caught error.) The discipline
+ * that keeps this correct is the same one model RAII uses: exactly one release
+ * per owning slot, from a single emit point. See docs/memory-model.md §8 step 4.
+ *
+ * The `<= 0` check is therefore defence against a *corrupt* header that already
+ * reads zero, not against double release. It costs one compare and stops such a
+ * block from being decremented to -1, which would look like PINNED and leak. */
+static void ionic_rc_release(void *p) {
+    if (!p) return;
+    int64_t *rc = ((int64_t *)p) - 1;
+    if (*rc == IONIC_RC_PINNED) return;
+    if (*rc <= 0) return;
+    *rc -= 1;
+    if (*rc == 0) free(rc);
+}
+
+/* Grow a counted payload. The header moves with it, so this is the only way a
+ * rc_alloc'd block may be resized — a plain realloc(payload) would free the
+ * header and return a pointer with no count in front of it. */
+static void *ionic_rc_realloc(void *p, size_t n) {
+    if (!p) return ionic_rc_alloc(n);
+    int64_t *rc = ((int64_t *)p) - 1;
+    if (*rc == IONIC_RC_PINNED) {
+        /* A pinned block cannot be grown in place, so copy it into a live one.
+         *
+         * The old length is knowable even though the header does not store it:
+         * every pinned block comes from ionic_str_lit, which allocates exactly
+         * strlen(s)+1. Copying that much (clamped to the new size, for a shrink)
+         * is therefore safe, whereas memcpy(q, p, n) would read past the end
+         * whenever the block grows. The interned original is left untouched, so
+         * the literal table keeps pointing at a valid value. */
+        size_t have = strlen((const char *)p) + 1;
+        void *q = ionic_rc_alloc(n);
+        if (!q) return NULL;
+        memcpy(q, p, have < n ? have : n);
+        return q;
+    }
+    char *base = (char *)realloc(rc, n + 8);
+    if (!base) return NULL;
+    return base + 8;
+}
+
+/* ── String literals as managed values ───────────────────────────────────────
+ *
+ * A literal lives in `__cstring` (read-only, no count in front of it), so it
+ * cannot be released. Rather than teach every release site to recognise one,
+ * literals are handed out as *pinned managed copies*, interned by their rodata
+ * address: the first request for a given literal allocates one copy, and every
+ * later request returns that same block. Releasing it does nothing.
+ *
+ * Keyed by address rather than by content because codegen already interns each
+ * literal node to a fixed `__cstring` offset, so the address is a stable
+ * identity for it and costs nothing to compare.
+ *
+ * Open-addressed table, growth by doubling. Literal counts are bounded by the
+ * program (the compiler itself has a few thousand), so this is a small, flat
+ * structure rather than a general-purpose map.
+ */
+static const char **g_lit_src  = NULL;   /* rodata address, or NULL = empty slot */
+static char       **g_lit_copy = NULL;
+static int64_t      g_lit_cap  = 0;
+static int64_t      g_lit_used = 0;
+
+static uint64_t lit_hash(const void *p) {
+    uint64_t v = (uint64_t)(uintptr_t)p;
+    return v * 11400714819323198485ull;   /* fibonacci mix; addresses are aligned */
+}
+
+static int lit_grow(void) {
+    int64_t newcap = g_lit_cap ? g_lit_cap * 2 : 256;
+    const char **ns = (const char **)calloc((size_t)newcap, sizeof(char *));
+    char       **nc = (char **)calloc((size_t)newcap, sizeof(char *));
+    if (!ns || !nc) { free((void *)ns); free((void *)nc); return -1; }
+    /* Reinsert every live entry. The masks differ, so positions all move. */
+    for (int64_t i = 0; i < g_lit_cap; i++) {
+        if (!g_lit_src[i]) continue;
+        uint64_t h = lit_hash(g_lit_src[i]) & (uint64_t)(newcap - 1);
+        while (ns[h]) { h = (h + 1) & (uint64_t)(newcap - 1); }
+        ns[h] = g_lit_src[i];
+        nc[h] = g_lit_copy[i];
+    }
+    free((void *)g_lit_src);
+    free((void *)g_lit_copy);
+    g_lit_src  = ns;
+    g_lit_copy = nc;
+    g_lit_cap  = newcap;
+    return 0;
+}
+
+/* The managed, pinned value for a string literal. `s` must be a rodata address
+ * with static lifetime — that is what codegen passes, and why the address is a
+ * usable key.
+ *
+ * On OOM it returns `s` unchanged. That is the *less* dangerous of two bad
+ * options, not a correct one: the caller gets a raw rodata pointer with no
+ * count in front of it, so a later release reads the byte before the literal
+ * (in-bounds rodata, but garbage) and may try to free a static address. The
+ * alternative — returning NULL — turns an out-of-memory condition into a
+ * null-deref at the first use, and a string is more often printed than released.
+ * Either way this is an OOM-only compromise, recorded so it is not mistaken for
+ * a guarantee. Same class as the OOM note in docs/memory-model.md §11.1. */
+const char *ionic_str_lit(const char *s) {
+    if (!s) return s;
+    /* Keep the table at least half empty so linear probing terminates quickly. */
+    if (g_lit_used * 2 >= g_lit_cap && lit_grow() != 0) return s;
+
+    uint64_t mask = (uint64_t)(g_lit_cap - 1);
+    uint64_t h    = lit_hash(s) & mask;
+    while (g_lit_src[h]) {
+        if (g_lit_src[h] == s) { return g_lit_copy[h]; }
+        h = (h + 1) & mask;
+    }
+    size_t n   = strlen(s) + 1;
+    char  *cp  = (char *)ionic_rc_alloc_pinned(n);
+    if (!cp) return s;
+    memcpy(cp, s, n);
+    g_lit_src[h]  = s;
+    g_lit_copy[h] = cp;
+    g_lit_used   += 1;
+    return cp;
+}
+
 /* ── Memory pools: identity and capacity (Stages C–D) ─────────────────────────
  * `tensor@cpu` / `tensor@gpu` name *pools*, not devices — SRAM (host memory,
  * capacity = system RAM) and VRAM (accelerator memory, capacity = the card).
@@ -300,7 +487,7 @@ int64_t ionic_cpu_core_count(void) {
  *
  * On OOM this returns NULL; that is the one case the contract cannot honour. */
 static char *rt_empty_str(void) {
-    char *e = (char *)malloc(1);
+    char *e = (char *)ionic_rc_alloc(1);
     if (e) e[0] = '\0';
     return e;
 }
@@ -313,7 +500,7 @@ static char *rt_empty_str(void) {
 static char *rt_dup_str(const char *s) {
     if (!s) return rt_empty_str();
     size_t n = strlen(s) + 1;
-    char *d = (char *)malloc(n);
+    char *d = (char *)ionic_rc_alloc(n);
     if (!d) return rt_empty_str();
     memcpy(d, s, n);
     return d;
@@ -332,7 +519,7 @@ char *ionic_file_read(const char *path) {
     long sz = ftell(f);
     fseek(f, 0, SEEK_SET);
     if (sz < 0) sz = 0;                      /* ftell failed: treat as empty */
-    char *buf = (char *)malloc((size_t)(sz + 1));
+    char *buf = (char *)ionic_rc_alloc((size_t)(sz + 1));
     if (!buf) { fclose(f); return rt_empty_str(); }
     fread(buf, 1, (size_t)sz, f);
     buf[sz] = '\0';
@@ -427,22 +614,22 @@ int64_t ionic_ceil(int64_t b)           { return d2i64(ceil(i642d(b))); }
 
 char *ionic_read_line(void) {
     char buf[4096];
-    if (!fgets(buf, sizeof(buf), stdin)) { char *r = (char *)malloc(1); r[0] = '\0'; return r; }
+    if (!fgets(buf, sizeof(buf), stdin)) { char *r = (char *)ionic_rc_alloc(1); r[0] = '\0'; return r; }
     size_t n = strlen(buf);
     if (n > 0 && buf[n-1] == '\n') buf[n-1] = '\0';
-    char *r = (char *)malloc(strlen(buf) + 1);
+    char *r = (char *)ionic_rc_alloc(strlen(buf) + 1);
     strcpy(r, buf);
     return r;
 }
 
 char *ionic_str_slice(const char *s, int64_t start, int64_t end) {
-    if (!s) { char *r = (char *)malloc(1); r[0] = '\0'; return r; }
+    if (!s) { char *r = (char *)ionic_rc_alloc(1); r[0] = '\0'; return r; }
     int64_t n = (int64_t)strlen(s);
     if (start < 0) start = 0;
     if (end > n) end = n;
-    if (start >= end) { char *r = (char *)malloc(1); r[0] = '\0'; return r; }
+    if (start >= end) { char *r = (char *)ionic_rc_alloc(1); r[0] = '\0'; return r; }
     int64_t len = end - start;
-    char *r = (char *)malloc((size_t)(len + 1));
+    char *r = (char *)ionic_rc_alloc((size_t)(len + 1));
     memcpy(r, s + start, (size_t)len);
     r[len] = '\0';
     return r;
@@ -468,18 +655,18 @@ char *ionic_str_replace(const char *s, const char *from, const char *to) {
     if (!s || !from || !to) {
         const char *src = s ? s : "";
         size_t n = strlen(src);
-        char *r = (char *)malloc(n + 1);
+        char *r = (char *)ionic_rc_alloc(n + 1);
         memcpy(r, src, n + 1);
         return r;
     }
     size_t ls = strlen(s), lf = strlen(from), lt = strlen(to);
-    if (lf == 0) { char *r = (char *)malloc(ls + 1); memcpy(r, s, ls + 1); return r; }
+    if (lf == 0) { char *r = (char *)ionic_rc_alloc(ls + 1); memcpy(r, s, ls + 1); return r; }
     /* Count occurrences */
     int count = 0;
     const char *p = s;
     while ((p = strstr(p, from))) { count++; p += lf; }
     size_t need = ls + (size_t)count * (lt > lf ? lt - lf : 0) + 1;
-    char *r = (char *)malloc(need);
+    char *r = (char *)ionic_rc_alloc(need);
     char *out = r;
     p = s;
     const char *q;
@@ -511,7 +698,7 @@ __attribute__((weak))
 char *ionic_str_concat(const char *a, const char *b) {
     if (!a) a = ""; if (!b) b = "";
     size_t la = strlen(a), lb = strlen(b);
-    char *r = (char *)malloc(la + lb + 1);
+    char *r = (char *)ionic_rc_alloc(la + lb + 1);
     memcpy(r, a, la); memcpy(r + la, b, lb); r[la + lb] = '\0';
     return r;
 }
@@ -558,9 +745,9 @@ char *ionic_str_concat(const char *a, const char *b) {
  * payload is touched once, during the fill. */
 char *ionic_str_join(IonicArray *arr, int64_t first, int64_t count, const char *sep) {
     if (!sep) sep = "";
-    if (!arr || count <= 0) { char *r = (char *)malloc(1); r[0] = '\0'; return r; }
+    if (!arr || count <= 0) { char *r = (char *)ionic_rc_alloc(1); r[0] = '\0'; return r; }
     if (first < 0) first = 0;
-    if (first >= arr->len) { char *r = (char *)malloc(1); r[0] = '\0'; return r; }
+    if (first >= arr->len) { char *r = (char *)ionic_rc_alloc(1); r[0] = '\0'; return r; }
     /* Clamp rather than trust the caller: a count past the end would read
        whatever follows the data block, and this is reachable from ordinary
        Ionic, where `len` and the count are two separate values. */
@@ -576,7 +763,7 @@ char *ionic_str_join(IonicArray *arr, int64_t first, int64_t count, const char *
         i = i + 1;
     }
 
-    char *r = (char *)malloc(put + 1);
+    char *r = (char *)ionic_rc_alloc(put + 1);
     size_t at = 0;
     i = first;
     while (i < first + count) {
@@ -611,7 +798,7 @@ int64_t ionic_str_index(const char *s, int64_t i) {
 
 __attribute__((weak))
 char *ionic_int64_to_str(int64_t v) {
-    char *buf = (char *)malloc(32);
+    char *buf = (char *)ionic_rc_alloc(32);
     snprintf(buf, 32, "%lld", (long long)v);
     return buf;
 }
@@ -619,7 +806,7 @@ char *ionic_int64_to_str(int64_t v) {
 __attribute__((weak))
 char *ionic_float64_to_str(int64_t b) {
     double v = i642d(b);
-    char *buf = (char *)malloc(32);
+    char *buf = (char *)ionic_rc_alloc(32);
     snprintf(buf, 32, "%g", v);
     return buf;
 }
@@ -643,7 +830,7 @@ char *ionic_format(const char *fmt,
             out_sz++;
         }
     }
-    char *out = (char *)malloc(out_sz + 1);
+    char *out = (char *)ionic_rc_alloc(out_sz + 1);
     char *op = out;
     ai = 0;
     for (const char *p = fmt ? fmt : ""; *p; p++) {
@@ -666,7 +853,7 @@ char *ionic_char_to_str(int64_t c) {
      * literals byte-by-byte through this, so it must be byte-identity for
      * 0..255 (no UTF-8 encoding, no 7-bit masking) or non-ASCII source bytes
      * would be corrupted. UTF-8 encoding lives in Ionic (u_utf8 / tui_utf8). */
-    char *buf = (char *)malloc(2);
+    char *buf = (char *)ionic_rc_alloc(2);
     buf[0] = (char)(c & 0xFF); buf[1] = '\0';
     return buf;
 }
@@ -2593,7 +2780,7 @@ static char *http_request(const char *method, const char *url,
     url_parse(url, host, sizeof(host), &port, &path);
     if (port < 0) {
         fprintf(stderr, "[ionic/http] https not supported (no TLS): %s\n", url);
-        char *e = (char *)malloc(1); e[0] = '\0'; return e;
+        return rt_empty_str();
     }
 
 #ifdef _WIN32
@@ -2659,7 +2846,7 @@ static char *http_request(const char *method, const char *url,
      * Return the ENTIRE raw response (status line + headers + body) so that
      * ionic_http_status / ionic_http_body can parse it. */
     size_t cap = 8192, len = 0;
-    char *buf = (char *)malloc(cap);
+    char *buf = (char *)ionic_rc_alloc(cap);
     if (!buf) { close(sock); return NULL; }
     char tmp[4096];
     for (;;) {
@@ -2667,7 +2854,7 @@ static char *http_request(const char *method, const char *url,
         if (r <= 0) break;
         if (len + (size_t)r + 1 > cap) {
             cap *= 2;
-            char *nb = (char *)realloc(buf, cap);
+            char *nb = (char *)ionic_rc_realloc(buf, cap);
             if (!nb) break;
             buf = nb;
         }
@@ -2713,21 +2900,20 @@ int64_t ionic_http_status(const char *raw) {
 char *ionic_http_body(const char *raw) {
     const char *sep = strstr(raw, "\r\n\r\n");
     if (!sep) {
-        const char *src = raw ? raw : "";
-        size_t n = strlen(src);
-        char *c = (char *)malloc(n + 1);
-        if (c) memcpy(c, src, n + 1);
-        return c;
+        return rt_dup_str(raw);
     }
-    char *b = (char *)malloc(strlen(sep + 4) + 1);
-    strcpy(b, sep + 4);
+    size_t n = strlen(sep + 4) + 1;
+    char *b = (char *)ionic_rc_alloc(n);
+    if (!b) return rt_empty_str();
+    memcpy(b, sep + 4, n);
     return b;
 }
 
 /* URL-encode a string (percent-encoding). */
 char *ionic_http_urlencode(const char *s) {
     if (!s) s = "";
-    char *out = (char *)malloc(strlen(s) * 3 + 1);
+    char *out = (char *)ionic_rc_alloc(strlen(s) * 3 + 1);
+    if (!out) return rt_empty_str();
     char *p = out;
     static const char hex[] = "0123456789ABCDEF";
     for (const unsigned char *c = (const unsigned char *)s; *c; c++) {
@@ -3517,7 +3703,8 @@ int64_t ionic_bpe_encode(const char *text, void *out_arr, int64_t add_bos) {
 char *ionic_bpe_decode(void *ids_arr) {
     IonicArray *a = (IonicArray *)ids_arr;
     size_t cap = (size_t)a->len * 4 + 16, len = 0;
-    char *out = (char *)malloc(cap);
+    char *out = (char *)ionic_rc_alloc(cap);
+    if (!out) return rt_empty_str();
     int64_t *slots = (int64_t *)a->data;
     for (int64_t i = 0; i < a->len; i++) {
         int id = (int)slots[i];
@@ -3527,7 +3714,7 @@ char *ionic_bpe_decode(void *ids_arr) {
         if (tok[0] == '<' && tok[1] == '0' && tok[2] == 'x' && tok[5] == '>' && strlen(tok) == 6) {
             char hex[3] = { tok[3], tok[4], 0 };
             unsigned char b = (unsigned char)strtol(hex, NULL, 16);
-            if (len + 2 > cap) { cap *= 2; out = (char *)realloc(out, cap); }
+            if (len + 2 > cap) { cap *= 2; out = (char *)ionic_rc_realloc(out, cap); }
             out[len++] = (char)b;
             continue;
         }
@@ -3537,11 +3724,11 @@ char *ionic_bpe_decode(void *ids_arr) {
         for (const char *p = tok; *p; ) {
             if ((unsigned char)p[0] == 0xE2 && p[1] && (unsigned char)p[1] == 0x96 &&
                 p[2] && (unsigned char)p[2] == 0x81) {
-                if (len + 2 > cap) { cap *= 2; out = (char *)realloc(out, cap); }
+                if (len + 2 > cap) { cap *= 2; out = (char *)ionic_rc_realloc(out, cap); }
                 out[len++] = ' ';
                 p += 3;
             } else {
-                if (len + 2 > cap) { cap *= 2; out = (char *)realloc(out, cap); }
+                if (len + 2 > cap) { cap *= 2; out = (char *)ionic_rc_realloc(out, cap); }
                 out[len++] = *p++;
             }
         }

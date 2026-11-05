@@ -97,12 +97,28 @@ jobs:
       - name: Verify self-hosting (object files byte-identical)
         run: ./build.sh --verify-self-hosting
 
+      # ── Producer ownership contract (memory-model §8 step 4, stage 1) ────
+      # Every string producer must return a block with an 8-byte refcount header
+      # in front of the payload, reading 1. Stage 1 routes them through
+      # ionic_rc_alloc but emits no release, so nothing else observes the header
+      # — it could regress to a raw malloc and every other check would still
+      # pass. Stage 2 emits releases, and a producer that missed the routing
+      # becomes a free() eight bytes into a malloc block. This gate exists
+      # before that code does, on purpose. Hard gate: it is fast, hermetic (C
+      # only, no accelerator, no Ionic binary) and either true or not.
+      - name: RC — every producer returns a counted block
+        run: ./scripts/rc_check.sh
+
       # ── RSS regression gate (ADVISORY during memory-model rollout) ───────
       # Smallest-possible-RSS is a core language goal. scripts/rss_check.sh
       # compiles a string-churn benchmark at two sizes and fails if peak RSS
-      # grows with N (a leaking allocator grows ~48 B/iter; a correct one is
-      # flat). It currently FAILS by design: the runtime still leaks, so this
-      # records the baseline and gives the ownership work a number to defend.
+      # grows with N. It currently FAILS by design: the runtime still leaks, so
+      # this records the baseline and gives the ownership work a number to
+      # defend. The measured baseline is ~80 B/iter for the shipped benchmark
+      # (two allocations: a 32-byte int64_to_str and a length-dependent
+      # str_concat), and ~48 B/iter for a single int64_to_str — an earlier
+      # comment here said "~48", which was the one-allocation figure compared
+      # against the two-allocation benchmark, not a regression.
       # `continue-on-error` keeps CI green for unrelated work and shows a red
       # step so the leak stays visible. When the memory model lands, delete
       # `continue-on-error` to make this a hard gate.

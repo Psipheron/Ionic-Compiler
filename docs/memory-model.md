@@ -95,18 +95,24 @@ a foreign pointer to be correct.
   place, a literal is provably a string at every use site, so (a) becomes viable
   again — but (b) is already the safer default.
 - **Runtime builtins route through `rc_alloc`** so the objects they return begin
-  life at refcount 1: `ionic_str_concat`, `ionic_int64_to_str`,
+  life at refcount 1: `ionic_str_concat`, `ionic_str_join`, `ionic_int64_to_str`,
   `ionic_float64_to_str`, `ionic_str_slice`, `ionic_str_replace`, `ionic_format`,
   `ionic_char_to_str`, `ionic_read_line`, `ionic_file_read`, `ionic_http_get`,
-  `ionic_http_post`, `ionic_http_body`, `ionic_http_urlencode`, and
-  `ionic_array_alloc`. Every one of these now allocates on every path — including
-  the failure paths, which is what §11.1 was about.
+  `ionic_http_post`, `ionic_http_body`, `ionic_http_urlencode`, `ionic_bpe_decode`,
+  and the two shared helpers `rt_empty_str` / `rt_dup_str` (which are how
+  `mlx_weights_key_at` and the three `ionic_http_*` request accessors get an owned
+  block). Every one of these now allocates on every path — including the failure
+  paths, which is what §11.1 was about.
   **Not** `ionic_get_arg`, `ionic_getenv`, `ionic_exe_dir`, or
   `ionic_mlx_last_error` — those return process-, libc-, or statically-owned
   buffers and must never be instrumented. The three `ionic_http_*` *request*
   accessors belong on this list too: they now copy out of the `HttpRequest`, so
   they are fresh allocations and safe to instrument (§11.2). See §11.3; an
   earlier version of this list wrongly included `get_arg` and `getenv`.
+  **Not `ionic_array_alloc` either**, despite an earlier draft of this list naming
+  it: an array is a *two-allocation* object (`{len, cap, data}`), so a header on
+  the `IonicArray *` would not cover the element buffer. Arrays need their own
+  release path (§11.4) and are not part of step 4's string-only stage.
 
 ### 4.2 Insertion points (compile time)
 
@@ -269,6 +275,74 @@ Landed incrementally, lowest risk first, each step verified with
    source that calls a name it does not know.
 4. **RC for strings and arrays.** Non-atomic. Literals are wrapped as pinned
    managed copies. Fixes the dominant user-program leak.
+
+   **Stage 1 of 3 — DONE (primitives, no emission).** `src/ionic_model_runtime.c`
+   now has the machinery and nothing calls it:
+
+   - `ionic_rc_alloc` / `_alloc_pinned` / `_retain` / `_release` / `_realloc`,
+     with the count in an 8-byte header *before* the payload. That layout is the
+     whole reason the step is cheap: the ABI value is still one `i64`, so no call
+     site, struct, or array slot changes shape.
+   - `IONIC_RC_PINNED` (`-1`) as the "never freed" count. Release on a pinned
+     object is a no-op, which is how literals and foreign pointers participate
+     uniformly instead of needing an exemption at every use site.
+   - `ionic_str_lit`, which interns a literal's *pinned managed copy* by its
+     rodata address — codegen already interns each literal node to a fixed
+     `__cstring` offset, so the address is a stable key and costs nothing to
+     compare.
+   - Every producer allocates through `ionic_rc_alloc`: the two `rt_*` helpers,
+     `read_line`, `str_slice`, `str_replace`, `str_concat`, `str_join`,
+     `int64_to_str`, `float64_to_str`, `format`, `char_to_str`, `file_read`,
+     `http_get`/`http_post`/`http_body`/`http_urlencode`, `bpe_decode`, and
+     `mlx_weights_key_at` via `rt_dup_str`. Producers that *grow* a buffer
+     (`http_request`, `bpe_decode`) go through `ionic_rc_realloc`, because a
+     plain `realloc(payload)` frees the header.
+
+   Output is unchanged: `./build.sh --verify-self-hosting` is byte-identical at
+   542916 bytes, and the only compiler warnings are `ionic_rc_retain` and
+   `ionic_rc_release` being unused — the correct state for a stage that emits
+   nothing.
+
+   **The producer contract is a gate (`scripts/rc_check.sh`).** Stage 1's
+   weakness is that it is unobservable: nothing reads the header, so a producer
+   that quietly kept a raw `malloc` would compile, run, and pass every other
+   check in the repo. `scripts/rcprobe.c` `#include`s the runtime TU (the rc
+   primitives are `static`) and asserts, under ASan+UBSan, that every producer
+   returns `rc == 1`, including on its failure paths — plus pinned-literal
+   interning and a no-op release on one, `retain`/`release` balance, and
+   `rc_realloc` over both a live and a pinned block. Coverage includes the three
+   `http_*` request accessors and `bpe_decode`, i.e. exactly the functions that
+   used to be in the interior and foreign/static classes, so the copy-on-access
+   fix (§11.2) is checked rather than assumed. It is wired into CI as a hard gate
+   ahead of step 2, because that is when a missed producer turns into `free()`
+   eight bytes into a `malloc` block. Verified to fail on both shapes of
+   regression: a producer reverted to `malloc` (ASan reports the header load at
+   the producer's line) and one returning a shared `rc=2` block (the `rc == 1`
+   assertion).
+
+   **What stage 1 did *not* change.** Peak RSS is unchanged, and the "48 → 80
+   bytes/iteration" figure that looked like an 8-byte-header regression was a
+   measurement error: 48 is a *one*-allocation benchmark (`s = int64_to_str(i)`)
+   and 80 is the shipped *two*-allocation one (`int64_to_str` + `str_concat`).
+   Same commit, same compiler, both figures reproduce exactly, and pre-header
+   `b0fc5a4` measures 80 too. The header rides inside malloc's existing size
+   classes at these sizes, so it is free until something actually frees — which
+   is the point of stage 2.
+
+   **Stage 2 — emission.** Gate it on `ncg_ty_of() == OTY_STR` and explicitly
+   *not* `OTY_OTHER`, so a release is never emitted for an unclassified pointer.
+   `get_arg`, `getenv`, `exe_dir` and `mlx_last_error` must be exempted by name
+   (§8 step 2) until step 6 makes the distinction type-level. Two known
+   divergences to reconcile in the same change, because both are CI-exercised:
+
+   - `src/codegen.rs` defines `ionic_str_concat`, `ionic_int64_to_str`,
+     `ionic_float64_to_str`, `ionic_char_to_str` and `ionic_file_read` *inline*
+     in LLVM IR with raw `malloc`, so the Rust bootstrap's payloads have no
+     header. Harmless today (nothing reads one); a use-after-free on a wrong
+     pointer the moment a release is emitted there.
+   - `src/codegen.rs:456` must either delegate to the C runtime or grow the same
+     header, and the choice has to be made once for both.
+
 5. **RC for tensor storage + RAII for `model`/handle types.** The domain core:
    deterministic release of scarce, device-affine memory. *(The `model` RAII half
    is implemented — see §9.)*
@@ -512,13 +586,17 @@ through one helper:
 
 ```c
 static char *rt_empty_str(void) {          /* allocated, not rodata */
-    char *e = (char *)malloc(1);
+    char *e = (char *)ionic_rc_alloc(1);
     if (e) e[0] = '\0';
     return e;
 }
 ```
 
-and the three alias paths copy instead of returning their input.
+and the three alias paths copy instead of returning their input. (The helper
+originally called `malloc`; step 4 stage 1 moved it onto `ionic_rc_alloc`, so a
+failure path returns a counted block like every other producer. Because *every*
+path in every producer now allocates, a `release` on any of them is well
+defined — which is the property `scripts/rc_check.sh` asserts directly.)
 
 Note `ionic_file_read` is `__attribute__((weak))` because the LLVM IR path
 defines it inline in `src/codegen.rs`. The C fix alone was **not** enough: the
