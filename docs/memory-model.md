@@ -244,8 +244,29 @@ Landed incrementally, lowest risk first, each step verified with
    foreign/static sources remain (`get_arg`, `getenv`, `exe_dir`,
    `mlx_last_error`); the retain/release pass must special-case those four by
    name until step 6 replaces the list with a type-level distinction.
-3. **Compiler arena per phase.** Immediate, self-contained leak elimination in
-   `ionic_new`; no language semantics change, and it does not depend on 1–2.
+3. **Compiler-internal peak elimination.** Immediate, self-contained, no language
+   semantics change, and it does not depend on 1–2. **Done, but not as an arena.**
+   An arena reclaims memory *between* phases, and measuring first showed the
+   blowup was not a phase-lifetime leak: it was O(lines × file size) copying
+   inside a single phase. At constant byte count, RSS tracked line count — a
+   328 KB input as 4 lines cost 42 MB, the same bytes as 8000 lines cost 798 MB,
+   and 30k statements in one function cost 192 MB. The cause was
+   `acc = str_concat(acc, str_concat(line, "\n"))` in `imp_expand`, plus the same
+   shape in the driver's fragment join: because `str_concat` allocates and
+   nothing frees, each line re-copied the whole accumulated prefix.
+
+   The fix is `str_join`, a linear bulk join that takes a `[string]` and the
+   separator, allocated once. Both call sites now collect fragments and join
+   them in one pass. The compiler's own source went from a 397 MB peak to 47 MB,
+   and RSS is now flat in line count. An arena would not have moved either
+   number, so the ordering in this list stands: the quadratic had to go first,
+   and the arena question is separate.
+
+   This did require a language surface addition (`str_join`), which §8 was not
+   expecting — Ionic strings are immutable and there is no builder type, so a
+   linear join cannot be expressed from existing builtins at all. The committed
+   `ionic_self` had to be refreshed for the same reason: it cannot compile
+   source that calls a name it does not know.
 4. **RC for strings and arrays.** Non-atomic. Literals are wrapped as pinned
    managed copies. Fixes the dominant user-program leak.
 5. **RC for tensor storage + RAII for `model`/handle types.** The domain core:

@@ -89,13 +89,11 @@ if (want_linux != host_linux) { cross_compiling = 1; }
 imp_reset();
 if (!str_eq(entry_path, "")) { g_imp_dir = imp_dir_of(entry_path); }
 imp_expand(src_str);
-mut combined = "";
-mut pi = 1;
-while (pi <= g_part_cnt) {
-    combined = str_concat(combined, str_concat(g_parts[pi], "\n"));
-    pi = pi + 1;
-}
-src_str = combined;
+// Join the fragments in one pass. `g_parts[0]` is a sentinel, so the run is
+// 1..g_part_cnt, and `str_join` appends the separator after every element —
+// the same bytes the per-fragment `str_concat(frag, "\n")` loop produced, but
+// linear, instead of re-copying every earlier fragment once per join.
+src_str = str_join(g_parts, 1, g_part_cnt, "\n");
 
 g_source = src_str;
 g_source_path = src_path;

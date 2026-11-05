@@ -35,6 +35,7 @@
 #   over-budget allocation at run time  -> refused by the allocator (Stage D)
 #   declared pool readable at run time  -> matches what was written
 #   device capacity readable at run time-> the other half of the comparison
+#   a copied handle outlives its source -> reference counted at run time (Stage D)
 #
 # Everything above the "runtime" sections is decided statically, so it runs on
 # any OS with no accelerator present. That is the point: the checker's behaviour
@@ -258,6 +259,229 @@ expect_reject "the same shape in F32 does not fit" "does not fit the accelerator
 @gpu(1.0) fn alloc() -> int64 {
     let a = mlx_zeros([20000, 20000], 0).toGpu();
     return 1;
+}
+fn main() -> int64 { return 0; }'
+
+# ── The budget follows live values, not declarations ─────────────────────────
+#
+# Each of the following was a *false rejection* before the accounting learned
+# that a value can stop being live: the program's real peak fits, and rejecting
+# it made the pool look smaller than the machine it describes. They are asserted
+# because the over-approximation was easy to reintroduce — any change that
+# charges on declaration and never releases brings all of them back.
+#
+# 4 x 256 MiB live = exactly 1 GiB. Freeing one makes room for a fifth.
+expect_ok "mlx_free releases the charge it took" \
+'let vram = 1073741824;
+@gpu fn work() -> int64 {
+    let a = mlx_zeros([8192, 8192], 0).toGpu();
+    let b = mlx_zeros([8192, 8192], 0).toGpu();
+    let c = mlx_zeros([8192, 8192], 0).toGpu();
+    let d = mlx_zeros([8192, 8192], 0).toGpu();
+    mlx_free(a);
+    let e = mlx_zeros([8192, 8192], 0).toGpu();
+    return 0;
+}
+fn main() -> int64 { return 0; }'
+
+# The same, twice over: two frees make room for two allocations.
+expect_ok "two frees release two charges" \
+'let vram = 1073741824;
+@gpu fn work() -> int64 {
+    let a = mlx_zeros([8192, 8192], 0).toGpu();
+    let b = mlx_zeros([8192, 8192], 0).toGpu();
+    let c = mlx_zeros([8192, 8192], 0).toGpu();
+    let d = mlx_zeros([8192, 8192], 0).toGpu();
+    mlx_free(a);
+    mlx_free(b);
+    let e = mlx_zeros([8192, 8192], 0).toGpu();
+    let f = mlx_zeros([8192, 8192], 0).toGpu();
+    return 0;
+}
+fn main() -> int64 { return 0; }'
+
+# `.toCpu()` moves the value out of VRAM, so its bytes stop counting against the
+# accelerator pool. Two moved back, one allocated: peak stays at 1 GiB.
+expect_ok "toCpu releases the VRAM charge" \
+'let vram = 1073741824;
+@gpu fn work() -> int64 {
+    let a = mlx_zeros([8192, 8192], 0).toGpu();
+    let b = mlx_zeros([8192, 8192], 0).toGpu();
+    let c = mlx_zeros([8192, 8192], 0).toGpu();
+    let d = mlx_zeros([8192, 8192], 0).toGpu();
+    let a2 = a.toCpu();
+    let b2 = b.toCpu();
+    let e = mlx_zeros([8192, 8192], 0).toGpu();
+    return 0;
+}
+fn main() -> int64 { return 0; }'
+
+# Sibling `if` branches do NOT accumulate a charge twice... but they DO both
+# count. A branch's locals go out of scope at its `}`, yet Ionic handles are not
+# RAII-freed: no runtime release happens, so a program whose branches both run
+# keeps every allocation. Releasing a branch's charges at `}` made the checker
+# accept the program below against a 1 GiB pool, and it then aborted at run time
+# on the eighth 256 MiB allocation. The over-approximation is the correct
+# direction here: a false rejection is a compile error with a line number, a
+# false acceptance is a runtime abort somewhere else.
+expect_reject "sibling if branches both count" "does not fit the accelerator pool" \
+'let vram = 1073741824;
+@gpu fn work(int64 c) -> int64 {
+    if (c > 0) {
+        let a = mlx_zeros([8192, 8192], 0).toGpu();
+        let b = mlx_zeros([8192, 8192], 0).toGpu();
+        let d = mlx_zeros([8192, 8192], 0).toGpu();
+        let e = mlx_zeros([8192, 8192], 0).toGpu();
+    }
+    if (c > 1) {
+        let f = mlx_zeros([8192, 8192], 0).toGpu();
+        let g = mlx_zeros([8192, 8192], 0).toGpu();
+        let h = mlx_zeros([8192, 8192], 0).toGpu();
+        let i = mlx_zeros([8192, 8192], 0).toGpu();
+    }
+    return 0;
+}
+fn main() -> int64 { return 0; }'
+
+# The same program with mlx_free() calls in each branch does fit, because the
+# bytes really are returned before the second branch allocates. This is the
+# difference the checker is trying to express: scope exit is not a release, but
+# mlx_free() is.
+expect_ok "freeing inside each branch makes them fit" \
+'let vram = 1073741824;
+@gpu fn work(int64 c) -> int64 {
+    if (c > 0) {
+        let a = mlx_zeros([8192, 8192], 0).toGpu();
+        let b = mlx_zeros([8192, 8192], 0).toGpu();
+        let d = mlx_zeros([8192, 8192], 0).toGpu();
+        let e = mlx_zeros([8192, 8192], 0).toGpu();
+        mlx_free(a);
+        mlx_free(b);
+        mlx_free(d);
+        mlx_free(e);
+    }
+    if (c > 1) {
+        let f = mlx_zeros([8192, 8192], 0).toGpu();
+        let g = mlx_zeros([8192, 8192], 0).toGpu();
+        let h = mlx_zeros([8192, 8192], 0).toGpu();
+        let i = mlx_zeros([8192, 8192], 0).toGpu();
+    }
+    return 0;
+}
+fn main() -> int64 { return 0; }'
+
+# `let b = a` copies the *handle*, not the allocation. At run time the pool
+# holds those bytes once, so five names for one 256 MiB buffer is 256 MiB.
+expect_ok "aliases of one handle are charged once" \
+'let vram = 1073741824;
+@gpu fn work() -> int64 {
+    let a = mlx_zeros([8192, 8192], 0).toGpu();
+    let b = a;
+    let c = a;
+    let d = a;
+    let e = a;
+    return 0;
+}
+fn main() -> int64 { return 0; }'
+
+# An alias of an alias. The chain `a -> e -> f` names one buffer three times, so a
+# charge that followed only one hop would bill 512 MiB as 768 MiB and reject it.
+expect_ok "a chain of aliases is charged once" \
+'let vram = 1073741824;
+@gpu fn work() -> int64 {
+    let a = mlx_zeros([8192, 8192], 0).toGpu();
+    let b = mlx_zeros([8192, 8192], 0).toGpu();
+    let c = mlx_zeros([8192, 8192], 0).toGpu();
+    let d = mlx_zeros([8192, 8192], 0).toGpu();
+    let e = a;
+    let f = e;
+    return 0;
+}
+fn main() -> int64 { return 0; }'
+
+# ...and freeing through the far end of the chain releases the bytes once, which
+# is what makes room for a fifth allocation.
+expect_ok "freeing through an alias chain releases the charge" \
+'let vram = 1073741824;
+@gpu fn work() -> int64 {
+    let a = mlx_zeros([8192, 8192], 0).toGpu();
+    let b = mlx_zeros([8192, 8192], 0).toGpu();
+    let c = mlx_zeros([8192, 8192], 0).toGpu();
+    let d = mlx_zeros([8192, 8192], 0).toGpu();
+    let e = a;
+    let f = e;
+    mlx_free(f);
+    let g = mlx_zeros([8192, 8192], 0).toGpu();
+    return 0;
+}
+fn main() -> int64 { return 0; }'
+
+# ...while a released value that is still referenced elsewhere must not free the
+# bytes twice. `mlx_free(b)` releases the charge `a` carries; that is one release
+# for one allocation, and the total returns to exactly zero.
+expect_ok "freeing an alias releases the charge once" \
+'let vram = 1073741824;
+@gpu fn work() -> int64 {
+    let a = mlx_zeros([8192, 8192], 0).toGpu();
+    let b = a;
+    let c = a;
+    let d = a;
+    mlx_free(b);
+    let e = mlx_zeros([8192, 8192], 0).toGpu();
+    return 0;
+}
+fn main() -> int64 { return 0; }'
+
+# A nested `gpu { }` adds to the enclosing scope's total rather than restarting
+# from zero. 256 MiB outside plus 4 x 256 MiB inside is 1.25 GiB, over a 1 GiB
+# pool, so this must be rejected — it used to compile because the block was
+# checked against the whole pool instead of what was left of it.
+expect_reject "a nested gpu block adds to the enclosing total" \
+  "does not fit the accelerator pool" \
+'let vram = 1073741824;
+@gpu fn work() -> int64 {
+    let outer = mlx_zeros([8192, 8192], 0).toGpu();
+    gpu {
+        let a = mlx_zeros([8192, 8192], 0).toGpu();
+        let b = mlx_zeros([8192, 8192], 0).toGpu();
+        let c = mlx_zeros([8192, 8192], 0).toGpu();
+        let d = mlx_zeros([8192, 8192], 0).toGpu();
+    }
+    return 0;
+}
+fn main() -> int64 { return 0; }'
+
+# The same block one value smaller fits, so the rejection above is about the
+# total and not about nesting as such.
+expect_ok "a nested gpu block that fits is accepted" \
+'let vram = 1073741824;
+@gpu fn work() -> int64 {
+    let outer = mlx_zeros([8192, 8192], 0).toGpu();
+    gpu {
+        let a = mlx_zeros([8192, 8192], 0).toGpu();
+        let b = mlx_zeros([8192, 8192], 0).toGpu();
+        let c = mlx_zeros([8192, 8192], 0).toGpu();
+    }
+    return 0;
+}
+fn main() -> int64 { return 0; }'
+
+# The block's charge survives the block. A `gpu { }` does not release its values
+# at `}`, so a value allocated after the block is live alongside them and must be
+# measured against them. Restoring the pre-block total on exit accepted this
+# against a 1 GiB pool.
+expect_reject "a value allocated after a gpu block still counts against it" \
+  "does not fit the accelerator pool" \
+'let vram = 1073741824;
+@gpu fn work() -> int64 {
+    gpu {
+        let a = mlx_zeros([8192, 8192], 0).toGpu();
+        let b = mlx_zeros([8192, 8192], 0).toGpu();
+        let c = mlx_zeros([8192, 8192], 0).toGpu();
+        let d = mlx_zeros([8192, 8192], 0).toGpu();
+    }
+    let after = mlx_zeros([8192, 8192], 0).toGpu();
+    return 0;
 }
 fn main() -> int64 { return 0; }'
 
@@ -718,6 +942,85 @@ fn main() -> int64 {
 }'
 
 expect_runtime "transfers move bytes between pools, accounting once" "$RUNTIME_TEST"
+
+echo
+echo "=== handle reference counting (Stage D) ==="
+
+# `let b = a;` names one handle twice. Before the handle carried a reference
+# count, `mlx_free(a)` destroyed the struct that `b` still pointed at, so the
+# next use of `b` was a use-after-free: `size(b)` returned -1 and the process
+# carried on from a freed pointer. The compiler accepted that program, which is
+# the worst of the three possible outcomes.
+#
+# The count is on the handle, not on the name, because the alternative — a
+# checker rule banning `let b = a` — could not cover the two places a handle is
+# really duplicated in ordinary code: passing a tensor to a function, and
+# returning one. Those need the runtime answer, so they are asserted here too.
+REFCNT_TEST='
+fn check(string name, bool ok) -> int64 {
+    if (ok) {
+        println(str_concat("  ok   ", name));
+        return 0;
+    }
+    println(str_concat("  FAIL ", name));
+    return 1;
+}
+
+fn size_of(tensor@cpu t) -> int64 { return mlx_size(t); }
+
+fn make_one() -> tensor@cpu { return mlx_zeros([3, 3], 0); }
+
+fn main() -> int64 {
+    if (mlx_available() == 0) {
+        println("SKIP: no MLX backend compiled in");
+        return 0;
+    }
+    mut fails = 0;
+
+    // ── a copy keeps the allocation alive ──────────────────────────────────
+    let base = mlx_pool_bytes(0);
+    let a = mlx_zeros([2, 2], 0);
+    let b = a;
+    fails = fails + check("a copy charges nothing extra", mlx_pool_bytes(0) - base == 16);
+    mlx_free(a);
+    fails = fails + check("freeing one name keeps the bytes", mlx_pool_bytes(0) - base == 16);
+    fails = fails + check("the other name is still readable", size_of(b) == 4);
+    mlx_free(b);
+    fails = fails + check("freeing the last name releases the bytes", mlx_pool_bytes(0) == base);
+
+    // ── a chain of copies is still one allocation ──────────────────────────
+    let c = mlx_zeros([4, 4], 0);
+    let d = c;
+    let e = d;
+    fails = fails + check("a chain charges once", mlx_pool_bytes(0) - base == 64);
+    mlx_free(c);
+    mlx_free(d);
+    fails = fails + check("the chain survives two frees", size_of(e) == 16);
+    mlx_free(e);
+    fails = fails + check("the chain releases at the end", mlx_pool_bytes(0) == base);
+
+    // ── passing a tensor borrows it ────────────────────────────────────────
+    // The callee reads the handle; it does not acquire a reference. So the
+    // caller can still free afterwards, and the pool falls back to baseline.
+    let p = mlx_zeros([2, 2], 0);
+    fails = fails + check("a parameter sees the value", size_of(p) == 4);
+    mlx_free(p);
+    fails = fails + check("passing did not leak a reference", mlx_pool_bytes(0) == base);
+
+    // ── returning a tensor moves it ────────────────────────────────────────
+    // No retain on the way out and no release of the source local, so the
+    // returned value arrives owning exactly the one reference it was built with.
+    let r = make_one();
+    fails = fails + check("a returned value is usable", mlx_size(r) == 9);
+    fails = fails + check("a return charges once", mlx_pool_bytes(0) - base == 36);
+    mlx_free(r);
+    fails = fails + check("a returned value is released", mlx_pool_bytes(0) == base);
+
+    if (fails == 0) { return 0; }
+    return 1;
+}'
+
+expect_runtime "a copied handle outlives the name it was copied from" "$REFCNT_TEST"
 
 echo
 echo "=== the allocator backstop (Stage D) ==="

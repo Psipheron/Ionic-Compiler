@@ -516,6 +516,79 @@ char *ionic_str_concat(const char *a, const char *b) {
     return r;
 }
 
+/* ── Bulk string building ──────────────────────────────────────────────────────
+ *
+ * `str_concat` allocates a fresh buffer for every call and nothing frees the
+ * old one, so building a result by repeated concatenation costs
+ *     sum(k = 1..n) k*avg  ~=  n^2*avg/2
+ * bytes of allocation and the same again in leaked memory. That is invisible at
+ * n = 10 and fatal at n = 10,000: the compiler's own import expander joined a
+ * ~170 KB source one line at a time and peaked at 269 MB doing it.
+ *
+ * `ionic_str_join` exists so the *bulk* case is linear: two passes and one
+ * allocation, so the peak is the result rather than the churn.
+ *
+ * It takes an IonicArray of strings: the language has no string-builder type,
+ * and every alternative (a byte array of [int64], a linked list of fragments)
+ * either re-wraps the whole payload per append or re-walks the list per copy.
+ * An [string] holds the fragments as pointers, so a pass over it to compute
+ * length is a pass over n words — the payload is never recopied until the single
+ * final fill.
+ *
+ * Callers still have to *collect* the fragments, which is why the two users in
+ * this tree push into an array instead of accumulating a string. The array is
+ * the builder; this is the one place the pieces get copied.
+ */
+
+/* Concatenate the run `arr[first .. first+count)`, putting `sep` *after* every
+   element — including the last.
+ *
+ * Terminator, not separator, because that is what both callers actually want:
+ * the import expander assembles line fragments and the driver assembles file
+ * fragments, and each piece is followed by a newline. `parts[0] + "\n" +
+ * parts[1] + "\n"` and `parts[0] + "\n" + parts[1]` differ by one byte, and a
+ * primitive that silently drops the trailing one would be the kind of thing
+ * that gets "fixed" by appending an empty element at every call site.
+ * std.text's `join` remains the separator-between version.
+ *
+ * `first` is an index into the array (0-based, like `arr[i]`), not an offset
+ * from 1: callers in this tree keep a sentinel at slot 0 and join from 1.
+ *
+ * Two passes and one allocation. Pass 1 reads one word per element; the
+ * payload is touched once, during the fill. */
+char *ionic_str_join(IonicArray *arr, int64_t first, int64_t count, const char *sep) {
+    if (!sep) sep = "";
+    if (!arr || count <= 0) { char *r = (char *)malloc(1); r[0] = '\0'; return r; }
+    if (first < 0) first = 0;
+    if (first >= arr->len) { char *r = (char *)malloc(1); r[0] = '\0'; return r; }
+    /* Clamp rather than trust the caller: a count past the end would read
+       whatever follows the data block, and this is reachable from ordinary
+       Ionic, where `len` and the count are two separate values. */
+    if (count > arr->len - first) { count = arr->len - first; }
+
+    size_t sl  = strlen(sep);
+    size_t put = sl * (size_t)count;      /* one sep per element, always */
+
+    int64_t i = first;
+    while (i < first + count) {
+        const char *s = (const char *)((int64_t *)arr->data)[i];
+        if (s) put += strlen(s);
+        i = i + 1;
+    }
+
+    char *r = (char *)malloc(put + 1);
+    size_t at = 0;
+    i = first;
+    while (i < first + count) {
+        const char *s = (const char *)((int64_t *)arr->data)[i];
+        if (s) { size_t l = strlen(s); memcpy(r + at, s, l); at += l; }
+        memcpy(r + at, sep, sl); at += sl;
+        i = i + 1;
+    }
+    r[at] = '\0';
+    return r;
+}
+
 int64_t ionic_str_eq(const char *a, const char *b) {
     if (!a) a = ""; if (!b) b = "";
     return strcmp(a, b) == 0 ? 1 : 0;
@@ -874,6 +947,11 @@ typedef struct {
     int64_t    pool;       /* IONIC_POOL_CPU / IONIC_POOL_GPU / _NONE      */
     int64_t    bytes;      /* charged against `pool` while this is alive  */
     uint32_t   owns_array; /* 0 after a move: another handle holds `a`    */
+    /* How many handles name this allocation. `let b = a` makes this 2, and
+     * `ionic_mlx_free` releases only when the last one goes. This fits the
+     * padding `owns_array` already left before the next 8-byte member, so the
+     * struct stays 40 bytes and no call site moves. */
+    uint32_t   rc;
 } MlxTensor;
 
 /* The stream an op on this pool must run on. Keeping the pool in the handle —
@@ -1050,6 +1128,7 @@ static MlxTensor *mlx_tensor_new_at(mlx_array a, int64_t pool) {
     t->pool       = pool;
     t->bytes      = (int64_t)mlx_array_nbytes(a);
     t->owns_array = 1;
+    t->rc         = 1;
     pool_charge(pool, t->bytes);
     return t;
 }
@@ -1403,8 +1482,30 @@ int64_t ionic_mlx_item(void *h) {
 
 /* ── Lifetime ─────────────────────────────────────────────────────────────── */
 
-/* Free a tensor. Null-tolerant and idempotent-ish: a second free on the same
- * handle is caught by the `alive` flag rather than double-freeing the array.
+/* Take another reference to a handle. Emitted by codegen wherever a handle
+ * value is *copied* rather than moved: `let b = a;`, passing a tensor to a
+ * function, and `return x`. Returns the handle so the caller can use the result
+ * as a value.
+ *
+ * This is what makes `let b = a` mean what the docs say it means. Before it,
+ * both names held the same `MlxTensor*`, so `mlx_free(a)` freed the struct and
+ * left `b` dangling: `mlx_tensor_of(b)` then read `magic` out of reclaimed
+ * memory, printed "bad tensor handle", and returned -1. Because the handle is
+ * 40 bytes — the same size class as much of the rest of the heap — the free
+ * usually *succeeded* and the program exited 0 with a wrong answer. */
+void *ionic_mlx_retain(void *h) {
+    MlxTensor *t = mlx_tensor_of(h);
+    if (!t) return h;
+    t->rc += 1;
+    return h;
+}
+
+/* Free a tensor reference. Null-tolerant.
+ *
+ * The handle is reference counted: `let b = a` and a tensor argument each add a
+ * reference, so this releases the allocation only when the last name for it
+ * goes. A second `mlx_free` on a name that is already dead is caught by the
+ * `alive` flag (the checker rejects it statically; this is the backstop).
  *
  * A handle that no longer owns its array (it was moved away from) releases
  * nothing: the bytes belong to the handle the transfer produced. Releasing the
@@ -1413,8 +1514,14 @@ int64_t ionic_mlx_item(void *h) {
 void ionic_mlx_free(void *h) {
     MlxTensor *t = mlx_tensor_of(h);
     if (!t) return;
-    pool_charge(t->pool, -t->bytes);
-    if (t->owns_array) mlx_array_free(t->a);
+    if (t->owns_array) {
+        /* A live owner. Drop this reference; the last one releases the bytes. */
+        if (t->rc > 1) { t->rc -= 1; return; }
+        pool_charge(t->pool, -t->bytes);
+        mlx_array_free(t->a);
+    }
+    /* Either the last owner, or a tombstone left by a move. Neither has bytes
+     * left to give back, so both just retire the struct. */
     t->alive = 0;
     free(t);
 }
@@ -2119,6 +2226,10 @@ int64_t ionic_mlx_set_memory_limit(int64_t b) { (void)b; return -1; }
 
 /* ── Lifetime / inspection ────────────────────────────────────────────────── */
 void    ionic_mlx_free(void *h) { (void)h; }
+/* No handles exist without a backend, so there is nothing to count. Returns the
+ * argument unchanged so the emitted `retain(h)` call is still a no-op value
+ * expression rather than a NULL that would poison a subsequent assignment. */
+void   *ionic_mlx_retain(void *h) { return h; }
 int64_t ionic_mlx_eval(void *h) { (void)h; mlx_unavailable(); return -1; }
 int64_t ionic_mlx_ndim(void *h) { (void)h; return -1; }
 int64_t ionic_mlx_size(void *h) { (void)h; return -1; }

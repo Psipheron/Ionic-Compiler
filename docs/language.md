@@ -337,6 +337,7 @@ no float or array overload.
 | `str_ends_with(string s, string suffix) -> bool` | Suffix test |
 | `str_replace(string s, string from, string to) -> string` | Replace all occurrences |
 | `str_slice(string s, int64 start, int64 end) -> string` | Half-open substring `[start, end)` |
+| `str_join([string] parts, int64 first, int64 count, string sep) -> string` | Join a run of an array, in one allocation |
 | `str_hash(string s) -> int64` | djb2-xor hash |
 | `str_to_int64(string s) -> int64` | Parse decimal int, `0` on failure |
 
@@ -344,6 +345,37 @@ no float or array overload.
 format("{} has {} items", name, int64_to_str(n));
 str_slice("abcdef", 1, 4);        // "bcd"
 ```
+
+#### Building a long string: use `str_join`
+
+Strings are immutable and `str_concat` allocates a fresh buffer every call, so
+accumulating one piece at a time
+
+```ionic
+mut acc = "";
+for (line in lines) { acc = str_concat(acc, line); }   // O(n^2)
+```
+
+re-copies the whole prefix on each iteration. Total allocation is quadratic in
+the result length, and nothing frees the intermediates. It is invisible at ten
+lines and fatal at ten thousand: this pattern in the compiler's own import
+expander made it peak at 798 MB on a 328 KB input.
+
+`str_join` copies each piece exactly once. Collect the pieces in a `[string]`
+and join them in one call:
+
+```ionic
+mut parts: [string] = [""];        // slot 0 unused, as with every Ionic array
+for (line in lines) { push(parts, line); }
+let s = str_join(parts, 1, len(parts) - 1, "\n");
+```
+
+The separator goes **after every element, including the last** — it is a
+terminator, not a separator — so the example above ends with a trailing `\n`,
+matching `line + "\n"` per piece. `first` is a 0-based index into the array and
+`count` is clamped to the end, so `str_join(a, 0, len(a), ",")` joins everything.
+`std.text`'s `join(parts, sep)` is the separator-*between* form built on
+`str_concat`; it is fine for a handful of pieces and quadratic for many.
 
 ### ML model
 | Function | Description |
@@ -435,7 +467,47 @@ line. `mlx_pool_capacity()` exists so a program can compare its declaration
 against the device *before* allocating.
 
 Unlike `load_model`, **handles are not RAII-freed**: call `mlx_free()`
-explicitly.
+explicitly. A handle does not release its bytes when the name that owns it goes
+out of scope — not at the end of a `{ }` block, not on `return`. That is why the
+static budget check counts a `let` inside an `if`/`while`/`for`/`gpu { }` block
+against the enclosing scope *even after the block closes*: the bytes are still
+held at run time, so releasing the charge would let an over-budget program
+compile and then abort at an unrelated line. `mlx_free(x)` and `x.toCpu()` are
+the two operations the checker models as giving bytes back; everything else is a
+borrow. See `docs/plan-placement.md` §D.0 for why the over-approximation is the
+deliberate direction.
+
+A handle is **reference counted**, so naming one twice is safe:
+
+```ionic
+let a = mlx_zeros([2, 2], 0);
+let b = a;          // a second name for one allocation, not a copy of it
+mlx_free(a);        // the bytes are still live: `b` holds the other reference
+println(mlx_size(b));   // 4
+mlx_free(b);        // last reference: the bytes are released here
+```
+
+There is exactly one place that creates a second reference — `let b = a` — and
+the compiler emits a retain there. Everything else either *creates* a reference
+(a constructor, a `@gpu` transfer, which returns a fresh handle) or *borrows* one:
+
+- Passing a tensor to a function borrows it. The callee must not `mlx_free` its
+  parameter, because the caller still owns that reference and goes on using it;
+  the checker rejects such a free. A `let b = p` *inside* the callee does retain,
+  since that new local really does own a reference.
+- `return x` is a move. Ownership leaves with the value and the source local is
+  not released, so no retain is emitted and none is needed.
+
+The pool charge follows the reference, not the name: five names for one 256 MiB
+buffer are 256 MiB, and the bytes come back on the *last* free rather than the
+first. That is what the checker's alias accounting models statically (see
+`scripts/placement_check.sh`, "handle reference counting"), and what the handle's
+own count enforces at run time.
+
+One consequence worth knowing: because a transfer moves a *reference*, a handle
+with more than one reference cannot be moved. `let b = a; let g = a.toGpu();`
+is therefore not a shape to rely on — the transfer consumes `a` while `b` still
+names the same struct.
 
 Backend selection is automatic and per-program: the compiler links `mlx-c` only
 when the source mentions `mlx_*`. On Intel Macs and Linux every function below

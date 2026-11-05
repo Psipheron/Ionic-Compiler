@@ -1,11 +1,16 @@
 # Functional Hardware-Placement Awareness
 
 Status: **Stage A complete, Stage B (B1–B6) complete, Stage C partially complete
-(pool as a runtime fact), Stage D items 2 and 5 complete (allocator backstop,
-device-capacity comparison)** — revised 2026-11-03
+(pool as a runtime fact), Stage D items 2, 3a and 5 complete (allocator backstop,
+handle refcounting, device-capacity comparison)** — revised 2026-11-03
 Author: audit + design pass
 Scope: `src/semantic/checker.ionic`, `src/ionic_model_runtime.c`,
 `src/codegen/native.ionic`, `docs/`
+
+Separately from this plan: `docs/memory-model.md` step 3 landed as a **compiler
+peak fix, not an arena** — a quadratic string join in the import expander was
+removed via a new linear `str_join` builtin (compiler RSS on its own source
+397 MB → 47 MB, flat in line count). See memory-model.md §8 item 3.
 
 ---
 
@@ -391,10 +396,11 @@ lands is archaeology.
    `docs/guide.md` / `docs/Tutorial/04-hardware-placement.md` were corrected to
    say so.
 
-   Regression coverage: `scripts/placement_check.sh` (35 assertions across the
-   B2, B3/B4 and B5 sections, all static and accelerator-free, run in both
-   `ci.yml` and the Linux `elf` job in `multitarget.yml`) and
-   `examples/mastery/04_pool_budget.ionic`.
+   Regression coverage: `scripts/placement_check.sh` (55 assertions across the
+   B2, B3/B4, B5 and runtime sections, run in both `ci.yml` and the Linux `elf`
+   job in `multitarget.yml`) and `examples/mastery/04_pool_budget.ionic`. The
+   static assertions are accelerator-free; the runtime ones self-skip where no
+   backend is linked in and report the skip rather than a pass.
 
    **Parser work this implied — none.** The `@gpu(...)` form already existed:
    `parser/parser.ionic:108-118` reads `@gpu(<float>)` into an `ND_HW` node with
@@ -433,8 +439,10 @@ lands is archaeology.
    was allocated — and charged — in the caller's scope; counting it again here
    would double-charge it. The consequence is that the check is a **necessary
    but not sufficient** condition: it catches "I allocated 4 GiB against a 1%
-   budget" and under-approximates. It cannot produce a false rejection, which
-   is the property that matters for a check users cannot turn off.
+   budget", and it *over*-approximates a value that is explicitly released (see
+   D.0 rows 1–2). It can therefore produce a false rejection, which is the trade
+   made deliberately: a compile error names the allocation, whereas a false
+   acceptance surfaces as a runtime abort at an unrelated line.
 5. **Use-after-move** for transfers (§4.3), per decision 1. ✅ **Done (B5).**
    `x.toGpu()` / `x.toCpu()` consumes `x`; reading the binding afterwards is
    rejected, and the diagnostic names the transfer and the line it happened on.
@@ -541,7 +549,8 @@ This is where the "different capacities" part of the model becomes real rather
 than advisory.
 
 **Item 2 (the allocator backstop) is done — 2026-11-03, and so is item 5 (the
-device-capacity comparison).** Items 3 and 4 remain.
+device-capacity comparison). Item 3a (refcounting the handle) is also done.**
+Items 3 and 4 remain.
 
 What landed:
 
@@ -616,13 +625,59 @@ does not fit VRAM (0 of 67108864 bytes in use)` and exit 1. Both halves are
 asserted in `scripts/placement_check.sh` (`the allocator backstop` section), which
 also checks that the declared number is the one the runtime reports.
 
+**Item 3a (refcount the handle) is done — 2026-11-03.** This was not in the
+original plan; it came out of D.0 row 2. `let b = a;` was accepted and then
+destroyed the allocation under `b`:
+
+```ionic
+let a = mlx_zeros([2, 2], 0);
+let b = a;              // two names, one allocation
+mlx_free(a);            // freed the struct `b` still pointed at
+println(mlx_size(b));   // -1, `[ionic/mlx] bad tensor handle`
+```
+
+The compiler accepted that and the process carried on from a freed pointer — the
+worst of the three outcomes (a false rejection is a compile error, a leak is
+bounded, this is silent corruption).
+
+What landed:
+
+- **`uint32_t rc` in `MlxTensor`**, using padding the struct already had after
+  `owns_array`, so no size class changed. `ionic_mlx_free` decrements it and
+  returns early while `rc > 0`; only the last reference releases the pool charge
+  and the array. `ionic_mlx_retain` is new, with a stub in the no-MLX branch.
+- **Codegen emits exactly one retain**, at the `let` whose initialiser is a
+  *name* bound to a handle. Everything else either creates a reference (a
+  constructor, a transfer) or borrows one. `return x` needs no retain: it is a
+  move, and the source local is not released, so the count is already right
+  (verified — the pool returns to 0).
+- **Tensor parameters are borrows**, so `mlx_free(p)` inside a callee releases a
+  value the caller goes on using. The codegen records the parameter as a tensor
+  so `let b = p` in the callee still retains; the checker rule rejecting a free
+  of a parameter is still **open** (no corpus code does it, so closing it is not
+  a breaking change).
+- **The mark and the retain are different questions**, which the first attempt
+  conflated: the slot is marked when the *initialiser produces a handle*
+  (`mlx_zeros(...)`, a parameter, another name, a transfer), and retained only
+  when it *duplicates an existing one*. Asking one question for both left every
+  freshly-constructed tensor unmarked, so `let b = a` had nothing to notice —
+  reproduced as `size(b) = -1` and fixed.
+
+The alias machinery the checker already had (`sv_alias` / `sv_owner`) turned out
+to be the right model for the static half as well, so "charged once" and
+"released on the last free" are now the same statement on both sides.
+
 **Still missing:**
 
 - **Live-range analysis**, so a value that is provably dead stops being charged.
   Today the runtime release is driven by `mlx_free` and by a transfer, so a value
   that simply falls out of scope keeps its charge until the process ends. That is
   the same over-approximation the static check makes, and the same piece of work
-  fixes both.
+  fixes both. **Scope exit is the sharp case**: the checker and the runtime
+  *agree* that a `let` inside a branch costs bytes after the branch closes, which
+  is why `if`/`while`/`for`/`gpu { }` locals are deliberately not released by
+  `budget_charge`'s counterpart. Making either side release them without the
+  other is what produced an accepted-then-aborted program; see D.0 row 2.
 - **Interprocedural peak.** A callee's allocation is charged to the callee's
   frame and released on return, which is correct for a real peak but means the
   caller's budget is not consulted. A caller holding 1 GiB can call a function
@@ -640,16 +695,22 @@ also checks that the declared number is the one the runtime reports.
 The goal is "pool exhaustion is a build error". The static check is a **necessary
 but not sufficient** condition today, and the difference is worth stating
 exactly, because every one of these was confirmed by compiling a program and
-watching it succeed. None of them can produce a *false* rejection; all of them
-can miss an over-budget program.
+watching it succeed.
+
+The direction of the error splits the table in two. The *over*-approximating
+rows can reject a program that would fit, and that is the deliberate choice —
+a false rejection is a compile error naming the allocation, while a false
+acceptance is a runtime abort at an unrelated line. The *under*-approximating
+rows can miss an over-budget program; those are the open work.
 
 | Gap | Confirmed by | Consequence |
 |---|---|---|
-| **No live-range analysis.** A binding keeps its charge for the whole scope, even after `mlx_free` or after it is provably dead. | Four 256 MiB values plus a freed fifth are rejected: 5 x 256 MiB is counted, though only 4 are live. | Over-approximates the peak, so it can reject a program that would fit. Conservative direction, but it is the *opposite* error from the ones below. |
+| **No live-range analysis for values whose lifetime is not a statement.** A binding keeps its charge for the rest of the scope unless something *explicitly* releases it. | Four 256 MiB values plus a fifth allocated after one of them is `mlx_free`d now compiles (the free is modelled); a value whose last use has passed, but which is never freed, still counts. | Over-approximates the peak, so it can reject a program that would fit. Conservative direction, but it is the *opposite* error from the ones below. |
+| ~~**Aliasing a handle was uncharged and unsafe.**~~ **Closed by item 3a.** `let b = a` copies the handle; before refcounting, `mlx_free(a)` freed the struct `b` still pointed at. | `let b = a; mlx_free(a); mlx_size(b)` printed `-1` and `[ionic/mlx] bad tensor handle` at exit 0 — accepted by the compiler, silent corruption at run time. | Fixed: the handle carries `rc`, one reference is retained at the copy, and the bytes come back on the last free. The static side already charged the alias once, so both halves now agree. |
+| **Scope exit does not release, and the checker now says so.** A `let` inside `if`/`while`/`for`/`gpu { }` keeps its charge after the closing `}`. | `if (c>0) { four 256 MiB } if (c>1) { four more }` is rejected against a 1 GiB pool. That is *correct*: an earlier revision released the branch's charges and accepted the program, which then aborted at run time on the eighth allocation. | Over-approximates. Deliberate: a false rejection names a line, a false acceptance aborts somewhere else. Lifts when item 3 gives scope exit a real release. |
 | **Interprocedural peak is not modelled.** `let n = inner()` where the caller already holds 1 GiB is not charged for what `inner` allocates. | A `@gpu` fn holding 1 GiB calls another that allocates 1 GiB; both compile, and the real peak is 2 GiB against a 1 GiB pool. | Under-approximates: the classic over-budget-at-3am case, still reachable. |
 | **Runtime-sized shapes are unbounded, and only warned about.** A shape element that is not an integer literal makes the size unknown, and unknown values are exempt (decision 4, narrowed). | `mlx_zeros([n, n], 0).toGpu()` in a budgeted scope still compiles for any `n`, but now prints a `[warn]` naming the value and the scope's known total. | Under-approximates. The exemption is *reported* rather than counted as a rejection, so "this fits" and "this was never sized" are distinguishable — but nothing enforces it. |
 | **The declared `vram` is never checked against the device** *statically*. The pool size is a compile-time literal and no compilation step knows what machine will run the binary. | Nothing at build time compares it to the backend's real memory. The runtime now compares it at the first allocation and warns. | A program can still declare more VRAM than exists and be "correct"; it is now told so when it runs, rather than believing it. |
-| **`gpu { }` inside `@gpu(f)` resets the running total** instead of adding to it. | Noted at `budget_begin(0)` in `checker.ionic`; the nested block checks its own locals against the whole pool. | Under-approximates for nested scopes. |
 
 Two of these are the difference between "catches obvious mistakes" and "makes
 pool exhaustion a build error": **interprocedural peak** and **runtime-sized
@@ -809,9 +870,12 @@ per pool, at the first allocation — when the declaration exceeds what the devi
 actually offers. So a program that gets past the static check cannot go on to
 allocate ten thousand times its stated budget, and a program whose declaration is
 fiction for this machine is told which two numbers disagree instead of believing
-it. MLX is retained as the unified-memory backend, the point in the design space
-where a transfer moves accounting but not bytes, rather than as the definition of
-the semantics. Remaining: live-range analysis and interprocedural peak (which
-together make the *static* check sufficient rather than necessary), the
-ambient-pool runtime stack, and the refusal path for a GPU scope on a machine with
-no accelerator.
+it. Since Stage D item 3a a tensor handle is reference counted, so naming one
+twice is safe and the bytes come back on the last free — the one shape that was
+accepted and then silently corrupted memory. MLX is retained as the
+unified-memory backend, the point in the design space where a transfer moves
+accounting but not bytes, rather than as the definition of the semantics.
+Remaining: live-range analysis and interprocedural peak (which together make the
+*static* check sufficient rather than necessary), the ambient-pool runtime stack,
+the refusal path for a GPU scope on a machine with no accelerator, and the
+checker rule banning `mlx_free` of a tensor parameter.

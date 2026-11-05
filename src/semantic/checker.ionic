@@ -183,6 +183,15 @@ mut sv_charged = [0];
 // harder to act on than one that can.
 mut sv_mvline  = [0];
 mut sv_mvhow   = [""];  // ".toGpu()" / ".toCpu()" — the transfer that consumed it
+// The binding whose bytes this one names, when `let b = a;` made `b` a second
+// name for `a`'s value, or "" when it owns bytes of its own.
+//
+// `let b = a` copies the *handle*, not the allocation: at run time both names
+// point at one MlxTensor, so the pool holds those bytes once. Charging both
+// would count them twice and reject a program whose peak fits. Remembering the
+// source name is what lets the duplicate charge be zeroed — and, because the
+// alias is recorded by name, releasing either one releases the bytes once.
+mut sv_alias   = [""];
 mut sv_count   = 0;
 mut frame_stk  = [0];
 mut frame_count = 0;
@@ -214,6 +223,7 @@ fn sv_declare(string name, int64 ty, string sv, int64 mut_flag) -> int64 {
         sv_charged[sv_count] = 0;
         sv_mvline[sv_count] = 0;
         sv_mvhow[sv_count]  = "";
+        sv_alias[sv_count]  = "";
     } else {
         push(sv_names,  name);
         push(sv_tys,    ty);
@@ -223,6 +233,7 @@ fn sv_declare(string name, int64 ty, string sv, int64 mut_flag) -> int64 {
         push(sv_charged, 0);
         push(sv_mvline, 0);
         push(sv_mvhow,  "");
+        push(sv_alias,  "");
     }
     return 0;
 }
@@ -276,6 +287,54 @@ fn sv_charged_in_set(string name, int64 sid) -> int64 {
     if (i == 0) { return 0; }
     sv_charged[i] = sid;
     return 0;
+}
+
+// Which scope this binding's bytes are currently counted in, or 0 for none.
+// Read by the aliasing rule in budget_charge: a value some scope already holds
+// must not be charged a second time by another name for it.
+fn sv_charged_id(string name) -> int64 {
+    let i = sv_lookup_idx(name);
+    if (i == 0) { return 0; }
+    return sv_charged[i];
+}
+
+// Record that `name` is a second name for `src`'s value (`let b = a;`).
+fn sv_alias_set(string name, string src) -> int64 {
+    let i = sv_lookup_idx(name);
+    if (i == 0) { return 0; }
+    sv_alias[i] = src;
+    return 0;
+}
+
+// The binding that actually carries `name`'s charge.
+//
+// Usually `name` itself. After `let b = a;` it is `a`, because `b` was never
+// charged — the bytes were counted once, under `a`. Following the chain (with a
+// depth cap so a pathological alias cycle cannot spin here) is what makes
+// `mlx_free(b)` release the bytes that `a` was charged for, which is the same
+// allocation at run time.
+fn sv_owner(string name) -> string {
+    mut cur = name;
+    mut guard = 0;
+    while (guard < 32) {
+        let i = sv_lookup_idx(cur);
+        if (i == 0) { return cur; }
+        if (str_eq(sv_alias[i], "")) { return cur; }
+        cur = sv_alias[i];
+        guard = guard + 1;
+    }
+    return cur;
+}
+
+// Give `name`'s value back to the pool: the bytes leave the running total the
+// owning binding was charged against.
+//
+// Both `mlx_free(x)` and `x.toCpu()` land here. Before this, neither was
+// modelled, so the checker counted a value it had been told to release and
+// rejected programs whose real peak fit — `mlx_free(a)` then allocating a
+// replacement was charged for both.
+fn sv_release_value(string name) -> int64 {
+    return sv_release_charge(sv_owner(name));
 }
 
 // Release `name`'s charge from the current scope's running total, if this scope
@@ -903,8 +962,15 @@ fn expr_bytes(int64 node) -> int64 {
 //     see the note in docs/plan-placement.md.
 //   * Consequently this is a NECESSARY but not sufficient check: it catches
 //     "I allocated 4 GiB against a 1% budget", and it does not prove that every
-//     value in the scope fits. It under-approximates; it cannot produce a false
-//     rejection.
+//     value in the scope fits.
+//   * It also *over*-approximates in two ways, so it CAN produce a false
+//     rejection — deliberately. A value keeps its charge until `mlx_free` or
+//     `.toCpu()` releases it (no live-range analysis), and a `let` inside a
+//     branch keeps its charge after the branch closes (nothing at run time
+//     frees it there). Both err toward rejecting a program that would fit,
+//     which is the direction that keeps a false acceptance — a runtime abort at
+//     an unrelated line — out of the user's hands. See docs/plan-placement.md
+//     §D.0.
 mut sc_budget_bytes  = -1;   // -1 = no budget in force
 mut sc_used_bytes    = 0;
 // Unique id for the scope currently accumulating, so a binding can record which
@@ -941,6 +1007,26 @@ fn budget_begin(int64 hw_node) -> int64 {
 // had.
 fn budget_charge(string name, int64 init_nd, int64 node) -> int64 {
     if (sc_budget_bytes < 0) { return 0; }
+    // `let b = a;` copies the *handle*, not the allocation, so the pool holds
+    // those bytes once. Charging `b` as well would double-count them and reject
+    // a program whose real peak fits — five names for one 256 MiB buffer
+    // measured 1.25 GiB. The alias records which binding actually carries the
+    // charge, so a later `mlx_free(b)` or `b.toCpu()` releases the right bytes.
+    if (nd_kind[init_nd] == ND_IDENT) {
+        let src = nd_sv[init_nd];
+        // Follow the chain: `let e = a; let f = e;` must see that `a` carries
+        // the charge. Asking `e` directly returns 0 — an alias is never charged
+        // itself — so the second copy was billed for bytes the pool already
+        // held under `a`, and a chain of four names for one buffer was rejected
+        // as four buffers.
+        let owner = sv_owner(src);
+        if (sv_charged_id(owner) == sc_scope_id) {
+            sv_alias_set(name, owner);
+            sv_set_bytes(name, expr_bytes(init_nd));
+            sv_charged_in_set(name, 0);
+            return 0;
+        }
+    }
     let b = expr_bytes(init_nd);
     if (b < 0) {
         // Exempt: the new value's size is unknown, so the record must say so.
@@ -1293,6 +1379,19 @@ fn register_builtins() -> int64 {
     bparam(1, TY_STR); bparam(2, TY_STR);
     register_builtin("str_replace",       3, TY_STR,     "");
     bparam(1, TY_STR); bparam(2, TY_STR); bparam(3, TY_STR);
+    // Bulk join: concatenate the run `parts[first .. first+count)`, putting
+    // `sep` after *every* element (a terminator, not a separator — see the
+    // runtime). Linear in the total length, where the equivalent
+    // `acc = str_concat(acc, piece)` loop is linear in the *square* of it.
+    //
+    // This exists for a measured reason: the compiler assembled its own
+    // 170 KB source one line at a time and peaked at 269 MB, and RSS tracked
+    // line count rather than byte count (320 KB as 4 lines = 42 MB; the same
+    // 320 KB as 8000 lines = 798 MB). Collecting the pieces in an array and
+    // joining once is the only shape that is not quadratic, because Ionic
+    // strings are immutable and there is no builder type.
+    register_builtin("str_join",          4, TY_STR,     "");
+    bparam(1, TY_ARRAY); bparam(2, TY_INT64); bparam(3, TY_INT64); bparam(4, TY_STR);
     register_builtin("str_to_int64",      1, TY_INT64,   ""); bparam(1, TY_STR);
     register_builtin("get_arg",           1, TY_STR,     ""); bparam(1, TY_INT64);
     register_builtin("exit",              1, TY_VOID,    ""); bparam(1, TY_INT64);
@@ -1701,6 +1800,42 @@ fn sc_expr(int64 node) -> int64 {
         let args_list = nd_i2[node];
         let got_argc = cons_len(args_list);
 
+        // `mlx_free(x)` gives the bytes back, so the scope no longer holds them.
+        // Recognised before the generic argument walk because releasing has to
+        // happen either way, and because the operand is being *consumed* rather
+        // than read — see below for why that matters to the move check.
+        if (str_eq(callee, "mlx_free")) {
+            let arg = arg_node(args_list, 1);
+            if (arg != 0 && nd_kind[arg] == ND_IDENT && sv_is_defined(nd_sv[arg])) {
+                let fname = nd_sv[arg];
+                // The name must still own a value. This path bypasses sc_expr —
+                // which is where every other reference gets the use-after-move
+                // rule — so it has to apply that rule itself: `let g = a.toGpu();
+                // mlx_free(a)` frees a binding that no longer holds anything, and
+                // silently accepting it would lose the diagnostic the transfer
+                // rule exists to produce.
+                sc_check_not_moved(fname);
+                sv_release_value(fname);
+                // The type check the generic path would have done, without
+                // re-reading the name whose release just happened.
+                let fty = sv_lookup_ty(fname);
+                if (fty != TY_TENSOR_CPU && fty != TY_TENSOR_GPU && fty != TY_UNKNOWN) {
+                    sc_error_at("mlx_free", str_concat(str_concat("expected tensor, got ", ty_name(fty, "")),
+                                                       " (mlx_free releases an mlx handle)"));
+                }
+                // Releasing clears the binding's scope record, so a second
+                // `mlx_free(a)` finds charged == 0 and subtracts nothing. That
+                // matters: a double release would drive the running total
+                // negative and silently disable every later budget check.
+                sc_ty = TY_VOID; sc_sv = ""; return 0;
+            }
+            // Not a plain binding (`mlx_free(mlx_zeros(...))`): nothing to
+            // release or track, but the argument still needs type checking.
+            mut cur = args_list;
+            while (cur != 0) { sc_expr(nd_i2[cur]); cur = nd_i3[cur]; }
+            sc_ty = TY_VOID; sc_sv = ""; return 0;
+        }
+
         if (sc_in_gpu_block == 1 && is_cpu_only_fn(callee)) {
             sc_error_at(str_concat("'", str_concat(callee, "' is CPU-only I/O, not allowed inside gpu block")),
                 "gpu blocks may only perform tensor compute");
@@ -1821,6 +1956,13 @@ fn sc_expr(int64 node) -> int64 {
             if (obj_ty != TY_TENSOR_GPU && obj_ty != TY_UNKNOWN) {
                 sc_error_at("toCpu", "can only call toCpu() on tensor@gpu");
             }
+            // The value leaves the accelerator pool, so the bytes it was charged
+            // for are no longer live there. Without this a program that moved
+            // two of four values back to the host and then allocated a fifth was
+            // rejected at 1.25 GiB against a 1 GiB pool whose real peak is 1 GiB.
+            if (nd_kind[nd_i2[node]] == ND_IDENT) {
+                sv_release_value(nd_sv[nd_i2[node]]);
+            }
             sc_consume_operand(nd_i2[node], nd_line[node], ".toCpu()");
             sc_ty = TY_TENSOR_CPU; sc_sv = ""; return 0;
         }
@@ -1938,6 +2080,13 @@ fn sc_expr(int64 node) -> int64 {
         sc_in_conversion = 0;
         if (sc_ty != TY_TENSOR_GPU && sc_ty != TY_UNKNOWN) {
             sc_error_at("toCpu", "operand must be tensor@gpu");
+        }
+        // Same release as the method-call spelling. The parser produces either
+        // ND_METHOD_CALL or ND_TO_CPU depending on how the transfer is written,
+        // so modelling one and not the other makes the accounting depend on
+        // syntax.
+        if (nd_kind[nd_i2[node]] == ND_IDENT) {
+            sv_release_value(nd_sv[nd_i2[node]]);
         }
         sc_consume_operand(nd_i2[node], nd_line[node], ".toCpu()");
         sc_ty = TY_TENSOR_CPU; sc_sv = ""; return 0;
@@ -2097,6 +2246,20 @@ fn sc_stmt(int64 node) -> int64 {
         if (sc_ty != TY_BOOL && sc_ty != TY_INT64 && sc_ty != TY_UNKNOWN) {
             sc_error_at("if condition", str_concat("expected bool/int64, got ", ty_name(sc_ty, "")));
         }
+        // NOT released. A branch's locals go out of *scope* at its `}`, but
+        // Ionic handles are not RAII-freed: nothing at run time gives those
+        // bytes back, so a program whose branches both run keeps every
+        // allocation. Releasing here made the checker accept
+        //
+        //     if (c > 0) { four values }
+        //     if (c > 1) { four more }
+        //
+        // against a 1 GiB pool, which then aborted at the eighth allocation.
+        // Trading a false rejection for a false *acceptance* is the wrong
+        // direction: the second one reaches the user as a runtime failure at an
+        // unrelated line. The over-approximation stays until a scope exit really
+        // returns bytes — that is stage D item 3, and it needs the tensor RAII
+        // question settled first (see plan-placement.md).
         sv_push_frame();
         sc_block_stmts(then_bl);
         sv_pop_frame();
@@ -2153,22 +2316,28 @@ fn sc_stmt(int64 node) -> int64 {
         let saved_first   = sc_unknown_first;
         sc_in_gpu_block = 1;
         // A bare `gpu { }` has no fraction of its own, so it inherits the whole
-        // declared pool.
+        // declared pool — and it *adds to* the total the enclosing scope has
+        // already accumulated rather than starting from zero. A block inside an
+        // `@gpu(0.25) fn` used to be checked against the entire pool instead of
+        // the remaining quarter, which under-counted and let an over-budget body
+        // through.
         //
-        // NOTE: nesting resets the running total rather than adding to the
-        // enclosing scope's. A `gpu { }` inside an `@gpu(0.25) fn` therefore
-        // checks its own locals against the whole pool, not the remaining
-        // quarter, which under-counts. This is the conservative-for-the-user
-        // direction (it can only let more through, never reject), and it
-        // matches the fact that the block's own locals die at its `}`. Fixing
-        // it properly needs the live-range analysis that stage D defers.
+        // The accumulated total is NOT restored on exit. The block's values are
+        // still live at run time — Ionic does not free a handle when its name
+        // goes out of scope — so anything allocated after the block has to be
+        // measured against them too. Only the budget (a property of the
+        // enclosing scope) and the diagnostic counters are restored.
+        let saved_scope  = sc_scope_id;
         budget_begin(0);
+        sc_used_bytes = saved_used;
         sv_push_frame();
         sc_block_stmts(nd_i2[node]);
         sv_pop_frame();
         budget_end();
+        let blocked_used = sc_used_bytes;
         sc_budget_bytes  = saved_budget;
-        sc_used_bytes    = saved_used;
+        sc_scope_id      = saved_scope;
+        sc_used_bytes    = blocked_used;
         sc_unknown_count = saved_unknown;
         sc_unknown_first = saved_first;
         sc_in_gpu_block = saved_gpu;

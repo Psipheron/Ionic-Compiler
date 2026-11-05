@@ -561,6 +561,11 @@ mut local_model    = [0];   // 1 if this local owns a `model` resource (RAII)
 // integer, because an element load is an int64 bit pattern and nothing carried
 // the element type to the call site.
 mut local_elem     = [0];
+// 1 when this local holds an MLX tensor handle rather than an int64 bit
+// pattern. Two different things read it: `let b = a` uses it to decide whether
+// the copy needs a retain, and a tensor *parameter* is marked because it is a
+// borrow that must not be freed by the callee.
+mut local_is_tensor = [0];
 mut local_count    = 0;
 
 // Names+slots of model-owning locals, for auto-free at function end.
@@ -604,6 +609,7 @@ fn local_reset() -> int64 {
     arr_reset(local_stypes);
     arr_reset(local_model);
     arr_reset(local_elem);
+    arr_reset(local_is_tensor);
     arr_reset(model_names);
     arr_reset(model_slots);
     model_count = 0;
@@ -649,8 +655,24 @@ fn local_def(string name, int64 is_float) -> int64 {
     local_stypes.push("");
     local_model.push(0);
     local_elem.push(0);
+    local_is_tensor.push(0);
     local_count = local_count + 1;
     return slot;
+}
+
+fn local_set_tensor(int64 slot, int64 is_tensor) -> int64 {
+    local_is_tensor[slot] = is_tensor;
+    return 0;
+}
+
+fn local_get_tensor(string name) -> int64 {
+    let h = str_hash(name);
+    mut i = 0;
+    while (i < local_count) {
+        if (local_names[i] == h) { return local_is_tensor[i]; }
+        i = i + 1;
+    }
+    return 0;
 }
 
 fn local_set_str(int64 slot, int64 is_str) -> int64 {
@@ -931,6 +953,91 @@ fn ncg_release_models() -> int64 {
         }
         i = i + 1;
     }
+    return 0;
+}
+
+// ── Reference counting for MLX tensor handles ────────────────────────────────
+//
+// A tensor handle is reference counted at run time (`MlxTensor.rc`), so every
+// place codegen *copies* a handle must retain. There is exactly one such place:
+//
+//     let b = a;      // two names, one allocation -> retain
+//
+// Everything else either creates a reference (a constructor returns rc=1; a
+// transfer returns a fresh handle) or borrows one (a tensor argument is
+// borrow-checked, so the callee must never free it — see the checker's rule
+// against `mlx_free(param)`). `return x` is a move: ownership leaves with the
+// value and the local is not released, so it needs no retain either.
+//
+// Deciding this from the AST rather than from `ncg_last_ty` matters: the emit
+// paths in `ncg_expr` set that global as a side effect, and the value that is
+// live when `let` looks at it is not necessarily the one the initialiser
+// produced.
+
+// Does this expression *produce a tensor handle*? Used to mark a local, so a
+// later `let b = a` can see that `a` holds a handle.
+//
+// This must be broader than "is a copy of an existing tensor": `let a =
+// mlx_zeros(...)` creates a reference and must still be marked, or the later
+// copy has nothing to notice. Asking only about names (the first version of
+// this function) left every freshly-constructed tensor unmarked, so
+// `let b = a` emitted no retain and `mlx_free(a)` freed the struct that `b`
+// still pointed at — reproduced as `size(b) = -1` at run time.
+fn ncg_is_tensor_expr(int64 n) -> int64 {
+    if (n == 0) { return 0; }
+    let k = nd_kind[n];
+    if (k == ND_TO_GPU || k == ND_TO_CPU) { return 1; }
+    if (k == ND_IDENT) {
+        if (local_get_tensor(nd_sv[n]) == 1) { return 1; }
+        // A tensor-typed global, or a name only the checker knows about.
+        let t = sv_lookup_ty(nd_sv[n]);
+        if (t == TY_TENSOR_CPU || t == TY_TENSOR_GPU) { return 1; }
+        return 0;
+    }
+    // A call: fn_find covers builtins, so this sees `mlx_zeros`, `mlx_matmul`
+    // and user functions declared to return a tensor.
+    if (k == ND_CALL || k == ND_METHOD_CALL) {
+        let t = fn_ret_ty(nd_sv[n]);
+        if (t == TY_TENSOR_CPU || t == TY_TENSOR_GPU) { return 1; }
+    }
+    return 0;
+}
+
+// Is this initialiser a *second name for an existing allocation*? That is the
+// only case that needs a retain; a freshly constructed handle is already one
+// reference and retaining it would leak.
+fn ncg_is_tensor_copy(int64 n) -> int64 {
+    if (n == 0) { return 0; }
+    if (nd_kind[n] != ND_IDENT) { return 0; }
+    return ncg_is_tensor_expr(n);
+}
+
+// Emit `r = ionic_mlx_retain(r)` for a handle that is being copied. The result
+// is the same pointer, so `r` stays valid and the caller's subsequent store is
+// unchanged.
+fn ncg_retain_r(int64 r, int64 init) -> int64 {
+    if (r < 0) { return 0; }
+    if (ncg_is_tensor_copy(init) == 0) { return 0; }
+    // A BL clobbers the caller-saved scratch registers, so spill everything
+    // live before the call and restore after — the same discipline every other
+    // call site here uses.
+    let live = scratch_depth;
+    mut si = 0;
+    while (si < live) {
+        a64_store_fp(REG_X9 + si, (spill_base + 2 + si) * 8);
+        si = si + 1;
+    }
+    let sym = sym_undef("ionic_mlx_retain");
+    a64_mov(REG_X0, r);
+    a64_bl_sym(sym);
+    si = 0;
+    while (si < live) {
+        a64_load_fp(REG_X9 + si, (spill_base + 2 + si) * 8);
+        si = si + 1;
+    }
+    // ionic_mlx_retain returns its argument, so X0 already holds the handle;
+    // nothing else to move. If it NULLed (it cannot), the stored value would be
+    // NULL rather than dangling, which is the safer of the two failures.
     return 0;
 }
 
@@ -1656,6 +1763,7 @@ fn ncg_call(int64 node) -> int64 {
     if (str_eq(callee, "str_eq"))           { real_callee = "ionic_str_eq"; }
     if (str_eq(callee, "str_len"))          { real_callee = "ionic_str_len"; }
     if (str_eq(callee, "str_index"))        { real_callee = "ionic_str_index"; }
+    if (str_eq(callee, "str_join"))         { real_callee = "ionic_str_join"; }
     if (str_eq(callee, "int64_to_str"))     { real_callee = "ionic_int64_to_str"; }
     if (str_eq(callee, "float64_to_str"))   { real_callee = "ionic_float64_to_str"; }
     if (str_eq(callee, "char_to_str"))      { real_callee = "ionic_char_to_str"; }
@@ -1824,6 +1932,7 @@ fn ncg_call(int64 node) -> int64 {
         str_eq(callee, "get_arg")        || str_eq(callee, "file_read")     ||
         str_eq(callee, "str_slice")      || str_eq(callee, "read_line")    ||
         str_eq(callee, "str_replace")    || str_eq(callee, "format")         ||
+        str_eq(callee, "str_join")       ||
         str_eq(callee, "http_get")       || str_eq(callee, "http_post")      ||
         str_eq(callee, "http_body")      || str_eq(callee, "http_urlencode") ||
         str_eq(callee, "bpe_decode")     ||
@@ -1891,6 +2000,31 @@ fn ncg_stmt(int64 node) -> int64 {
         }
         // RAII: a local bound to a freshly loaded model owns that resource.
         if (ncg_model_expr(init) == 1) { local_set_model(name, 1); }
+        // A tensor local owns one reference to its handle, so a `let` whose
+        // initialiser *copies* another live tensor must retain it: `let b = a`
+        // would otherwise leave two names over one reference, and `mlx_free(a)`
+        // would free the struct out from under `b`.
+        //
+        // `ncg_retain_r` decides from the initialiser's shape, so a tensor
+        // produced fresh by `mlx_zeros(...)` is not retained (it is already one
+        // reference) while `let b = a` is.
+        //
+        // The slot is written directly rather than through `local_set_tensor`'s
+        // name lookup: `let` may shadow, and a name-keyed setter resolves to the
+        // *first* binding of that name, which would mark the wrong slot.
+        // NOTE: `ann_ty` is a *type node*, so it is matched on ND_TY_TENSOR, not
+        // on a TY_* code — there is no single TY_TENSOR, the codes are split by
+        // device (TY_TENSOR_CPU / TY_TENSOR_GPU).
+        mut is_tensor = 0;
+        if (ann_ty != 0 && nd_kind[ann_ty] == ND_TY_TENSOR) {
+            is_tensor = 1;
+        } else if (ncg_is_tensor_expr(init) == 1) {
+            is_tensor = 1;
+        }
+        local_set_tensor(slot, is_tensor);
+        // Note the *narrower* question here: marking the slot asks "does this
+        // hold a handle", retaining asks "is this a second name for one".
+        if (is_tensor == 1) { ncg_retain_r(r, init); }
         // Store to stack
         if (off >= 0) { a64_str(r, REG_X29, off >> 3); }
         else {
@@ -2393,6 +2527,14 @@ fn ncg_fn_node(int64 fn_node) -> int64 {
         }
         if (nd_kind[param_ty] == ND_TY_ARRAY) {
             local_set_elem(slot, node_ty_elem_int(param_ty));
+        }
+        // A tensor parameter is a *borrow*: the caller still owns its reference,
+        // so `mlx_free(p)` inside the callee would release a value the caller
+        // goes on using. The checker rejects that (see the mlx_free rule); this
+        // column records the type so `let b = p` inside the callee still retains
+        // correctly, since the new local does own a reference.
+        if (nd_kind[param_ty] == ND_TY_TENSOR) {
+            local_set_tensor(slot, 1);
         }
         let off  = local_offset(slot);
         // Prologue happens before we store params, so store after prologue

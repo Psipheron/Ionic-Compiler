@@ -405,9 +405,25 @@ fn imp_emit(string frag) -> int64 {
 }
 
 // Expand source, splicing in imports and stripping import lines.
+//
+// Body lines are collected in an array and joined ONCE, not accumulated with
+// `acc = str_concat(acc, line)`.
+//
+// That is not a style choice. `str_concat` allocates a fresh buffer and nothing
+// frees the old one, so the accumulator re-copied the whole prefix on every
+// line: total allocation was O(lines x file size). The compiler did this to its
+// own 170 KB source and peaked at 269 MB; measured on synthetic input, RSS
+// tracked *line count* at constant byte count — 320 KB as 4 lines was 42 MB,
+// the same 320 KB as 8000 lines was 798 MB. Collecting the pieces and joining
+// once is linear, and an array of pointers is the only builder the language has
+// (strings are immutable, so every alternative is the same quadratic).
+//
+// The fragments are still emitted as ONE body after this file's imports, which
+// is what preserves the original ordering: a module's imports are spliced in
+// ahead of its own top-level statements.
 fn imp_expand(string src) -> int64 {
     let n = str_len(src);
-    mut acc = "";
+    mut lines: [string] = [""];   // sentinel at 0; body lines from 1
     mut pos = 0;
     while (pos < n) {
         let nl = imp_next_nl(src, pos);
@@ -454,11 +470,13 @@ fn imp_expand(string src) -> int64 {
                 imp_resolve(modpath);
             }
         } else {
-            acc = str_concat(acc, str_concat(str_slice(src, pos, nl), "\n"));
+            push(lines, str_slice(src, pos, nl));
         }
         pos = nl + 1;
     }
-    imp_emit(acc);
+    // `str_join` puts the separator after every element, so this reproduces
+    // `line + "\n"` exactly. Count is len-1 because slot 0 is the sentinel.
+    imp_emit(str_join(lines, 1, len(lines) - 1, "\n"));
     return 0;
 }
 
