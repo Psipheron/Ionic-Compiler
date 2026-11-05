@@ -211,7 +211,11 @@ impl Codegen {
 
         // Format string constants
         self.emit("@fmt_int   = private constant [6 x i8]  c\"%lld\\0A\\00\"");
-        self.emit("@fmt_float = private constant [5 x i8]  c\"%lf\\0A\\00\"");
+        // "%g", not "%lf": the C runtime prints floats with
+        // ionic_println_float64 (`printf("%g")`), so "%lf" here printed
+        // 2.500000 where the self-hosted compiler printed 2.5 for the same
+        // program. Same divergence as ionic_float64_to_str below.
+        self.emit("@fmt_float = private constant [4 x i8]  c\"%g\\0A\\00\"");
         self.emit("@fmt_str   = private constant [4 x i8]  c\"%s\\0A\\00\"");
         self.emit("@fmt_bool_t = private constant [6 x i8] c\"true\\0A\\00\"");
         self.emit("@fmt_bool_f = private constant [7 x i8] c\"false\\0A\\00\"");
@@ -452,93 +456,49 @@ impl Codegen {
         self.emit("}");
         self.emit("");
 
-        // ail_str_concat(a, b) -> ptr
-        self.emit("define ptr @ionic_str_concat(ptr %a, ptr %b) {");
-        self.emit("entry:");
-        self.emit("  %la = call i64 @strlen(ptr %a)");
-        self.emit("  %lb = call i64 @strlen(ptr %b)");
-        self.emit("  %tot1 = add i64 %la, %lb");
-        self.emit("  %tot = add i64 %tot1, 1");
-        self.emit("  %buf = call ptr @malloc(i64 %tot)");
-        self.emit("  call ptr @strcpy(ptr %buf, ptr %a)");
-        self.emit("  call ptr @strcat(ptr %buf, ptr %b)");
-        self.emit("  ret ptr %buf");
-        self.emit("}");
+        // ── String producers: DELEGATED TO THE C RUNTIME ─────────────────────
+        //
+        // These five were defined here in IR, each with a raw malloc. That was
+        // harmless while nothing read a refcount header — but the moment step 4
+        // stage 2 emits a release, an IR-built string would be released eight
+        // bytes before the start of a plain malloc block.
+        //
+        // Re-deriving the header arithmetic in IR was the alternative and was
+        // rejected: two copies of one layout is how these two builds drifted in
+        // the first place. `ionic_float64_to_str` already proved it — the IR
+        // version here formatted with "%lf" and returned 2.500000 while the C
+        // runtime formatted with "%g" and returned 2.5, so the same program
+        // printed differently depending on which compiler built it.
+        //
+        // So the IR now only *declares* these, and the calls resolve to the C
+        // definitions. Those are marked __attribute__((weak)) precisely so an IR
+        // definition could override them; with no override present the weak
+        // definition is used. One implementation, one header layout.
+        //
+        // `ionic_float64_to_str` takes an i64 *bit pattern*, not a double: every
+        // float builtin in this runtime passes floats in GP registers (see the
+        // note in src/ionic_model_runtime.c), so the call site bitcasts.
+        //
+        // The runtime object is always linked (src/main.rs), which is what makes
+        // this link. See docs/memory-model.md §8 step 4.
+        self.emit("declare ptr  @ionic_str_concat(ptr, ptr)");
+        self.emit("declare ptr  @ionic_int64_to_str(i64)");
+        self.emit("declare ptr  @ionic_float64_to_str(i64)");
+        self.emit("declare ptr  @ionic_char_to_str(i64)");
+        self.emit("declare ptr  @ionic_file_read(ptr)");
+        // Bulk join (memory-model step 3). Without this arm the call fell
+        // through to the user-function path and emitted `@str_join`, which no
+        // declaration defines — so the Rust bootstrap could not compile the
+        // self-hosted sources at all once they started calling `str_join`.
+        self.emit("declare ptr  @ionic_str_join(ptr, i64, i64, ptr)");
         self.emit("");
 
-        // ail_int64_to_str(n) -> ptr
-        self.emit("@fmt_lld = private constant [5 x i8] c\"%lld\\00\"");
-        self.emit("define ptr @ionic_int64_to_str(i64 %n) {");
-        self.emit("entry:");
-        self.emit("  %buf = call ptr @malloc(i64 32)");
-        self.emit("  call i32 (ptr, ptr, ...) @sprintf(ptr %buf, ptr @fmt_lld, i64 %n)");
-        self.emit("  ret ptr %buf");
-        self.emit("}");
-        self.emit("");
-
-        // ail_float64_to_str(f) -> ptr
-        self.emit("@fmt_lf = private constant [4 x i8] c\"%lf\\00\"");
-        self.emit("define ptr @ionic_float64_to_str(double %f) {");
-        self.emit("entry:");
-        self.emit("  %buf = call ptr @malloc(i64 64)");
-        self.emit("  call i32 (ptr, ptr, ...) @sprintf(ptr %buf, ptr @fmt_lf, double %f)");
-        self.emit("  ret ptr %buf");
-        self.emit("}");
-        self.emit("");
-
-        // ail_char_to_str(c) -> ptr
-        self.emit("define ptr @ionic_char_to_str(i64 %c) {");
-        self.emit("entry:");
-        self.emit("  %buf = call ptr @malloc(i64 2)");
-        self.emit("  %c8 = trunc i64 %c to i8");
-        self.emit("  store i8 %c8, ptr %buf, align 1");
-        self.emit("  %nul_ptr = getelementptr i8, ptr %buf, i64 1");
-        self.emit("  store i8 0, ptr %nul_ptr, align 1");
-        self.emit("  ret ptr %buf");
-        self.emit("}");
-        self.emit("");
-
-        // File I/O wrappers
+        // File-mode constants. `file_write`, `file_open_read` and
+        // `file_open_write` still open streams in IR (they are not string
+        // producers, so the refcount question does not reach them), and they
+        // reference these globals.
         self.emit("@mode_r = private constant [2 x i8] c\"r\\00\"");
         self.emit("@mode_w = private constant [2 x i8] c\"w\\00\"");
-
-        // file_read(path) -> string (reads entire file via fseek/ftell/fread).
-        // Must guard against fopen returning NULL: a missing file previously
-        // segfaulted in flockfile() via fseek(NULL).
-        //
-        // Every return path allocates an owned string. Returning a rodata ""
-        // here would make "returned a TY_STR => the caller owns it" false on
-        // exactly the path a program is most likely to hit, so a release of the
-        // result would free a string literal. This definition must stay in
-        // step with `ionic_file_read` in src/ionic_model_runtime.c, or the
-        // self-hosted and Rust builds diverge. See docs/memory-model.md §11.1.
-        self.emit("define ptr @ionic_file_read(ptr %path) {");
-        self.emit("entry:");
-        self.emit("  %fp = call ptr @fopen(ptr %path, ptr @mode_r)");
-        self.emit("  %missing = icmp eq ptr %fp, null");
-        self.emit("  br i1 %missing, label %no_file, label %read_file");
-        self.emit("no_file:");
-        self.emit("  %empty = call ptr @malloc(i64 1)");
-        self.emit("  store i8 0, ptr %empty, align 1");
-        self.emit("  ret ptr %empty");
-        self.emit("read_file:");
-        self.emit("  call i32 @fseek(ptr %fp, i64 0, i32 2)");   // SEEK_END=2
-        self.emit("  %fsz = call i64 @ftell(ptr %fp)");
-        self.emit("  call i32 @fseek(ptr %fp, i64 0, i32 0)");   // SEEK_SET=0
-        // ftell returns -1 on a non-seekable stream (a pipe, a tty). Without
-        // this clamp the size propagates as size_t(-1): malloc(0), then an
-        // out-of-bounds store one byte *before* the buffer. Same clamp as the
-        // C runtime.
-        self.emit("  %negative = icmp slt i64 %fsz, 0");
-        self.emit("  %size = select i1 %negative, i64 0, i64 %fsz");
-        self.emit("  %bufsz = add i64 %size, 1");
-        self.emit("  %buf = call ptr @malloc(i64 %bufsz)");
-        self.emit("  call i64 @fread(ptr %buf, i64 1, i64 %size, ptr %fp)");
-        self.emit("  %end = getelementptr i8, ptr %buf, i64 %size");
-        self.emit("  store i8 0, ptr %end, align 1");
-        self.emit("  call i32 @fclose(ptr %fp)");
-        self.emit("  ret ptr %buf");
-        self.emit("}");
         self.emit("");
     }
 
@@ -1191,9 +1151,15 @@ impl Codegen {
                 (r, Type::Str)
             }
             "float64_to_str" => {
+                // The runtime takes the IEEE-754 *bit pattern* in an i64, not a
+                // double: every float builtin crosses this boundary in a GP
+                // register (same convention as the mlx_* arm below and as
+                // i642d()/d2i64() in src/ionic_model_runtime.c).
                 let (v, _) = &args[0];
+                let bits = self.fresh_reg();
+                self.emit(&format!("  {} = bitcast double {} to i64", bits, v));
                 let r = self.fresh_reg();
-                self.emit(&format!("  {} = call ptr @ionic_float64_to_str(double {})", r, v));
+                self.emit(&format!("  {} = call ptr @ionic_float64_to_str(i64 {})", r, bits));
                 (r, Type::Str)
             }
             "char_to_str" => {
@@ -1435,6 +1401,20 @@ impl Codegen {
                 let (to, _)    = &args[2];
                 let r = self.fresh_reg();
                 self.emit(&format!("  {} = call ptr @ionic_str_replace(ptr {}, ptr {}, ptr {})", r, s, from, to));
+                (r, Type::Str)
+            }
+            // str_join(parts, first, count, sep) -> string. Four arguments, and
+            // the array crosses as a ptr (it is an opaque IonicArray*), so no
+            // coercion is needed the way array *elements* need one.
+            "str_join" => {
+                let (arr, _) = &args[0];
+                let (first, _) = &args[1];
+                let (count, _) = &args[2];
+                let (sep, _) = &args[3];
+                let r = self.fresh_reg();
+                self.emit(&format!(
+                    "  {} = call ptr @ionic_str_join(ptr {}, i64 {}, i64 {}, ptr {})",
+                    r, arr, first, count, sep));
                 (r, Type::Str)
             }
             "str_contains" => {

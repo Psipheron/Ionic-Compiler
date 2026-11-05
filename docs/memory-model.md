@@ -329,19 +329,32 @@ Landed incrementally, lowest risk first, each step verified with
    classes at these sizes, so it is free until something actually frees — which
    is the point of stage 2.
 
+   **The Rust/IR divergence is CLOSED — one implementation, one layout.**
+   `src/codegen.rs` used to `define` five producers (`ionic_str_concat`,
+   `int64_to_str`, `float64_to_str`, `char_to_str`, `file_read`) *inline* in LLVM
+   IR, each with a raw `malloc`. Because the C definitions are
+   `__attribute__((weak))`, the IR versions won at link time, so a string built
+   by the Rust bootstrap had no refcount header. That was harmless only while
+   nothing read one.
+
+   They are now *declared* there, not defined, and the calls resolve to the C
+   runtime. The runtime object is always linked (`src/main.rs`), so this needs no
+   new link step; `nm` confirms the symbols are undefined in the emitted `.o` and
+   the header is therefore whatever the runtime says rather than a second copy of
+   the arithmetic. Re-deriving the layout in IR was rejected precisely because two
+   copies is how they drifted — and they *had* drifted: the IR `%lf` returned
+   `2.500000` where the C `%g` returned `2.5`, so the same program printed
+   differently depending on which compiler built it. `println`'s float format had
+   drifted the same way and is fixed with it.
+
+   Reverting to a definition here would silently reintroduce the
+   no-header-on-Rust-payloads bug, so the *declarations* are the invariant, not an
+   optimisation.
+
    **Stage 2 — emission.** Gate it on `ncg_ty_of() == OTY_STR` and explicitly
    *not* `OTY_OTHER`, so a release is never emitted for an unclassified pointer.
    `get_arg`, `getenv`, `exe_dir` and `mlx_last_error` must be exempted by name
-   (§8 step 2) until step 6 makes the distinction type-level. Two known
-   divergences to reconcile in the same change, because both are CI-exercised:
-
-   - `src/codegen.rs` defines `ionic_str_concat`, `ionic_int64_to_str`,
-     `ionic_float64_to_str`, `ionic_char_to_str` and `ionic_file_read` *inline*
-     in LLVM IR with raw `malloc`, so the Rust bootstrap's payloads have no
-     header. Harmless today (nothing reads one); a use-after-free on a wrong
-     pointer the moment a release is emitted there.
-   - `src/codegen.rs:456` must either delegate to the C runtime or grow the same
-     header, and the choice has to be made once for both.
+   (§8 step 2) until step 6 makes the distinction type-level.
 
 5. **RC for tensor storage + RAII for `model`/handle types.** The domain core:
    deterministic release of scarce, device-affine memory. *(The `model` RAII half
@@ -534,11 +547,12 @@ Classification key:
 - **caller-buffer** — writes into a buffer the caller owns. Not a return of new
   memory at all. *1 function* (`ionic_fgets_stdin`).
 
-23 distinct functions return a `char *`/`const char *` to a program. That is 26
+23 distinct functions return a `char *`/`const char *` to a program. That is 25
 definitions once you count the two `mlx_*` accessors, which have separate MLX and
-stub builds, and `ionic_file_read`, which exists twice for a different reason: a
-weak C definition and an inline LLVM IR definition emitted by the Rust
-bootstrap (§11.1).
+stub builds. (An earlier revision said 26: `ionic_file_read` used to exist twice,
+as a weak C definition *and* an inline LLVM IR definition emitted by the Rust
+bootstrap. The IR definition is gone — the IR now only declares it — so there is
+one implementation again. See §8 step 4.)
 
 ### 11.1 `alias` — returns an input, not a copy — RESOLVED
 
@@ -598,13 +612,17 @@ failure path returns a counted block like every other producer. Because *every*
 path in every producer now allocates, a `release` on any of them is well
 defined — which is the property `scripts/rc_check.sh` asserts directly.)
 
-Note `ionic_file_read` is `__attribute__((weak))` because the LLVM IR path
-defines it inline in `src/codegen.rs`. The C fix alone was **not** enough: the
+Note `ionic_file_read` is `__attribute__((weak))` because the LLVM IR path used
+to define it inline in `src/codegen.rs`. The C fix alone was **not** enough: the
 IR definition also returned `@empty_str`, a rodata constant, and the
 `--verify-self-hosting` check would not have caught the divergence because both
 builds emit the same object *file* while differing only in a runtime routine's
-behaviour. Both definitions are now in step, and the comment in `codegen.rs`
-says so.
+behaviour.
+
+That divergence class is now gone rather than kept in step by hand: the IR only
+*declares* the producer, so both builds call one C implementation (§8 step 4).
+The `weak` attribute stays as the mechanism that makes the IR's absence legal —
+it costs nothing and documents the original reason.
 
 **One path still cannot honour the contract: OOM.** If `malloc` fails inside a
 failure path, `rt_empty_str` returns NULL. That is a hard error everywhere else
@@ -725,9 +743,8 @@ needed `local_elem`.
 
 ### 11.5 The audit's verdict
 
-Of the 26 definitions (23 distinct functions; two `mlx_*` accessors have separate
-MLX and stub builds, and `ionic_file_read` has both a weak C and an inline IR
-definition):
+Of the 25 definitions (23 distinct functions; two `mlx_*` accessors have separate
+MLX and stub builds):
 
 | class | count | verdict |
 |---|---|---|
