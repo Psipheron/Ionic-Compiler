@@ -7,21 +7,26 @@ eliminating leaks without a tracing collector.
 
 ## 1. Current state (as shipped)
 
-Ionic today has **no garbage collector, no reference counting, and no lifetime
-system**. It is C-style, allocation-heavy, and reclamation-free by design:
+Ionic today has **no garbage collector and no linear lifetime system**, and
+reference counting that is **partial**: strings are counted and reclaimed at
+function scope, arrays and structs are not counted at all, and the only explicit
+free is `model_free`. What follows describes the shipped baseline; §8 and §9 track
+which parts of the target model have landed.
 
 - **Strings** are `malloc`'d C strings (`char *`), treated as immutable `const`
-  values. Every `str_concat`, `int64_to_str`, `str_slice`, `format`,
-  `char_to_str`, `file_read`, and `read_line` allocates a fresh buffer and never
-  frees it (`src/ionic_model_runtime.c`).
+  values, and every producer routes through `ionic_rc_alloc` so the block carries
+  an 8-byte count (§4.1). Codegen raises and discharges a claim per string slot
+  (§4.2), so a string whose owner goes out of scope is freed.
 - **Structs** are heap-allocated with `malloc` at construction
-  (`src/codegen/native.ionic`, `ND_STRUCT_LIT`).
+  (`src/codegen/native.ionic`, `ND_STRUCT_LIT`) and are **not** counted.
 - **Arrays** use a 24-byte header `[len:i64][cap:i64][data_ptr]` plus a separate
-  `malloc`/`realloc`'d data region (`IonicArray`, `src/ionic_model_runtime.c`).
+  `malloc`/`realloc`'d data region (`IonicArray`, `src/ionic_model_runtime.c`) and
+  are **not** counted. `ionic_arr_reset` only sets `len = 0` (§11.4).
 - **The only explicit free** is `model_free(m)`, which releases ML model
   resources (ONNX Runtime handles) via `ionic_model_free`.
 
-The runtime states the policy directly:
+The policy is stated in the runtime, and it is now true only of the uncounted
+kinds:
 
 ```c
 return buf; /* caller owns — but Ionic treats strings as const; leak is acceptable for now */
@@ -29,8 +34,12 @@ return buf; /* caller owns — but Ionic treats strings as const; leak is accept
 
 `src/ionic_model_runtime.c`
 
-Consequence: any long-running Ionic program that churns strings, arrays, or
-structs grows without bound. The compiler itself leaks for this reason.
+Consequence, measured rather than assumed: a program that churns **strings**
+inside a function is flat in iteration count (`scripts/rss_check.sh` reports 0
+bytes growth across N=200000..800000), while one that churns **arrays or
+structs** still grows without bound because those are not counted (§11.4). The
+compiler's own peak came from string copying and is fixed (§8 step 3); it still
+allocates every aggregate it builds.
 
 ---
 
@@ -68,8 +77,11 @@ Adopt **deterministic ownership** as the language memory model:
 2. **Unique ownership + RAII** for resources with scarce, device-affine lifetimes
    — `model`, GPU buffers, file/socket handles.
 3. **Arena scopes** for compiler-internal temporaries.
-4. **Cycles are intended to be impossible**, so no tracing GC or cycle collector
-   would be required. *This does not currently hold* — see §6 and §11.6.
+4. **Cycles: no collector.** Tracing GC and cycle collectors are both rejected
+   (see §5). Strings and tensor storage are immutable, so no cycle can form over
+   them and refcounting is complete for both. Mutable aggregates *can* form
+   cycles, and a cyclic aggregate is an **accepted, documented leak** — decided
+   in §6.1, not an open question. Nothing walks the heap and nothing pauses.
 
 The three mechanisms share one property: reclamation is *deterministic* and
 *local*. Nothing walks the heap, nothing pauses, and nothing needs to understand
@@ -158,9 +170,11 @@ no semantic change to the language.
   only for temporaries (see §4.4).
 - **RC plus a cycle collector (trial deletion):** would make the runtime
   unconditionally leak-free, but adds a mark phase and full object enumeration.
-  This was rejected on the grounds that the type system prevents cycles outright —
-  which, per §11.6, it currently does not. If §6 is not restored, this moves back
-  onto the table.
+  It was rejected first on the grounds that the type system prevents cycles
+  outright, and then rejected on its own merits once §11.6 showed it does not:
+  a collector contradicts the determinism-and-locality premise this whole model
+  rests on (§3). The cycle question is settled as an accepted leak (§6.1), not
+  deferred to a collector.
 
 ---
 
@@ -171,6 +185,13 @@ no semantic change to the language.
 > (`let q = p`) and aggregates can contain aggregates (`a.push(b)`), so a
 > reference cycle is constructible from ordinary Ionic. Read this section as the
 > *intended* design and §11.6 for the shipped behaviour.
+>
+> **Decision (step 7, §8): the invariant is formally abandoned for aggregates.**
+> Refcounting reclaims acyclic aggregate graphs only; cyclic ones leak, and that
+> leak is **accepted and documented** rather than prevented at the type level.
+> Strings and tensor storage have no such exemption — both are immutable, so no
+> cycle can form over them and their graphs stay DAGs. See §6.1 for the decision,
+> the evidence, and the exact scope of what is accepted.
 
 A cycle collector is only necessary if a cycle can form. As designed, Ionic's
 data model was meant to forbid it:
@@ -184,30 +205,100 @@ Under those two rules every reference graph is a DAG, and refcounting alone
 reclaims it completely — which is what would make Ionic leak-free *without* a
 general-purpose collector.
 
-The second rule is the one that did not survive contact with the implementation:
-`let q = p` copies a pointer rather than moving it, for both structs and arrays.
-Until that is changed (or aggregate-in-aggregate is rejected at the type level),
-refcounting reclaims acyclic graphs only and cyclic aggregates leak by
-construction. See §11.6 for the measurement and the options.
+The first rule holds. The second does not, and cannot be made to hold without
+removing capabilities the language is built around:
+
+- `let q = p` copies a pointer rather than moving it, for both structs and
+  arrays, so two names alias one mutable aggregate.
+- Structs and arrays can contain aggregates *of their own type*, so the
+  back-edge does not need two objects or two names — one object can point at
+  itself.
+
+### 6.1 The decision (step 7)
+
+**Accepted: cyclic aggregates leak.** No cycle collector is planned, and the
+language makes no promise to reclaim a cyclic aggregate graph. This is a
+deliberate, bounded, programmer-visible leak, in the same category as a `push`
+that drops an ownership claim (§4.2) and the two known gaps noted in §9.
+
+Scope, stated precisely so it can be tested rather than assumed:
+
+- **What is exempt.** Any aggregate (`struct`, `[T]`, or array-of-struct)
+  reachable from a cycle. When such a graph loses its last external reference,
+  its members' counts never reach zero and none of the memory returns.
+- **What is not exempt.** Strings and tensor storage. Both are immutable, so a
+  cycle cannot form over them and refcounting is complete for them. This is why
+  `scripts/rss_check.sh` — a string-churn benchmark — is a valid hard gate
+  (§8 step 4), and why a flat RSS result there is a statement about strings, not
+  about aggregates.
+- **The obligation this creates.** Any benchmark guarding aggregate
+  reclamation must be **cycle-free**, or it will never go flat and its failure
+  will be indistinguishable from "aggregate RC is not implemented yet". §8
+  step 4 stage 2 must therefore land aggregate RC with its own acyclic
+  benchmark, and this document must not point at a cyclic one.
+
+**Rejected: banning aggregate-in-aggregate at the type level (Option B).** It was
+the alternative on the table and it does not work, for a reason worth recording
+because it invalidates the earlier framing in this document and in §11.6:
+
+> The ban would have to cover a struct with a field of *its own* type, not just
+> nested containers. `struct Node { val: int64, next: Node }` is legal today, and
+> `n.next = n` produces a traversable self-cycle with **no array and no second
+> object involved**:
+
+```ionic
+struct Node { val: int64, next: Node }
+let m = Node { val: 2 };
+let n = Node { val: 1, next: m };
+n.next = n;
+n.next.val;          // 1  — n.next is n
+n.next.next.val;     // 1  — and still is, unboundedly
+```
+
+A rule phrased as "aggregates may not contain aggregates" therefore forbids
+recursive structs — trees, lists, any self-referential shape — which is a much
+larger language restriction than "cycles leak". Narrower rules did not survive
+either: permitting recursion but rejecting cycles needs either a static
+must-not-alias proof or an occurs-check on value identity, and neither is
+available in a language where every aggregate assignment aliases. Rejecting only
+`[T]` inside `[U]` would fix nothing, because the cycle routes through a struct
+just as easily.
+
+**Rejected: a cycle collector.** The whole model is premised on reclamation being
+deterministic and local (§3): nothing walks the heap and nothing pauses. A
+collector contradicts the property the memory model exists to provide, and the
+leak it would remove is bounded and rare in this language's domain code (see
+§11.6).
+
+**What is unchanged.** Aliasing of mutable aggregates (`let q = p`; writes
+through `q` visible through `p`) stays exactly as it is. It is a consequence of
+aggregates being single-word heap pointers, it is relied on by the compiler's own
+IR-building code, and it is orthogonal to the cycle question — it only *enables*
+cycles, it does not require them. Changing it to a value-copy or a move is not
+part of this decision and would be a separate language-semantics change.
 
 ---
 
 ## 7. Consequences
 
-**What improves**
+**What improves** (once the remaining stages land — see §8/§9 for what is live)
 
-- Transient strings and arrays are freed the moment they die — the dominant leak
-  in user programs disappears.
+- Transient strings are freed when their owner dies — the dominant leak in user
+  programs. **This is live today** (`rss_check.sh` is flat).
+- Transient *arrays and structs* are freed when their owner dies — **not yet**:
+  they are uncounted (§11.4).
 - Device/model memory is released deterministically, never at the whim of a
-  collector pause.
-- The compiler binary's own leak is gone (§4.4).
+  collector pause. (`model` RAII is live; tensor storage RC is step 5.)
+- The compiler's own peak is bounded (§8 step 3) — by eliminating the quadratic
+  copy, not by an arena. The arena in §4.4 was never built and its ordering
+  question is still open.
 
 **What RC does not solve**
 
-- **Reference cycles among counted objects.** Intended to be prevented by design
-  (§6), but they *are* constructible today (§11.6), and the objects in a cycle
-  leak. Mitigation is either a type-level restriction or an accepted, documented
-  leak.
+- **Reference cycles among counted objects.** Constructible today (§11.6), and the
+  objects in a cycle leak. **Settled as an accepted leak** (§6.1): no type-level
+  restriction, no collector. Strings and tensor storage are unaffected — they are
+  immutable, so a cycle cannot form over them.
 - **C-runtime buffers not routed through `rc_alloc`.** Anything `malloc`'d inside
   `src/ionic_model_runtime.c` (for example the `piper_forward` samples array, the
   `http_get` body) is invisible to the scheme until it is re-routed. These are
@@ -351,10 +442,18 @@ Landed incrementally, lowest risk first, each step verified with
    no-header-on-Rust-payloads bug, so the *declarations* are the invariant, not an
    optimisation.
 
-   **Stage 2 — emission.** Gate it on `ncg_ty_of() == OTY_STR` and explicitly
-   *not* `OTY_OTHER`, so a release is never emitted for an unclassified pointer.
-   `get_arg`, `getenv`, `exe_dir` and `mlx_last_error` must be exempted by name
-   (§8 step 2) until step 6 makes the distinction type-level.
+   **Stage 2 — emission — PARTLY DONE (strings).** The gate is
+   `ncg_ty_of() == OTY_STR` and explicitly *not* `OTY_OTHER`, so a release is never
+   emitted for an unclassified pointer. `get_arg`, `getenv`, `exe_dir` and
+   `mlx_last_error` are exempted by name (§8 step 2) until step 6 makes the
+   distinction type-level.
+
+   Landed: per-slot claims on `let`/`=`/`return`/exit (§4.2, first two insertion
+   points) and reclamation of argument temporaries (§4.2 third insertion point).
+   Measured: `scripts/rss_check.sh` reports 0 bytes growth in N. Not yet landed:
+   array element stores and `push` (arrays are uncounted, §11.4), and the two
+   documented gaps in §9 — a loop-re-executed `let`, and a producer temp passed to
+   a *user* function.
 
 5. **RC for tensor storage + RAII for `model`/handle types.** The domain core:
    deterministic release of scarce, device-affine memory. *(The `model` RAII half
@@ -362,10 +461,15 @@ Landed incrementally, lowest risk first, each step verified with
 6. **Type-level `owned` vs. `borrowed` distinction.** Makes the ownership
    discipline explicit in the type system rather than a runtime convention, and
    is the correct handling of foreign pointers from C/library interop.
-7. **Decide the cycle question (§11.6).** Either amend §6 to accept bounded leaks
-   for cyclic aggregates, or prevent aggregate-in-aggregate at the type level.
-   Step 4 can land before this, but `rss_check.sh` cannot be a hard gate until it
-   is decided.
+7. **Decide the cycle question (§11.6). — DECIDED.** Amend §6 to accept bounded
+   leaks for cyclic aggregates. The alternative (prevent aggregate-in-aggregate at
+   the type level) was rejected because the cycle does not require a nested
+   container: a struct with a field of its own type is legal, and `n.next = n` is
+   a traversable self-cycle, so the ban would forbid recursive structs outright.
+   No cycle collector. See §6.1 for the decision and §11.6 for the evidence.
+
+   This unblocks step 4's gate: `rss_check.sh` is a valid hard gate because its
+   benchmark is string churn, and strings have no cycle exemption.
 
 ---
 
@@ -411,8 +515,30 @@ This document records the decision and plan.
   it widens the static free count without fixing the leak above.) The supported
   shapes are one owner, one transfer point, and several owners with no transfer.
   See the `ND_RETURN` note in `src/codegen/native.ionic`.
-- **Slice 2 (RC for strings/arrays) — prototyped and REVERTED.** See §10 for the
-  implementation log and the prerequisite it exposed.
+- **Slice 2 (RC for strings/arrays) — prototyped, REVERTED, then RELANDED in stages.**
+  See §10 for the implementation log and the prerequisite it exposed. Stage 1
+  (primitives, no emission) is in §8 step 4. **Stage 2 (emission) has partly
+  landed**, for strings only:
+  - `let` and `=` raise, retain and release a claim per slot; `return` transfers;
+    the single exit block discharges whatever is left. See §4.2.
+  - **Argument temporaries are reclaimed.** A producer result passed straight into
+    a copying builtin (`s = str_concat(int64_to_str(i), "-x")`) has no slot to be
+    discharged from, so nothing used to release it. Nine frame slots per function
+    stash one pointer per ABI argument and park the call's result across the
+    releases; the stash sits between argument evaluation and the `bl`. Only
+    `ncg_str_copies_args` callees are eligible, because a user function may retain
+    the pointer past the return. This is §4.2's third insertion point, and it is
+    what took `scripts/rss_check.sh` from ~48 B/iter to **0 bytes growth** across
+    N=200000..800000.
+  - **Two gaps remain, both documented at the point of emission** in
+    `src/codegen/native.ionic`: a `let` re-executed by a loop leaks one block per
+    iteration (releasing on re-entry is unsound under the single-exit design,
+    because the slot may hold a `getenv` borrow left by another path), and a user
+    function receiving a producer temp still leaks by design.
+  - Arrays are still not counted at all (§11.4), so this is a string-only stage.
+- **Cycle question (§8 step 7) — DECIDED: accepted leak.** See §6.1. Cycles over
+  mutable aggregates are constructible and now formally exempt; strings and tensor
+  storage are unaffected. No collector, no type-level ban.
 - **Prerequisite for Slice 2 — the type oracle, step 1 SHIPPED.** `ncg_ty_of` /
   `ncg_elem_ty` answer "int64 / string / float64 / none of those" for an
   expression and for an array element, and print dispatch now consults them. That
@@ -773,29 +899,74 @@ viable. The retain/release pass still needs the owned-vs-borrowed type
 distinction (§8 step 6) to be *sound by construction* rather than by a
 hand-maintained exemption list, but nothing in §11 blocks landing it.
 
-### 11.6 Cycles are constructible, contrary to §6
+### 11.6 Cycles are constructible, contrary to §6 — RESOLVED as an accepted leak
 
-§6 asserts cycles cannot form because "shared data is immutable and mutable
-ownership is unique/affine". Neither half holds in the shipped language. Measured:
+§6 asserted cycles cannot form because "shared data is immutable and mutable
+ownership is unique/affine". One half of that holds and one does not:
+
+- **Immutable-shared-data half: HOLDS.** Strings and tensor storage are never
+  mutated in place, so no cycle can form over them. Refcounting is complete for
+  both.
+- **Affine-ownership half: DOES NOT HOLD.** Two names can alias one mutable
+  aggregate, and an aggregate can contain a reference to an aggregate.
+
+Measured (`/tmp/alias1.ionic`, `/tmp/rs11.ionic`, `/tmp/rs13.ionic`):
 
 ```
-let a = [1,2,3]; let b = [4,5,6];
-a.push(b); b.push(a);        // a.len == 4: an array element holding an array
-
 let p = P { x: 1, y: 2 }; let q = p; q.x = 99;   // p.x == 99
+p.y = 7;                                          // q.y == 7   (both directions)
+
+struct Bag { n: int64, items: [Bag] }
+let b = Bag { n: 7, items: empty };
+b.items.push(b);
+b.items[0].n;              // 7   — the same Bag
+b.items[0].items[0].n;     // 7   — and again, unboundedly
 ```
 
 `let q = p` copies the *pointer* (structs and arrays are heap objects behind a
-single-word value), so two names alias one mutable aggregate. That gives both
-aliasing of mutable data and a back-edge, i.e. a reference cycle.
+single-word value), so two names alias one mutable aggregate. The second example
+is the more important one: **a single object points at itself**, so the back-edge
+needs neither two objects nor two names.
 
-Consequence: refcounting alone leaves mutually-referencing aggregates
-permanently leaked. The `scripts/rss_check.sh` benchmark must therefore remain
-cycle-free or it will never go flat, and §6 needs either an amendment ("bounded,
-programmer-visible leaks are accepted for cyclic aggregates") or a decision to
-prevent aggregate-in-aggregate at the type level. This is a design call, not an
-implementation task, and it should be made before the retain/release pass is
-written rather than discovered by it.
+**The earlier framing of the fix was wrong, and this is the correction.** This
+section used to propose "prevent aggregate-in-aggregate at the type level" as a
+way out. That does not work, because the cycle does not require a nested
+container at all:
+
+```
+struct Node { val: int64, next: Node }
+let m = Node { val: 2 };
+let n = Node { val: 1, next: m };
+n.next = n;
+n.next.val;        // 1
+n.next.next.val;   // 1   — traversable, well-typed, no array involved
+```
+
+A struct with a field of its own type is legal today. So a rule banning
+"aggregate in aggregate" would forbid recursive structs — trees and lists
+included — which is a far larger language restriction than accepting the leak
+would be a cost.
+
+**Decision: accepted, bounded leak (§6.1).** Refcounting reclaims acyclic
+aggregate graphs only; cyclic ones are documented as leaking, and no cycle
+collector is planned. The rationale, the scope, and the rejected alternatives are
+in §6.1 rather than duplicated here.
+
+**Consequence for benchmarks — the one operational obligation.** Because
+cyclic aggregates never return memory, a benchmark that builds one can never go
+flat, and its failure would be indistinguishable from "aggregate RC is not
+implemented yet". Measured today, with arrays not yet counted, an acyclic and a
+self-cyclic benchmark of the same shape are indistinguishable in RSS (~192 B/iter
+both) precisely because *nothing* aggregate-shaped is reclaimed yet. Step 4
+stage 2 must therefore (a) land aggregate RC with a **cycle-free** acyclic
+benchmark, and (b) add a second, small, **deliberately cyclic** benchmark that
+asserts *the leak is present and bounded* — a growth in proportion to the number
+of cycles created, not to iteration count. Without (b) the accepted leak is
+silent, and a future regression that turned a bounded leak into an unbounded one
+would look exactly like the documented behaviour.
+
+`scripts/rss_check.sh` remains a valid hard gate for strings throughout: its
+benchmark is string churn, and strings have no cycle exemption.
 
 ## See also
 
