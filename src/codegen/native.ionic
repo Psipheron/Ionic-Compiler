@@ -1305,6 +1305,23 @@ fn ncg_ty_of(int64 n) -> int64 {
         return ncg_elem_ty(n);
     }
 
+    // A struct field takes the field's declared type. Without this, `b.val` was
+    // OTY_OTHER and `println(b.val)` printed the field's pointer. Only a
+    // string/float/int field can be typed; a struct- or array-valued field
+    // stays OTY_OTHER, which is what the vocabulary has no code for.
+    if (k == ND_FIELD_ACCESS) {
+        // `.len` is special-cased by the emitter: `ncg_expr` always compiles it
+        // to `ionic_array_len` regardless of the receiver's type, so the oracle
+        // has to agree or print dispatch would pick a string variant for a value
+        // the emitter produced as an int64.
+        if (str_eq(nd_sv[n], "len")) { return OTY_INT; }
+        let outer = ncg_stype_of(nd_i2[n]);
+        if (str_eq(outer, "")) { return OTY_OTHER; }
+        let st = st_find(outer);
+        if (st == 0) { return OTY_OTHER; }
+        return oty_from_ty(st_field_ty(st, nd_sv[n]));
+    }
+
     // Arithmetic promotes to float, otherwise int.
     if (k == ND_BINOP) {
         let op = nd_iv[n];
@@ -1332,6 +1349,38 @@ fn ncg_ty_of(int64 n) -> int64 {
     return OTY_OTHER;
 }
 
+// Struct type name of the value an expression produces, or "" when it is not a
+// struct or cannot be resolved. The pure equivalent of `ncg_last_stype`, which
+// is a side effect of emission and unusable at a point that has not emitted yet.
+//
+// Needed for field access: `ncg_ty_of` could not say what `b.val` was, so
+// `println(b.val)` fell through to the int64 printer and printed the field's
+// pointer — the same class of bug the array-element case had.
+fn ncg_stype_of(int64 n) -> string {
+    if (n == 0) { return ""; }
+    let k = nd_kind[n];
+    if (k == ND_IDENT) {
+        let name = nd_sv[n];
+        if (local_find(name) >= 0) { return local_get_stype(name); }
+        // The symbol table's sv column carries the struct name for a struct
+        // binding and the element type for an array, so the ty code decides
+        // which of the two this is.
+        if (sv_lookup_ty(name) != TY_STRUCT) { return ""; }
+        return sv_lookup_sv_val(name);
+    }
+    if (k == ND_CALL)  { return ncg_fn_stype(nd_sv[n]); }
+    if (k == ND_STRUCT_LIT) { return nd_sv[n]; }
+    if (k == ND_FIELD_ACCESS) {
+        let outer = ncg_stype_of(nd_i2[n]);
+        if (str_eq(outer, "")) { return ""; }
+        let st = st_find(outer);
+        if (st == 0) { return ""; }
+        if (st_field_ty(st, nd_sv[n]) != TY_STRUCT) { return ""; }
+        return st_field_sv(st, nd_sv[n]);
+    }
+    return "";
+}
+
 // Element type of the array produced by node `n`, as an oracle type code.
 fn ncg_array_elem_oracle(int64 n) -> int64 {
     if (n == 0) { return OTY_OTHER; }
@@ -1347,6 +1396,18 @@ fn ncg_array_elem_oracle(int64 n) -> int64 {
     }
     if (k == ND_ARRAY_LIT) {
         return oty_from_ty(array_lit_elem_ty(n));
+    }
+    // A call returning an array: the checker records the element type in
+    // fn_ret_svs, but nothing consulted it, so `build() -> [string]` lost its
+    // element type the moment it crossed a function boundary. The array itself
+    // survived (`.len` worked); only the element load was mistyped, which is
+    // why `println(p[0])` printed the element's pointer as an integer while
+    // `str_len(p[0])` read the string correctly. The checker had the answer all
+    // along — this asks it.
+    if (k == ND_CALL) {
+        let sv = fn_ret_sv(nd_sv[n]);
+        if (str_len(sv) == 0) { return OTY_OTHER; }
+        return oty_from_ty(elem_from_sv(sv));
     }
     // A nested array (`[[int]]`) has an array-valued element, and the oracle's
     // vocabulary has no code for that; `a[i][j]` therefore stays OTY_OTHER
@@ -2089,6 +2150,10 @@ fn ncg_expr(int64 node) -> int64 {
         while (flist != 0) {
             let fnode   = nd_i2[flist];
             let fval_nd = nd_i2[fnode];
+            // The field keeps the pointer from now on, so a named local that fed
+            // it must not be released at scope exit — see the escape note on
+            // ncg_str_releasable. Same hole as an array literal had.
+            ncg_note_str_escape(fval_nd);
             let val_r   = ncg_expr(fval_nd);
             // ptr_r may have been spilled/restored within ncg_expr; re-load from scratch
             // (scratch stack: ptr_r is below val_r, so ptr_r = REG_X9 + scratch_depth - 2)
@@ -2129,6 +2194,19 @@ fn ncg_expr(int64 node) -> int64 {
         mut elem = nd_i2[node];
         while (elem != 0) {
             let elem_nd = nd_i2[elem];
+            // The element is now owned by the array, so a named local feeding
+            // it can no longer be released at scope exit — the array would be
+            // left holding the pointer. This is the same rule `push` gets from
+            // ncg_note_arg_escapes, but a literal pushes with a raw BL and never
+            // goes through ncg_call, so it was never applied here:
+            //
+            //     fn build() -> [string] { let s = str_concat("he","llo");
+            //                              let a: [string] = [s]; return a; }
+            //
+            // returned an array whose element had already been freed, and
+            // `println(p[0])` printed an empty line. Leaking is the documented
+            // safe direction (see the escape comment on ncg_str_releasable).
+            ncg_note_str_escape(elem_nd);
             let val_r = ncg_expr(elem_nd);
             // Spill all live regs (including arr_r and val_r) before push call
             let nlive = scratch_depth;
@@ -2534,6 +2612,16 @@ fn ncg_stmt(int64 node) -> int64 {
         if (nd_kind[init] == ND_ARRAY_LIT && local_get_elem(name) == 0) {
             local_set_elem(slot, array_lit_elem_ty(init));
         }
+        // A binding whose initialiser is a CALL returning an array needs the same
+        // treatment, and this is the case that was missing: `let p = build()`
+        // where `build() -> [string]` left `local_elem` at 0, so `p[0]` typed as
+        // an int64 and `println(p[0])` printed the element's pointer. Recording
+        // it here — not in the oracle — because `p[0]`'s receiver is the local,
+        // so the oracle never sees the call node at all.
+        if (nd_kind[init] == ND_CALL && local_get_elem(name) == 0) {
+            let rsv = fn_ret_sv(nd_sv[init]);
+            if (str_len(rsv) != 0) { local_set_elem(slot, elem_from_sv(rsv)); }
+        }
         // RAII: a local bound to a freshly loaded model owns that resource.
         if (ncg_model_expr(init) == 1) { local_set_model(name, 1); }
         // A tensor local owns one reference to its handle, so a `let` whose
@@ -2616,6 +2704,14 @@ fn ncg_stmt(int64 node) -> int64 {
     if (kind == ND_ASSIGN) {
         let target = nd_i2[node];
         let val    = nd_i3[node];
+        // An assignment into a container drops the source's claim, and it has to
+        // happen *before* the value is evaluated: after that the claim is still
+        // set and the exit block would release a pointer the container now holds.
+        // Index and field targets are containers; a plain name is not.
+        let tkind0 = nd_kind[target];
+        if (tkind0 == ND_INDEX || tkind0 == ND_FIELD_ACCESS) {
+            ncg_note_str_escape(val);
+        }
         let vr     = ncg_expr(val);
 
         let tkind = nd_kind[target];

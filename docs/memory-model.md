@@ -542,8 +542,11 @@ This document records the decision and plan.
 - **Prerequisite for Slice 2 — the type oracle, step 1 SHIPPED.** `ncg_ty_of` /
   `ncg_elem_ty` answer "int64 / string / float64 / none of those" for an
   expression and for an array element, and print dispatch now consults them. That
-  closed the observable `println` defects (array element, string parameter). It is
-  deliberately conservative, and the remaining widening is described in §10.
+  closed the observable `println` defects: array elements (including an array
+  *returned* from a function, whose element type the checker was losing at the
+  boundary), string parameters, struct fields, and `.len`. It stays deliberately
+  conservative — a nested-array element and a method call are still `OTY_OTHER` —
+  and the remaining widening is described in §10.
 - **Allocation audit (§11) — COMPLETE, both bug classes fixed.** Every pointer
   the runtime hands to a program is classified as fresh, interior,
   foreign/static, or caller-buffer. §11.1 (the alias returns) and §11.2 (the
@@ -620,10 +623,34 @@ static types into codegen. The additive half of it has shipped:
 - Element types are recorded per local slot (`local_elem`), and parameters record
   their declared type, so the information survives the way it needs to.
 
+**Struct fields and `.len` — the last two `OTY_OTHER` answers that were knowable.**
+Both made `println(b.val)` print the field's pointer as an integer, and left
+`println(a.len)` one bad dispatch away from the same. Two answers were already in
+the checker and neither was being asked for:
+
+- `ncg_stype_of(node)` — the pure equivalent of `ncg_last_stype`, which is a side
+  effect of emission and therefore unusable at a point that has not emitted yet.
+  `ncg_ty_of` now resolves an `ND_FIELD_ACCESS` receiver through it and reads the
+  field's declared type from `st_field_ty`.
+- `.len` is special-cased to `OTY_INT`, because the emitter always compiles it to
+  `ionic_array_len` whatever the receiver's type is. The oracle has to agree with
+  the emitter, or dispatch picks a variant for a value that was never produced.
+
+A struct- or array-valued field still answers `OTY_OTHER`: the oracle's vocabulary
+is three scalar classes and has no code for an aggregate.
+
+**A returned array's element type — the root cause of a whole bug class.** The
+checker's `register_fn_node` stored the return type's `sv` via `node_ty_sv`, which
+only encodes a *named* type. So `-> [string]` recorded `""`, and every call
+returning an array lost its element type at the boundary: the array itself
+survived (`.len` worked) but `p[0]` typed as unknown. `sc_sv` for an array *is* its
+element type, so the fix is `node_ty_val_sv` — the function parameters already
+used it. Element types are then recorded at the `let` binding (`local_elem`),
+because `p[0]`'s receiver is the local, not the call.
+
 **What is still required before Slice 2 may be retried.** The oracle is
 deliberately conservative. It answers "none of those" (`OTY_OTHER`) for a
-nested-array element, a method call, and a struct-field load. A retain/release
-pass must therefore:
+nested-array element and a method call. A retain/release pass must therefore:
 
 - emit operations **only** where `ncg_ty_of` proves the value is managed, and
 - treat `OTY_OTHER` as *unknown*, not as "not managed" — the two differ, and
@@ -631,8 +658,7 @@ pass must therefore:
   stack address.
 
 That is a narrower, sound starting point. Widening it means teaching the oracle
-about struct fields (needs field types in the struct registry) and about method
-return types (needs `fn_ret_ty` to describe methods).
+about method return types (needs `fn_ret_ty` to describe methods).
 
 A second, cheaper prerequisite is to give the `@gpu`/tensor resource path
 (Slice 3, RAII) priority: it needs no value-type oracle, because handles are

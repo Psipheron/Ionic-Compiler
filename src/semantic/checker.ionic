@@ -1208,7 +1208,15 @@ fn register_fn_node(int64 node) -> int64 {
     let ret_ty_nd   = nd_i3[node];
     mut ret_ty = TY_VOID;
     mut ret_sv = "";
-    if (ret_ty_nd != 0) { ret_ty = node_ty_to_int(ret_ty_nd); ret_sv = node_ty_sv(ret_ty_nd); }
+    // `node_ty_val_sv` rather than `node_ty_sv`: the latter only encodes a
+    // *named* type, so `-> [string]` stored "" and every call returning an
+    // array lost its element type. `sc_expr` publishes `fn_ret_svs[fi]` as the
+    // result's sv (see the ND_CALL case), and `sc_sv` for an array *is* its
+    // element type — so an empty entry meant `build()[0]` typed as unknown and
+    // `println(p[0])` printed the element's pointer. Parameters already use this
+    // function (`node_ty_val_sv`), which is why an array parameter kept its
+    // element type and a returned array did not.
+    if (ret_ty_nd != 0) { ret_ty = node_ty_to_int(ret_ty_nd); ret_sv = node_ty_val_sv(ret_ty_nd); }
     let hw_node = nd_i5[node];
     fn_count = fn_count + 1;
     if (fn_count < len(fn_names)) {
