@@ -21,7 +21,7 @@ jobs:
   # ── macOS arm64: self-hosted compiler → Mach-O emitter ────────────────────
   macho:
     name: Mach-O (macOS arm64)
-    runs-on: macos-14
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -129,7 +129,7 @@ jobs:
   # which the `elf` job above only ever tests self-compilation on Linux.
   cross_compile:
     name: Cross-compile to Linux (from macOS)
-    runs-on: macos-14
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
