@@ -1,0 +1,21 @@
+// An array escaping into a container, minted inside a loop.
+//
+// `outer.push(row)` stores the pointer in `outer`, so `row`'s slot can no
+// longer release it — but the *next* iteration mints a new `row` over the same
+// slot, and the re-entry release must not free the value `outer` is still
+// pointing at.
+//
+// Expected: 4 / 0 / 2
+
+fn main() {
+    mut outer: [[int64]] = [[0]];
+    mut i = 0;
+    while (i < 3) {
+        let row = [i, i + 1];
+        outer.push(row);
+        i = i + 1;
+    }
+    println(outer.len);
+    println(outer[0][0]);
+    println(outer[2][1]);
+}

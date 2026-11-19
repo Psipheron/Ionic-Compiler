@@ -1,0 +1,23 @@
+// A string that escapes into a container, then is conditionally reassigned.
+//
+// `outer.push(s)` stores the pointer in `outer`, so `s`'s claim is dropped and
+// the container owns the block. A later conditional assignment must not make
+// `s` claim again — on the path where the branch did not run, the slot still
+// holds the block the container is pointing at, and releasing it would free
+// memory the container still holds.
+//
+// The branch must NOT be taken: the bug is on the path where the assignment
+// did not happen.
+//
+// Expected: hello / hello
+
+fn main() {
+    mut outer: [string] = [""];
+    mut s = str_concat("he", "llo");
+    outer.push(s);
+    if (outer.len > 99) {
+        s = str_concat("wor", "ld");
+    }
+    println(s);
+    println(outer[1]);
+}

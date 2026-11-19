@@ -106,8 +106,33 @@ jobs:
       # becomes a free() eight bytes into a malloc block. This gate exists
       # before that code does, on purpose. Hard gate: it is fast, hermetic (C
       # only, no accelerator, no Ionic binary) and either true or not.
+ 
       - name: RC — every producer returns a counted block
         run: ./scripts/rc_check.sh
+
+      # ── Array RC gate (memory-model §11.4, stage 2) ─────────────────────
+      # The string RC gate above checks the *producer* contract: that every
+      # producer hands back a block with a refcount header. It cannot see the
+      # aliasing bugs, which are about how many names point at one header.
+      #
+      # scripts/arr_rc_check.sh compiles a set of probes with the real compiler,
+      # relinks them against the real runtime under ASan + UBSan, and runs them.
+      # The cases are the ones where the count and the number of live names can
+      # disagree: an alias returned from a function, a borrowed slot reassigned
+      # over, a value that escapes into a container (with and without a
+      # conditional reassignment), a global store, and a loop that re-enters
+      # the same slot.
+      #
+      # This is the gate that found the escape bug: a container escape used to
+      # drop the source slot's claim without retaining, so the count sat one
+      # short of the number of live names and the next assignment to that slot
+      # released the container's value. That is a heap-use-after-free that a
+      # plain build reports as "mostly worked".
+      #
+      # Leak detection is off on purpose: the accepted leak for a container
+      # escape is a *decision*, and a leak report would flag it as a bug.
+      - name: Array RC — aliasing and escapes are memory-safe
+        run: ./scripts/arr_rc_check.sh
 
       # ── RSS regression gate (ADVISORY during memory-model rollout) ───────
       # Smallest-possible-RSS is a core language goal. scripts/rss_check.sh

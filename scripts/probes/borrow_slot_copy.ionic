@@ -1,0 +1,25 @@
+// An array borrowed into a local slot, then conditionally reassigned.
+//
+// `let x = p` copies a *borrow*: the callee still owns `p`, and `x` does not.
+// A later assignment must not make `x` claim a reference, because on the path
+// where the assignment did not run, the slot still holds the callee's array —
+// and releasing it would free memory the callee goes on using.
+//
+// The assignment branch must NOT be taken: that is the path where the slot's
+// value is the borrowed array.
+//
+// Expected: 3 / 7
+
+fn borrow([int64] p) -> [int64] {
+    return p;
+}
+
+fn main() {
+    let src = [7, 8, 9];
+    mut x = borrow(src);
+    if (x.len > 99) {
+        x = [1, 2];
+    }
+    println(x.len);
+    println(x[0]);
+}

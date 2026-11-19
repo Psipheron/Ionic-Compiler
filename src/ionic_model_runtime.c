@@ -80,21 +80,9 @@ typedef struct {
     void   *data;
 } IonicArray;
 
-static IonicArray *ionic_array_alloc(int64_t cap) {
-    IonicArray *a = (IonicArray *)malloc(sizeof(IonicArray));
-    a->len  = 0;
-    a->cap  = cap > 0 ? cap : 8;
-    a->data = malloc((size_t)(a->cap * 8));
-    return a;
-}
-
-static void ionic_array_push_i64(IonicArray *a, int64_t v) {
-    if (a->len >= a->cap) {
-        a->cap *= 2;
-        a->data = realloc(a->data, (size_t)(a->cap * 8));
-    }
-    ((int64_t *)a->data)[a->len++] = v;
-}
+/* `ionic_array_alloc` and `ionic_array_push_i64` are defined below the
+ * reference-counting primitives, because the header is a counted block and
+ * `ionic_rc_alloc` has to exist first. */
 
 /* ── Reference counting: primitives (memory-model §8 step 4, stage 1) ──────────
  *
@@ -203,6 +191,65 @@ static void *ionic_rc_realloc(void *p, size_t n) {
     return base + 8;
 }
 
+/* ── Dynamic arrays as counted objects (memory-model §11.4) ───────────────────
+ *
+ * `IonicArray` is a *two-allocation* object: the header `{len, cap, data}` and
+ * the element buffer `data`. A count in front of the header covers only the
+ * header, so releasing with `ionic_rc_release` would free the header and leak
+ * the buffer. `ionic_array_release` is the release an array needs, and it is
+ * the only correct one — mixing the two would free `data` on the wrong
+ * reference or not at all.
+ *
+ * What release deliberately does **not** do is release the *elements*.
+ * Elements are stored as int64 bit patterns with no per-slot type, so the
+ * runtime cannot tell `[int64]` (whose elements are raw integers, and where
+ * "releasing" one would mean freeing an address built from `1`, `2`, `3`) from
+ * `[string]` (whose elements may be counted blocks). Releasing elements would
+ * therefore corrupt every numeric array.
+ *
+ * Even where the element type *is* known at the release site, releasing is not
+ * generally sound: a `[string]` element may be a `getenv`/`get_arg` borrow or a
+ * function parameter, which an escape rule dropped the claim over precisely
+ * because it is not ours to free. Strings stored in a `[string]` array are
+ * therefore **leaked, not reclaimed** — the same accepted, documented direction
+ * `docs/memory-model.md` §4.2 takes for any container escape. `[int64]`,
+ * `[float64]` and `[T]`-of-struct arrays are fully reclaimed.
+ */
+
+static IonicArray *ionic_array_alloc(int64_t cap) {
+    IonicArray *a = (IonicArray *)ionic_rc_alloc(sizeof(IonicArray));
+    if (!a) return NULL;
+    a->len  = 0;
+    a->cap  = cap > 0 ? cap : 8;
+    a->data = malloc((size_t)(a->cap * 8));
+    if (!a->data) { ionic_rc_release(a); return NULL; }
+    return a;
+}
+
+static void ionic_array_push_i64(IonicArray *a, int64_t v) {
+    if (a->len >= a->cap) {
+        a->cap *= 2;
+        a->data = realloc(a->data, (size_t)(a->cap * 8));
+    }
+    ((int64_t *)a->data)[a->len++] = v;
+}
+
+/* Drop one reference to the array. The last reference frees the element buffer
+ * as well as the header, because `data` is owned by the header and by nothing
+ * else. Null-tolerant; a no-op on a pinned array, which nothing creates today
+ * but which keeps the contract uniform with strings. */
+static void ionic_array_release(IonicArray *a) {
+    if (!a) return;
+    int64_t *rc = ((int64_t *)a) - 1;
+    if (*rc == IONIC_RC_PINNED) return;
+    if (*rc <= 0) return;
+    *rc -= 1;
+    if (*rc == 0) {
+        free(a->data);
+        free(rc);
+    }
+}
+
 /* ── Exported surface for emitted code (memory-model §8 step 4, stage 2) ──────
  *
  * The primitives above are `static` because nothing in this file's own code
@@ -224,6 +271,38 @@ void *ionic_rc_retain_pub(void *p) { return ionic_rc_retain(p); }
  * returning anything would invite a caller to use it. Stage 2 emits a `bl` and
  * ignores X0. */
 void ionic_rc_release_pub(void *p) { ionic_rc_release(p); }
+
+/* The array release, for emitted code. Separate from `ionic_rc_release_pub`
+ * because an array owns its element buffer as well as its header: releasing an
+ * `IonicArray *` with the plain one would free the header and leak `data`
+ * (§11.4). Codegen must pick this symbol for an array-typed slot.
+ *
+ * Elements are not released — see the note on `ionic_array_release`. */
+void ionic_array_release_pub(void *p) { ionic_array_release((IonicArray *)p); }
+
+/* The array retain, for emitted code. A copy of an array value — `let b = a` —
+ * is a second name for one header, so it must raise the count. Without it the
+ * copy has no claim of its own while the original still has one, and the two
+ * names can disagree about who owns the header: `let b = a; return b;` would
+ * release `a` at the exit block and hand the caller a pointer into freed
+ * memory. Retaining makes the count match the number of live names, which is
+ * the whole invariant.
+ *
+ * Retain and release are deliberately asymmetric in *which* allocations they
+ * touch: retain raises the count on the header only, and release frees the
+ * element buffer when the count reaches zero. That is correct because `data`
+ * is owned by the header and by nothing else — it is reached through the
+ * header, never stored independently.
+ *
+ * Returns its argument so a retain can be used as a value expression
+ * (`b = retain(a)`) rather than only as a statement. */
+void *ionic_array_retain_pub(void *p) { return ionic_rc_retain(p); }
+
+/* Deliberately absent: an element-release helper for `ionic_array_get`.
+ * Releasing an element would be correct only for a `[string]` array, and the
+ * element slots carry no type — see the note on `ionic_array_release`. A
+ * release helper that could only be correct half the time is worse than no
+ * helper at all. */
 
 /* ── String literals as managed values ───────────────────────────────────────
  *
@@ -403,6 +482,16 @@ int64_t ionic_file_write_binary(IonicArray *arr, const char *path) {
     return arr->len;
 }
 
+/* Reset an array to empty without freeing it. Drops every element slot by
+ * setting `len` to 0; the slot *storage* stays allocated for reuse, which is
+ * the point of the call.
+ *
+ * The dropped elements are **not** released. This is the same decision
+ * `ionic_array_release` makes and for the same reason: element slots carry no
+ * type, so the runtime cannot tell a `[int64]` element (a plain number, where
+ * "releasing" means freeing an address built from it) from a `[string]`
+ * element. A `[string]` reset therefore leaks its element blocks, which is the
+ * documented safe direction rather than a use-after-free. See §11.4. */
 int64_t ionic_arr_reset(IonicArray *arr) {
     arr->len = 0;
     return 0;

@@ -1,0 +1,21 @@
+// An alias that escapes into a container.
+//
+// `let b = a` retains, so `a` and `b` hold two counts over one header. `b`
+// escapes into `outer`, which takes a count of its own — so `a` and `b` and
+// `outer` hold three counts over one header. Releasing `a` and `b` at scope
+// exit must leave the array alive for `outer`.
+//
+// Expected: 4 / 0
+
+fn main() {
+    mut outer: [[int64]] = [[0]];
+    mut i = 0;
+    while (i < 3) {
+        let a = [i, i + 1];
+        let b = a;
+        outer.push(b);
+        i = i + 1;
+    }
+    println(outer.len);
+    println(outer[1][0]);
+}

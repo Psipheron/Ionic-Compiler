@@ -1,0 +1,24 @@
+// A string that escapes into a container, then is conditionally reassigned.
+//
+// The escape drops the slot's claim so the container owns the block. A later
+// assignment must not make the slot claim again — on the path where the
+// assignment did not run, the slot still holds the block the container is
+// pointing at, and releasing it would free memory the container still holds.
+//
+// The escape branch IS taken and the reassignment branch is NOT: that is the
+// path where the slot's value and the container's value are the same block.
+//
+// Expected: hello / hello
+
+fn main() {
+    mut outer: [string] = [""];
+    mut s = str_concat("he", "llo");
+    if (outer.len > 0) {
+        outer.push(s);
+    }
+    if (outer.len > 99) {
+        s = str_concat("wor", "ld");
+    }
+    println(s);
+    println(outer[1]);
+}

@@ -1,0 +1,20 @@
+// A borrowed array slot reassigned over.
+//
+// `borrow(x)` hands the callee a pointer it does not own. The slot `x` must
+// never be released, and a later assignment over it must not release the
+// borrowed value either — the caller still holds it.
+//
+// Expected: 3 / 2 / 1
+
+fn borrow([int64] p) -> int64 {
+    return p.len;
+}
+
+fn main() {
+    mut x = [7, 8, 9];
+    let n = borrow(x);
+    println(n);
+    x = [1, 2];
+    println(x.len);
+    println(x[0]);
+}

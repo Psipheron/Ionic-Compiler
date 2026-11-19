@@ -1,0 +1,17 @@
+// An array minted inside a loop body, never escaping.
+//
+// The re-entry release must free the previous iteration's array, or the loop
+// leaks one array per iteration.
+//
+// Expected: 10
+
+fn main() {
+    mut total = 0;
+    mut i = 0;
+    while (i < 5) {
+        let row = [i, i + 1, i + 2];
+        total = total + row[0];
+        i = i + 1;
+    }
+    println(total);
+}

@@ -1,0 +1,25 @@
+// A value that escapes into a container, then is conditionally reassigned.
+//
+// The escape transfers the value to the container. A later *conditional*
+// assignment must not make the slot release the container's value on the path
+// where the assignment did not run.
+//
+// The read happens in the caller, after the function has returned — so the
+// release at scope exit has already run. That is where a use-after-free shows.
+//
+// Expected: hello
+
+fn build() -> [string] {
+    mut outer: [string] = [""];
+    mut s = str_concat("he", "llo");
+    outer.push(s);
+    if (outer.len > 99) {
+        s = str_concat("wor", "ld");
+    }
+    return outer;
+}
+
+fn main() {
+    let o = build();
+    println(o[1]);
+}

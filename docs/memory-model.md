@@ -8,8 +8,8 @@ eliminating leaks without a tracing collector.
 ## 1. Current state (as shipped)
 
 Ionic today has **no garbage collector and no linear lifetime system**, and
-reference counting that is **partial**: strings are counted and reclaimed at
-function scope, arrays and structs are not counted at all, and the only explicit
+reference counting that is **partial**: strings and array headers are counted and
+reclaimed at function scope, structs are not counted at all, and the only explicit
 free is `model_free`. What follows describes the shipped baseline; §8 and §9 track
 which parts of the target model have landed.
 
@@ -20,8 +20,13 @@ which parts of the target model have landed.
 - **Structs** are heap-allocated with `malloc` at construction
   (`src/codegen/native.ionic`, `ND_STRUCT_LIT`) and are **not** counted.
 - **Arrays** use a 24-byte header `[len:i64][cap:i64][data_ptr]` plus a separate
-  `malloc`/`realloc`'d data region (`IonicArray`, `src/ionic_model_runtime.c`) and
-  are **not** counted. `ionic_arr_reset` only sets `len = 0` (§11.4).
+  `malloc`/`realloc`'d data region (`IonicArray`, `src/ionic_model_runtime.c`).
+  The header is a counted block, so an `IonicArray *` carries a count — but the
+  two-allocation shape means the release must free `data` as well as the header,
+  which is why it has its own symbol: `ionic_array_release_pub`, not
+  `ionic_rc_release_pub` (§11.4). Elements are **not** released; element slots
+  carry no type, so a `[string]` array leaks its element blocks (§11.4).
+  `ionic_arr_reset` sets `len = 0` and releases nothing, for the same reason.
 - **The only explicit free** is `model_free(m)`, which releases ML model
   resources (ONNX Runtime handles) via `ionic_model_free`.
 
@@ -34,12 +39,13 @@ return buf; /* caller owns — but Ionic treats strings as const; leak is accept
 
 `src/ionic_model_runtime.c`
 
-Consequence, measured rather than assumed: a program that churns **strings**
-inside a function is flat in iteration count (`scripts/rss_check.sh` reports 0
-bytes growth across N=200000..800000), while one that churns **arrays or
-structs** still grows without bound because those are not counted (§11.4). The
-compiler's own peak came from string copying and is fixed (§8 step 3); it still
-allocates every aggregate it builds.
+Consequence, measured rather than assumed: a program that churns **strings** or
+**arrays** inside a function is flat in iteration count. `scripts/rss_check.sh`
+reports 0 bytes growth across N=200000..800000 for string churn, and an
+8-element array literal minted 200000 times peaks at 1.7 MB with array RC against
+21 MB without it (§11.4). **Structs** still grow without bound — they are the one
+remaining uncounted kind (§11.4). The compiler's own peak came from string
+copying and is fixed (§8 step 3).
 
 ---
 
@@ -121,10 +127,11 @@ a foreign pointer to be correct.
   accessors belong on this list too: they now copy out of the `HttpRequest`, so
   they are fresh allocations and safe to instrument (§11.2). See §11.3; an
   earlier version of this list wrongly included `get_arg` and `getenv`.
-  **Not `ionic_array_alloc` either**, despite an earlier draft of this list naming
-  it: an array is a *two-allocation* object (`{len, cap, data}`), so a header on
-  the `IonicArray *` would not cover the element buffer. Arrays need their own
-  release path (§11.4) and are not part of step 4's string-only stage.
+  **`ionic_array_alloc` is counted too, but with its own release.** An array is
+  a *two-allocation* object (`{len, cap, data}`), so a header on the
+  `IonicArray *` covers only the header and the release must free `data` as
+  well. That is why `ionic_array_release_pub` exists as a separate symbol rather
+  than reusing `ionic_rc_release_pub` — see §11.4.
 
 ### 4.2 Insertion points (compile time)
 
@@ -233,9 +240,15 @@ Scope, stated precisely so it can be tested rather than assumed:
   about aggregates.
 - **The obligation this creates.** Any benchmark guarding aggregate
   reclamation must be **cycle-free**, or it will never go flat and its failure
-  will be indistinguishable from "aggregate RC is not implemented yet". §8
-  step 4 stage 2 must therefore land aggregate RC with its own acyclic
-  benchmark, and this document must not point at a cyclic one.
+  will be indistinguishable from "that aggregate RC has not landed". For
+  **arrays** this was vacuous in stage 1 — copies did not retain, so
+  `ring.push(ring)` stored a borrow and the count still reached zero — and is
+  **live from stage 2**, where copies do retain and the cycle is constructible
+  (§11.6). A cyclic array benchmark therefore asserts *safety* (the graph stays
+  readable, nothing is freed while it is reachable) rather than reclamation. For
+  **structs** the cycle-free obligation holds in full: they are uncounted, so a
+  struct benchmark can neither go flat nor distinguish a cycle from the missing
+  implementation.
 
 **Rejected: banning aggregate-in-aggregate at the type level (Option B).** It was
 the alternative on the table and it does not work, for a reason worth recording
@@ -285,8 +298,9 @@ part of this decision and would be a separate language-semantics change.
 
 - Transient strings are freed when their owner dies — the dominant leak in user
   programs. **This is live today** (`rss_check.sh` is flat).
-- Transient *arrays and structs* are freed when their owner dies — **not yet**:
-  they are uncounted (§11.4).
+- Transient *arrays* are freed when their owner dies — **live today** for the
+  header and element buffer (§11.4). Elements are not released, by design, and
+  structs are still uncounted.
 - Device/model memory is released deterministically, never at the whim of a
   collector pause. (`model` RAII is live; tensor storage RC is step 5.)
 - The compiler's own peak is bounded (§8 step 3) — by eliminating the quadratic
@@ -295,10 +309,11 @@ part of this decision and would be a separate language-semantics change.
 
 **What RC does not solve**
 
-- **Reference cycles among counted objects.** Constructible today (§11.6), and the
-  objects in a cycle leak. **Settled as an accepted leak** (§6.1): no type-level
-  restriction, no collector. Strings and tensor storage are unaffected — they are
-  immutable, so a cycle cannot form over them.
+- **Reference cycles among counted objects.** Constructible today (§11.6) over
+  **structs**, which are uncounted and therefore leak regardless, and over
+  **counted arrays** now that copies retain (§11.6). **Settled as an accepted
+  leak** (§6.1): no type-level restriction, no collector. Strings and tensor
+  storage are unaffected — they are immutable, so a cycle cannot form over them.
 - **C-runtime buffers not routed through `rc_alloc`.** Anything `malloc`'d inside
   `src/ionic_model_runtime.c` (for example the `piper_forward` samples array, the
   `http_get` body) is invisible to the scheme until it is re-routed. These are
@@ -450,10 +465,15 @@ Landed incrementally, lowest risk first, each step verified with
 
    Landed: per-slot claims on `let`/`=`/`return`/exit (§4.2, first two insertion
    points) and reclamation of argument temporaries (§4.2 third insertion point).
-   Measured: `scripts/rss_check.sh` reports 0 bytes growth in N. Not yet landed:
-   array element stores and `push` (arrays are uncounted, §11.4), and the two
-   documented gaps in §9 — a loop-re-executed `let`, and a producer temp passed to
-   a *user* function.
+   Measured: `scripts/rss_check.sh` reports 0 bytes growth in N.
+
+   **Array emission (stage 2, arrays) — LANDED.** Array slots carry their own
+   claim column and their own release symbol; see §11.4 for the full rule set,
+   the retain-on-copy rule, the escape rule, and the measured result (21 MB →
+   1.7 MB on a 200000-iteration array literal). `scripts/arr_rc_check.sh` gates
+   the aliasing and escape cases under ASan and UBSan, including the cyclic
+   array that retain-on-copy makes constructible (§11.6). Structs remain
+   uncounted, so "aggregate RC" is not yet complete.
 
 5. **RC for tensor storage + RAII for `model`/handle types.** The domain core:
    deterministic release of scarce, device-affine memory. *(The `model` RAII half
@@ -535,7 +555,13 @@ This document records the decision and plan.
     iteration (releasing on re-entry is unsound under the single-exit design,
     because the slot may hold a `getenv` borrow left by another path), and a user
     function receiving a producer temp still leaks by design.
-  - Arrays are still not counted at all (§11.4), so this is a string-only stage.
+  - **Array emission has also landed** (§11.4): array slots carry their own
+    claim column and release symbol, with the loop re-entry release reclaiming a
+    per-iteration array literal. Elements are never released, by design.
+    Copies **do** retain, and an escape into a container **retains** and keeps
+    the source slot's claim — the rule that fixed the escape use-after-free
+    (`docs/memory-model-escape-bug.md`). Structs remain uncounted, so aggregate
+    RC is not complete.
 - **Cycle question (§8 step 7) — DECIDED: accepted leak.** See §6.1. Cycles over
   mutable aggregates are constructible and now formally exempt; strings and tensor
   storage are unaffected. No collector, no type-level ban.
@@ -878,20 +904,121 @@ Copy-on-access would fix it identically; it is not done because the buffer is a
 process-wide sticky diagnostic rather than per-object data, and no program has
 been observed to hold two live error strings. Recorded so the choice is explicit.
 
-### 11.4 Arrays and aggregates
+### 11.4 Arrays and aggregates — array RC stage 2 LANDED
 
 `IonicArray` is `{ i64 len; i64 cap; void *data; }`, allocated by
 `ionic_array_alloc`. It is a **two-allocation** object: the header and
 `data`. An RC header on the `IonicArray *` covers only the header, so releasing
-an array must also free `data` (and, if `data` holds managed slots, release
-them first). `ionic_arr_reset` (`:138`) currently sets `len = 0` and does
-nothing else — under RC it must release each element it drops.
+an array must also free `data`.
 
-Strings stored in array slots are a separate retain: `ionic_array_get` returns
-`((int64_t*)arr->data)[i]`, an element *value*. Reading it out does not copy or
-retain, so `let s = names[0]` aliases the slot; writing `names[0] = s` stores a
-borrow. Both directions need explicit handling, and this is why the oracle
-needed `local_elem`.
+**Shipped: the header is now a counted block, with its own release symbol.**
+`ionic_array_alloc` routes through `ionic_rc_alloc`, and
+`ionic_array_release` drops the count and frees *both* allocations when it
+reaches zero. Emitted code calls `ionic_array_release_pub`, deliberately not
+`ionic_rc_release_pub`: the plain release would free the header and leak
+`data`. Passing the wrong one is a leak rather than a crash, which is exactly
+why the two symbols are distinct and why the choice is documented at
+`ncg_emit_arr_release_r` in `src/codegen/native.ionic`.
+
+**Elements are NOT released, and that is the design, not a gap to close.**
+Element slots store int64 bit patterns with no per-slot type, so the runtime
+cannot tell `[int64]` — whose elements are raw integers, where "releasing" one
+would mean calling `free()` on an address built from `1`, `2`, `3` — from
+`[string]`, whose elements may be counted blocks. Releasing elements would
+corrupt every numeric array. Even where the element type *is* known at the
+release site, releasing is not generally sound: a `[string]` element may be a
+`getenv` borrow or a function parameter, over which an escape rule dropped the
+claim precisely because it is not ours to free. So a `[string]` array **leaks
+its element blocks** and reclaims only its own two allocations. `[int64]`,
+`[float64]` and `[T]`-of-struct arrays are fully reclaimed. `ionic_arr_reset`
+releases nothing for the same reason.
+
+What codegen does with an array slot, mirroring the string pass exactly:
+
+- **claim** on a fresh producer — an array literal (`ionic_make_array` returns
+  rc=1) or one of `ncg_arr_producer`'s builtins — **or on a copy of an owning
+  local**. The copy case **retains**: `let b = a` makes two names over one
+  header, so the count has to go up by one before the new slot claims its
+  reference. Without the retain, `let b = a; return b;` would release `a` at
+  the exit block and hand the caller a pointer into freed memory — a
+  use-after-free, not a leak.
+- **escape** — a value stored into a container (`push`, an array literal
+  element, a struct field, `arr[i] = v`, a global store) **retains**, and the
+  source slot **keeps** its claim. See "The escape rule" below.
+- **transfer** — `return a` clears the slot so the exit block does not release
+  it a second time. `local_owns_arr` does the slot lookup and the `< 0` guard
+  itself: `local_find(n) >= 0 && local_own_arr[local_find(n)]` *looks*
+  short-circuited and is not — `&&` in this compiler evaluates both sides, so a
+  non-local name indexed with -1 and aborted the compiler.
+- **re-release on loop re-entry** — a claiming `let` inside a loop body releases
+  the slot's previous value first. Gated on four conditions that must all hold:
+  the slot is written more than once, nothing else in the body assigns that name
+  (`ncg_is_assigned_name`), the slot was never poisoned, and the slot does not
+  already own a reference. With all four, every value the slot can hold is
+  releasable on every path.
+- **discharge** — `ncg_release_arrs()` in the single exit block, immediately
+  after `ncg_release_strs()`.
+
+#### The escape rule
+
+An escape *transfers a reference* to a container. The bookkeeping is therefore:
+
+- the source slot **keeps** its claim, and
+- the escape site **retains** the value, so the count goes up by one.
+
+The extra count belongs to the container, and nothing ever releases it — the
+accepted leak for a container escape (§4.2). It is a *correct* leak: the count
+stays honest, so no release can free a value a live container still holds.
+
+The earlier design did the opposite: it **dropped** the source slot's claim
+without retaining, on the reasoning that "the container holds the pointer now,
+so the slot must not release it; leaking is the safe direction". ASan found
+that wrong in two ways:
+
+1. **The count was short by one.** The container's pointer had no count behind
+   it, so the block was never freed.
+2. **The next assignment freed the container's value.** The escape cleared the
+   claim; a *later* assignment to the same slot raised a fresh claim over
+   whatever the slot held — and on every path where that assignment did not
+   run, the slot still held the value the container was pointing at. The exit
+   block then released it.
+
+The array case is the sharper of the two, because an array is a live owner of
+its element buffer: releasing one the container still points at frees `data`
+and leaves a dangling header the container will read through. The full
+write-up, with the three array probes ASan caught, is in
+`docs/memory-model-escape-bug.md`.
+
+The rule is not array-specific — the *string* pass had the same defect, and
+ASan found it there first. Both are handled by one helper,
+`ncg_escape_retain`, which emits the retain for whichever of the two value
+classes the slot holds. The retain is emitted at the escape site, reading the
+value from its slot rather than from the evaluated register: the slot *is* the
+name the container will hold, and nothing between the retain and the store can
+change it. Reading it from the slot also makes the retain safe to emit
+*before* the call's arguments are evaluated, which is where it has to be —
+the argument registers X0..X7 are live across the call.
+
+`arr_push_i64` is deliberately *not* an escape site: it appends an int64 token
+id, not a pointer, so there is nothing for the container to own. Retaining one
+would increment a count word at whatever address the integer happened to be.
+
+Measured: an 8-element array literal minted 200000 times inside a function peaks
+at 1.7 MB with this, against 21 MB at the parent commit — the re-entry release
+is what removes the per-iteration leak. `scripts/rss_check.sh` (string churn)
+stays flat, `scripts/rc_check.sh` covers the producer contract, and
+`scripts/arr_rc_check.sh` covers the aliasing and escape cases under ASan and
+UBSan.
+
+**Still uncounted: structs.** They are `malloc`'d at `ND_STRUCT_LIT` and have no
+claim column. An aggregate-shaped benchmark that never goes flat may be leaking
+a struct rather than an array; §11.6's cycle obligation applies here too.
+
+**Strings stored in array slots** remain a separate retain: `ionic_array_get`
+returns `((int64_t*)arr->data)[i]`, an element *value*. Reading it out does not
+copy or retain, so `let s = names[0]` aliases the slot; writing `names[0] = s`
+stores a borrow. Both directions need explicit handling, and this is why the
+oracle needed `local_elem`.
 
 ### 11.5 The audit's verdict
 
@@ -978,18 +1105,51 @@ aggregate graphs only; cyclic ones are documented as leaking, and no cycle
 collector is planned. The rationale, the scope, and the rejected alternatives are
 in §6.1 rather than duplicated here.
 
-**Consequence for benchmarks — the one operational obligation.** Because
-cyclic aggregates never return memory, a benchmark that builds one can never go
-flat, and its failure would be indistinguishable from "aggregate RC is not
-implemented yet". Measured today, with arrays not yet counted, an acyclic and a
-self-cyclic benchmark of the same shape are indistinguishable in RSS (~192 B/iter
-both) precisely because *nothing* aggregate-shaped is reclaimed yet. Step 4
-stage 2 must therefore (a) land aggregate RC with a **cycle-free** acyclic
-benchmark, and (b) add a second, small, **deliberately cyclic** benchmark that
-asserts *the leak is present and bounded* — a growth in proportion to the number
-of cycles created, not to iteration count. Without (b) the accepted leak is
-silent, and a future regression that turned a bounded leak into an unbounded one
-would look exactly like the documented behaviour.
+**Consequence for benchmarks — the cyclic obligation, and when it became
+live.** The obligation this section originally stated was: land aggregate RC with
+a cycle-free benchmark *and* a second, deliberately cyclic one asserting the
+leak is bounded.
+
+For arrays that obligation was **vacuous in stage 1** and is **live in stage 2**,
+and the reason is worth recording because it is a property of the design rather
+than an omission.
+
+Array stage 1 did not retain on copy (§11.4). `ring.push(ring)` therefore
+stored a borrowed pointer and raised no count, so the array's count still walked
+1 → 0 when its slot was released and the array was freed — header, `data`, and
+all. A refcount cycle over an array could not be constructed at all, so there
+was nothing to assert about one.
+
+Array stage 2 **does** retain on copy, so `ring.push(ring)` now raises the
+count: the array holds a reference to itself, its count never reaches zero, and
+the array is leaked. That is the accepted leak of §6.1, now reachable over
+arrays and not just over structs. Measured: a self-referential array loop peaks
+at 3375104 bytes at N=200000 and 10289152 bytes at N=800000 — growth, not flat,
+which is the signature of the leak and is exactly what §6.1 documents.
+
+The obligation therefore has two halves, and only the first is a *reclamation*
+assertion:
+
+- **A cycle-free aggregate benchmark must go flat.** This is the ordinary
+  requirement, and it is what `scripts/rss_check.sh` checks for strings (which
+  have no cycle exemption at all).
+- **A deliberately cyclic aggregate benchmark must NOT go flat, and must not
+  crash.** The second half asserts the *safety* property, not the reclamation:
+  the cyclic graph must stay readable and nothing may be freed while it is
+  reachable. A cycle that *was* reclaimed would be the bug — the count would
+  have reached zero with the array still reachable, and every read through it
+  would be a use-after-free.
+
+`scripts/arr_rc_check.sh` carries the array half of the second obligation:
+`scripts/probes/cyclic_array.ionic` builds a self-referential array, reads
+through the cycle, and runs under ASan and UBSan. It asserts safety, not
+reclamation, and leak detection is off in that harness because the leak is a
+decision.
+
+**Structs** remain the live gap in a different sense: they are malloc'd,
+uncounted, and `struct Node { next: Node }` with `n.next = n` is both legal and
+unreclaimed by construction. Any struct-shaped benchmark must be acyclic for the
+same reason this section gives, and the accepted leak applies to it in full.
 
 `scripts/rss_check.sh` remains a valid hard gate for strings throughout: its
 benchmark is string churn, and strings have no cycle exemption.

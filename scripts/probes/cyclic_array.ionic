@@ -1,0 +1,36 @@
+// An array that contains itself.
+//
+// `ring.push(ring)` stores the array's own pointer into the array. With
+// retain-on-copy that raises the count by one, so the array now holds a
+// reference to itself: the count cannot reach zero while the array is live,
+// and it never does — the array is leaked when the program ends.
+//
+// That leak is *accepted* (docs/memory-model.md §6.1): a cyclic aggregate is a
+// documented, bounded-in-kind programmer-visible leak, not a bug. What must
+// NOT happen is a memory error: the array must stay readable through the
+// cycle, and nothing may be freed while it is still reachable.
+//
+// So this probe asserts the safety property, not the reclamation:
+//
+//   1. the values read back through the cycle are the ones that were written
+//   2. the program runs to completion
+//   3. ASan and UBSan report no memory error
+//
+// A cycle that *was* reclaimed would be the bug: that would mean the count
+// reached zero with the array still reachable, and every read through it
+// would be a use-after-free.
+//
+// Expected: 4 / 3 / 7
+
+fn main() {
+    mut ring: [[int64]] = [[0], [1, 2, 3], [7, 8, 9]];
+    // The array now contains a pointer to itself.
+    ring.push(ring);
+
+    println(ring.len);
+    // Read *through* the cycle: ring[3] is the array itself, so ring[3][1]
+    // is ring[1], which is [1, 2, 3] — and its last element is 3.
+    println(ring[3][1][2]);
+    // The original elements are still readable, unchanged.
+    println(ring[2][0]);
+}

@@ -1,0 +1,18 @@
+// A global array aliased by a local.
+//
+// `let a = g` copies a pointer the global owns. The local must not release it:
+// the global is still live and still points at the header.
+//
+// Expected: 3 / 2 / 99 / 99
+
+mut g = [1, 2, 3];
+
+fn main() {
+    let a = g;
+    println(a.len);
+    println(g[1]);
+    let b = g;
+    b[0] = 99;
+    println(g[0]);
+    println(b[0]);
+}

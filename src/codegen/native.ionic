@@ -609,6 +609,62 @@ mut model_count    = 0;
 mut str_slots = [0];
 mut str_count = 0;
 
+// ── Array ownership (memory-model §11.4) ─────────────────────────────────────
+//
+// The same slot-claim discipline as strings, with three differences that matter:
+//
+//   * The release is `ionic_array_release`, not `ionic_rc_release`. An array is
+//     a two-allocation object (header + `data`), so the plain release would free
+//     the header and leak the element buffer. Codegen must pick the right
+//     symbol, which is why this is a separate column and a separate emit helper
+//     rather than a reuse of `local_own_str`.
+//
+//   * Elements are NOT released. Element slots carry no type at run time, so
+//     the runtime cannot tell an `[int64]` element (a plain number) from a
+//     `[string]` one. Releasing elements would corrupt every numeric array.
+//     A `[string]` array therefore leaks its element blocks and reclaims only
+//     its own two allocations — the documented safe direction (§4.2, §11.4).
+//
+//   * A claim is raised from a *fresh producer* — an array literal, whose
+//     `ionic_make_array` call returns rc=1, or one of the builtins in
+//     `ncg_arr_producer` — or from a copy of an owning local. The copy case
+//     retains, so two names over one header hold two counts; without the
+//     retain, one of them could be released while the other still lives, which
+//     is a use-after-free rather than a leak.
+mut local_own_arr    = [0];
+mut local_poison_arr = [0];
+mut arr_slots = [0];
+mut arr_count = 0;
+
+// Hashed names that appear as a plain `name = ...` target anywhere in the
+// current function body. Filled once per function by `ncg_collect_assigns`.
+//
+// This is what makes release-on-re-entry sound. The re-entry release assumes a
+// loop slot's previous contents are always 0 or an array this pass minted, and
+// a later assignment in the same body can break that: `a = b` stores a borrowed
+// pointer, and the next iteration would then release it. Rather than prove
+// aliasing, a name that is assigned *anywhere* in the body simply never gets a
+// re-entry release. Conservative in the leaking direction, which is the safe
+// one.
+mut g_asg_hashes = [0];
+mut g_asg_count  = 0;
+
+// How many `while`/`for` bodies enclose the statement currently being emitted.
+//
+// Only used to decide whether a claiming `let` must release its slot's previous
+// contents first. A body local is zeroed once, in the prologue, so a `let` that
+// runs exactly once already finds 0 there and a release would be dead code. A
+// `let` inside a loop body runs N times over one slot, so without the re-entry
+// release it mints N arrays and reclaims one — the leak this section exists to
+// remove.
+//
+// Release-on-re-entry is sound here (and this is why it is gated on the poison
+// column rather than on control flow): a slot is only ever released if it was
+// never poisoned, and poison is permanent. So every value the slot can hold is
+// either 0 or a fresh array this pass minted, on every path, including paths
+// that entered the loop a previous time. See `local_poison_arr`.
+mut ncg_loop_depth = 0;
+
 // Tracks the struct type name of the most recently evaluated expression.
 // Set by ncg_expr whenever it evaluates a struct-typed expression.
 mut ncg_last_stype = "";
@@ -648,6 +704,13 @@ fn local_reset() -> int64 {
     arr_reset(local_poison);
     arr_reset(local_elem);
     arr_reset(local_is_tensor);
+    arr_reset(local_own_arr);
+    arr_reset(local_poison_arr);
+    arr_reset(arr_slots);
+    arr_count = 0;
+    arr_reset(g_asg_hashes);
+    g_asg_count = 0;
+    ncg_loop_depth = 0;
     arr_reset(model_names);
     arr_reset(model_slots);
     model_count = 0;
@@ -699,6 +762,8 @@ fn local_def(string name, int64 is_float) -> int64 {
     local_poison.push(0);
     local_elem.push(0);
     local_is_tensor.push(0);
+    local_own_arr.push(0);
+    local_poison_arr.push(0);
     local_count = local_count + 1;
     return slot;
 }
@@ -795,12 +860,14 @@ fn local_is_float_slot(string name) -> int64 {
 //   fall out of scope         the exit block releases it
 //   return s                  ownership leaves with the value
 //   escape into a container   a struct field, an array element, a global, a
-//                             `push` — the container keeps a pointer this pass
-//                             cannot prove it still owns, so the claim is dropped
-//                             and the value leaks. Leaking is the safe
-//                             direction: releasing there would free a pointer a
-//                             live container still holds, which is a
-//                             use-after-free rather than a leak.
+//                             `push` — the container now holds a *second* name
+//                             for the value, so the escape retains it and the
+//                             count goes up by one. The container's reference
+//                             is never released, which is the accepted leak for
+//                             a container escape (docs/memory-model.md §4.2).
+//                             It is a *correct* leak: the count stays honest,
+//                             so no release can free a value a live container
+//                             still holds.
 //
 // Two things are deliberately *not* covered in this stage. Element loads
 // (`let s = arr[0]`) and user-function results stay unowned: this pass cannot
@@ -837,6 +904,316 @@ fn local_owns_str(string name) -> int64 {
     let slot = local_find(name);
     if (slot < 0) { return 0; }
     return local_own_str[slot];
+}
+
+// ── Array ownership: emission (memory-model §11.4) ───────────────────────────
+//
+// Structurally a copy of the string pass. The one place it differs is the
+// *release symbol*: an array is a two-allocation object, so the release is
+// `ionic_array_release` and not `ionic_rc_release`. See the note on
+// `local_own_arr`.
+//
+// Everything else follows the string pass exactly, including the two
+// ownership transfers that matter:
+//
+//   a value stored into a container  the container takes a reference of its
+//                                     own (the escape retains) and the source
+//                                     slot keeps its claim
+//   a value returned                 ownership leaves with the value
+
+fn local_set_own_arr(int64 slot, int64 v) -> int64 {
+    if (slot < 0) { return 0; }
+    local_own_arr[slot] = v;
+    if (v == 1) {
+        mut i = 0;
+        mut dup = 0;
+        while (i < arr_count) {
+            if (arr_slots[i] == slot) { dup = 1; }
+            i = i + 1;
+        }
+        if (dup == 0) {
+            arr_slots.push(slot);
+            arr_count = arr_count + 1;
+        }
+    }
+    return 0;
+}
+
+fn local_set_own_arr_name(string name, int64 v) -> int64 {
+    let slot = local_find(name);
+    if (slot < 0) { return 0; }
+    return local_set_own_arr(slot, v);
+}
+
+// The array analogue of `local_owns_str`. Exists because `&&` is *not*
+// short-circuit in this compiler: `a >= 0 && tbl[a] == 1` still evaluates the
+// index on the path where `a` is -1, and a negative index aborts the compiler
+// with "index out of bounds". Every read of a name-keyed ownership column goes
+// through one of these, so the guard cannot be skipped by a future caller.
+fn local_owns_arr(string name) -> int64 {
+    let slot = local_find(name);
+    if (slot < 0) { return 0; }
+    return local_own_arr[slot];
+}
+
+// Record that `slot` has held a pointer this pass did not mint, permanently.
+// Same reasoning as `local_set_poison`: the old value may still be in the slot
+// on a path that skipped the assignment that would have overwritten it.
+fn local_set_poison_arr(int64 slot, int64 v) -> int64 {
+    if (slot < 0) { return 0; }
+    if (v == 1) { local_poison_arr[slot] = 1; }
+    return 0;
+}
+
+// Is `callee` a builtin that returns a *freshly allocated* array (rc == 1)?
+//
+// Only the builtins whose body calls `ionic_array_alloc` and returns it
+// unconditionally on every path. A user function is excluded for the same
+// reason a user string function is: its body is not visible here and it may
+// legally return one of its parameters, so a release would free the caller's
+// array. That exclusion is what makes `let p = build()` a leak rather than a
+// use-after-free, which is the direction §11.4 chose.
+fn ncg_arr_producer(string callee) -> int64 {
+    if (str_eq(callee, "mlx_to_array"))  { return 1; }
+    if (str_eq(callee, "mlx_shape"))     { return 1; }
+    if (str_eq(callee, "piper_forward")) { return 1; }
+    return 0;
+}
+
+// Can `ionic_array_release` be called on the value this expression produces, on
+// *any* path through the function?
+//
+// Mirrors `ncg_str_releasable`, and for the same reason: the exit block emits
+// one release per claiming slot and runs on every path that reaches the
+// fall-through, so *both* values a slot can hold must be releasable.
+//
+// The set is:
+//
+//   array literal     `ionic_make_array` returns rc=1; the one clear producer.
+//   producer call     `ncg_arr_producer` — builtins whose body allocates.
+//   owning local      a second name for one header. Releasing it drops one of
+//                     the counts that exist for it, which is why a copy must
+//                     also *retain* — see `ncg_emit_arr_retain_r`.
+//
+// An identifier that this frame does not own is not releasable: a global, a
+// parameter, or a name the checker knows but this frame does not. The claim
+// column says so directly, so no type inference is needed here.
+//
+// There is no literal exemption to write, in contrast to strings: a string
+// literal's managed copy is pinned, whereas an array literal is an ordinary
+// counted object from the moment it is minted.
+fn ncg_arr_releasable(int64 n) -> int64 {
+    if (n == 0) { return 0; }
+    let k = nd_kind[n];
+    if (k == ND_ARRAY_LIT) { return 1; }
+    if (k == ND_CALL) { return ncg_arr_producer(nd_sv[n]); }
+    if (k == ND_IDENT) {
+        // A global, or a name the checker knows but this frame does not: the
+        // pass has no claim on it and no proof about it either.
+        let slot = local_find(nd_sv[n]);
+        if (slot < 0) { return 0; }
+        return local_own_arr[slot];
+    }
+    return 0;
+}
+
+// Retain a value that is being stored into a container this pass cannot follow.
+//
+// The container now holds a *second* name for the same allocation, so the count
+// must go up by one to match the number of live names. That extra count is the
+// container's, and nothing ever releases it — the accepted leak for a container
+// escape (docs/memory-model.md §4.2). Keeping the count honest is what stops
+// a later release from freeing a value the container still points at.
+//
+// The slot that holds the value KEEPS its claim. An escape *transfers* a
+// reference to the container; it does not remove the slot's. The previous
+// design cleared the claim instead, on the reasoning that "the container holds
+// the pointer now, so the slot must not release it; leaking is the safe
+// direction". That was wrong in a way ASan found: clearing the claim without
+// retaining leaves the count one short of the number of live names, so the
+// container's pointer has no count behind it, and the *next* assignment to the
+// slot raises a fresh claim over a slot that still holds the container's value
+// on every path where that assignment did not run. The release that eventually
+// ran then freed the container's value.
+//
+// The hazard is sharper for arrays than for strings, because an array is a live
+// owner of its element buffer — releasing one the container still points at
+// frees `data` and leaves a dangling header the container will read through.
+//
+// Only a *name* can need this, because only a name can be an owning local:
+//
+//   fresh producer      the count is already the container's — nothing to do
+//   borrow              a parameter, a global, an element load: not ours to
+//                       count, and the container that stores it is the
+//                       caller's problem, exactly as it is for the claim
+//   plain int64         owns nothing; retaining it would be a wild write
+//
+// Both value classes are handled here, because the escape rule is the same
+// rule applied to two of them: the string pass had the same defect and ASan
+// found it there first (scripts/probes/escape_conditional_reassign.ionic).
+//
+// The retain is emitted from the slot rather than from the evaluated value,
+// because the slot *is* the name the container will hold: the value expression
+// for an identifier is a load of that slot, and nothing between here and the
+// store can change it.
+fn ncg_escape_retain(int64 node) -> int64 {
+    if (node == 0) { return 0; }
+    if (nd_kind[node] != ND_IDENT) { return 0; }
+    let slot = local_find(nd_sv[node]);
+    if (slot < 0) { return 0; }
+    if (local_own_str[slot] == 1) {
+        let r = scratch_push();
+        ncg_load_slot(r, slot);
+        ncg_emit_retain_r(r);
+        scratch_pop();
+        return 0;
+    }
+    if (local_own_arr[slot] == 1) {
+        let r = scratch_push();
+        ncg_load_slot(r, slot);
+        ncg_emit_arr_retain_r(r);
+        scratch_pop();
+    }
+    return 0;
+}
+
+// Emit `ionic_array_retain_pub(r)`. Separate from `ncg_emit_retain_r` because
+// the symbol differs: the array retain and the array release must be a
+// symmetric pair, and the plain `ionic_rc_retain_pub` would work only by
+// accident (both touch the same count word) — the array pair is what keeps the
+// two operations visibly coupled at the call site.
+//
+// Returns its argument, so `r` keeps the same pointer; the move is there so
+// `r` holds the value the callee returned rather than the pre-call spill copy.
+fn ncg_emit_arr_retain_r(int64 r) -> int64 {
+    let live = scratch_depth;
+    mut si = 0;
+    while (si < live) {
+        a64_store_fp(REG_X9 + si, (spill_base + 2 + si) * 8);
+        si = si + 1;
+    }
+    let sym = sym_undef("ionic_array_retain_pub");
+    a64_mov(REG_X0, r);
+    a64_bl_sym(sym);
+    si = 0;
+    while (si < live) {
+        a64_load_fp(REG_X9 + si, (spill_base + 2 + si) * 8);
+        si = si + 1;
+    }
+    a64_mov(r, REG_X0);
+    return 0;
+}
+
+// Emit `ionic_array_release_pub(r)`. Separate from `ncg_emit_release_r` because
+// the symbol differs: an array owns its element buffer as well as its header, so
+// `ionic_rc_release` would free the header and leak `data` (§11.4). Passing the
+// wrong one is a leak, not a crash — which is exactly why it is easy to miss.
+fn ncg_emit_arr_release_r(int64 r) -> int64 {
+    let live = scratch_depth;
+    mut si = 0;
+    while (si < live) {
+        a64_store_fp(REG_X9 + si, (spill_base + 2 + si) * 8);
+        si = si + 1;
+    }
+    let sym = sym_undef("ionic_array_release_pub");
+    a64_mov(REG_X0, r);
+    a64_bl_sym(sym);
+    si = 0;
+    while (si < live) {
+        a64_load_fp(REG_X9 + si, (spill_base + 2 + si) * 8);
+        si = si + 1;
+    }
+    return 0;
+}
+
+// Release every array slot that still owns a reference. Runs in the single exit
+// block, once per claiming slot, no matter how many `return`s the body has.
+fn ncg_release_arrs() -> int64 {
+    mut i = 0;
+    while (i < arr_count) {
+        let slot = arr_slots[i];
+        if (local_own_arr[slot] == 1) {
+            let r = scratch_push();
+            ncg_load_slot(r, slot);
+            ncg_emit_arr_release_r(r);
+            scratch_pop();
+            local_own_arr[slot] = 0;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Could this subtree create an array ownership claim? Pre-scan for the exit
+// slot, on the same over-approximating contract as `ncg_may_own_str`.
+fn ncg_may_own_arr(int64 n) -> int64 {
+    if (n == 0) { return 0; }
+    let k = nd_kind[n];
+    if (k == ND_ARRAY_LIT) { return 1; }
+    if (k == ND_CALL && ncg_arr_producer(nd_sv[n]) == 1) { return 1; }
+    if (ncg_may_own_arr(nd_i2[n]) == 1) { return 1; }
+    if (ncg_may_own_arr(nd_i3[n]) == 1) { return 1; }
+    if (ncg_may_own_arr(nd_i4[n]) == 1) { return 1; }
+    return 0;
+}
+
+fn ncg_stmts_may_own_arr(int64 list) -> int64 {
+    mut c = list;
+    while (c != 0) {
+        if (ncg_may_own_arr(nd_i2[c]) == 1) { return 1; }
+        c = nd_i3[c];
+    }
+    return 0;
+}
+
+// Collect every name that is the target of a plain `name = ...` in this body.
+//
+// Used only to *withhold* the release-on-re-entry optimisation, so an
+// under-approximation here would be unsound while an over-approximation merely
+// leaks. Hence a name in any assignment, in any nested block, counts.
+fn ncg_collect_assigns(int64 list) -> int64 {
+    mut node = list;
+    while (node != 0) {
+        let stmt = nd_i2[node];
+        let k = nd_kind[stmt];
+        if (k == ND_ASSIGN) {
+            let target = nd_i2[stmt];
+            if (nd_kind[target] == ND_IDENT) {
+                let h = str_hash(nd_sv[target]);
+                mut i = 0;
+                mut dup = 0;
+                while (i < g_asg_count) {
+                    if (g_asg_hashes[i] == h) { dup = 1; }
+                    i = i + 1;
+                }
+                if (dup == 0) {
+                    g_asg_hashes.push(h);
+                    g_asg_count = g_asg_count + 1;
+                }
+            }
+        }
+        if (k == ND_BLOCK) { ncg_collect_assigns(nd_i2[stmt]); }
+        if (k == ND_GPU_BLOCK) { ncg_collect_assigns(nd_i2[nd_i2[stmt]]); }
+        if (k == ND_IF) {
+            ncg_collect_assigns(nd_i2[nd_i3[stmt]]);
+            let else_block = nd_i4[stmt];
+            if (else_block != 0) { ncg_collect_assigns(nd_i2[else_block]); }
+        }
+        if (k == ND_WHILE) { ncg_collect_assigns(nd_i2[nd_i3[stmt]]); }
+        if (k == ND_FOR)   { ncg_collect_assigns(nd_i2[nd_i4[stmt]]); }
+        node = nd_i3[node];
+    }
+    return 0;
+}
+
+fn ncg_is_assigned_name(string name) -> int64 {
+    let h = str_hash(name);
+    mut i = 0;
+    while (i < g_asg_count) {
+        if (g_asg_hashes[i] == h) { return 1; }
+        i = i + 1;
+    }
+    return 0;
 }
 
 // Load a local slot into `r`, honouring register-promoted parameters.
@@ -952,8 +1329,8 @@ fn ncg_str_producer(string callee) -> int64 {
 // Does `callee` read its string arguments and keep no pointer to them?
 //
 // This is the mirror image of the escape set: `push` parks the pointer inside a
-// container the pass cannot follow, so the claim is dropped and the value leaks
-// (see `ncg_note_arg_escapes`). Everything listed here instead *copies* the
+// container the pass cannot follow, so the container takes a reference of its
+// own (see `ncg_escape_arg_values`). Everything listed here instead *copies* the
 // bytes, so a producer result passed as an argument is garbage the moment the
 // call returns — and nothing was releasing it, which is why
 //
@@ -1108,15 +1485,6 @@ fn ncg_release_arg_temps(string callee, int64 args) -> int64 {
     return 0;
 }
 
-// Give up the claim on a value that is being stored somewhere this pass cannot
-// follow. Called on the *value* node, never on the destination.
-fn ncg_note_str_escape(int64 n) -> int64 {
-    if (n == 0) { return 0; }
-    if (nd_kind[n] != ND_IDENT) { return 0; }
-    local_set_own_str_name(nd_sv[n], 0);
-    return 0;
-}
-
 // Could this subtree create a string ownership claim? Asked *before* the body is
 // emitted, to reserve the exit-block return slot: every release passes its value
 // in X0 and clobbers it, so a function that releases anything needs somewhere to
@@ -1180,9 +1548,10 @@ fn ncg_stmts_may_own_str(int64 list) -> int64 {
 //
 // Everything else is a pointer the pass did not mint — a parameter (the
 // caller's), `getenv`/`get_arg`/`exe_dir` (the kernel's or libc's), an element
-// load or struct field (a container's, and arrays are not counted at all yet),
-// or a user function's result (it may legally return its parameter). Releasing
-// one of those frees memory that is still live.
+// load or a struct field (the container's: an element load aliases the array's
+// slot, and a struct field is the struct's), or a user function's result (it may
+// legally return its parameter). Releasing one of those frees memory that is
+// still live.
 fn ncg_str_releasable(int64 n) -> int64 {
     if (n == 0) { return 0; }
     let k = nd_kind[n];
@@ -1207,15 +1576,31 @@ fn local_set_poison(int64 slot, int64 v) -> int64 {
     return 0;
 }
 
-// Clear the claim on every named argument of a call that stores its arguments
-// in a container this pass cannot follow. Only the container-writing builtins
-// are listed: `println(s)` copies its argument and keeps no pointer, so treating
-// it as an escape would leak one block per print.
-fn ncg_note_arg_escapes(string callee, int64 args) -> int64 {
-    if (!str_eq(callee, "push") && !str_eq(callee, "arr_push_i64")) { return 0; }
-    mut a = args;
+// Retain every *value* argument of a call that stores its arguments in a
+// container this pass cannot follow. Only the container-writing builtins are
+// listed: `println(s)` copies its argument and keeps no pointer, so treating it
+// as an escape would leak one block per print.
+//
+// `arr_push_i64` is deliberately *not* in the list. It appends an int64 token
+// id, not a pointer, so there is nothing for the container to own — retaining
+// one would increment a count word at whatever address the integer happened to
+// be. `push` is different: it is polymorphic in the element type, so
+// `outer.push(s)` on a `[string]` does store a pointer.
+//
+// The first argument is the container itself, not a value stored into it, so it
+// is skipped: the container's own claim already accounts for the name it holds,
+// and retaining it would raise a count for no reason.
+//
+// The retain is emitted *before* the arguments are evaluated, because the
+// argument registers X0..X7 are live across the call and a retain between
+// Phase 2 and the BL would clobber them. Reading the value from its slot
+// rather than from the evaluated register is what makes that safe: the value
+// the container will hold is a load of that same slot.
+fn ncg_escape_arg_values(string callee, int64 args) -> int64 {
+    if (!str_eq(callee, "push")) { return 0; }
+    mut a = nd_i3[args];   // skip the container
     while (a != 0) {
-        ncg_note_str_escape(nd_i2[a]);
+        ncg_escape_retain(nd_i2[a]);
         a = nd_i3[a];
     }
     return 0;
@@ -1981,6 +2366,28 @@ fn ncg_expr(int64 node) -> int64 {
         let mc_recv   = nd_i2[node];
         let mc_xargs  = nd_i3[node];
 
+        // `a.push(v)` is the same container write as `push(a, v)`, but it never
+        // goes through ncg_call, so it needs the escape rule applied here. Only
+        // `push` stores its argument; `len` reads nothing into the container.
+        //
+        // The receiver is deliberately not escaped: it is the container, and the
+        // container's own claim already accounts for the name it holds. What
+        // needs a reference of its own is the *value* — the array now holds a
+        // second name for it, so the count has to go up by one.
+        //
+        // The retain is emitted before the receiver and the arguments are
+        // evaluated. It has to be: a BL clobbers every caller-saved register,
+        // and the argument registers X0..X7 are live across the call below. The
+        // retain reads the value from its slot rather than from an evaluated
+        // register, so doing it first cannot change which value is retained.
+        if (str_eq(mc_method, "push")) {
+            mut esc = mc_xargs;
+            while (esc != 0) {
+                ncg_escape_retain(nd_i2[esc]);
+                esc = nd_i3[esc];
+            }
+        }
+
         // Spill any live scratch registers
         let mc_live = scratch_depth;
         mut mc_si = 0;
@@ -2150,10 +2557,14 @@ fn ncg_expr(int64 node) -> int64 {
         while (flist != 0) {
             let fnode   = nd_i2[flist];
             let fval_nd = nd_i2[fnode];
-            // The field keeps the pointer from now on, so a named local that fed
-            // it must not be released at scope exit — see the escape note on
-            // ncg_str_releasable. Same hole as an array literal had.
-            ncg_note_str_escape(fval_nd);
+            // The field keeps the pointer from now on, so the field's value has
+            // a name of its own — and the count has to cover that name. A local
+            // that fed it keeps its own claim and releases it at scope exit;
+            // the field's reference is the extra count, and it is never
+            // released because a struct is malloc'd and never freed. Same
+            // shape as an array literal element, and the same hole the old
+            // "drop the claim" rule left open.
+            ncg_escape_retain(fval_nd);
             let val_r   = ncg_expr(fval_nd);
             // ptr_r may have been spilled/restored within ncg_expr; re-load from scratch
             // (scratch stack: ptr_r is below val_r, so ptr_r = REG_X9 + scratch_depth - 2)
@@ -2194,19 +2605,17 @@ fn ncg_expr(int64 node) -> int64 {
         mut elem = nd_i2[node];
         while (elem != 0) {
             let elem_nd = nd_i2[elem];
-            // The element is now owned by the array, so a named local feeding
-            // it can no longer be released at scope exit — the array would be
-            // left holding the pointer. This is the same rule `push` gets from
-            // ncg_note_arg_escapes, but a literal pushes with a raw BL and never
-            // goes through ncg_call, so it was never applied here:
+            // The array holds the element now, so the element's value has a
+            // second name and the count has to go up by one. A literal pushes
+            // with a raw BL and never goes through ncg_call, so the function
+            // form's escape rule was never applied here:
             //
             //     fn build() -> [string] { let s = str_concat("he","llo");
             //                              let a: [string] = [s]; return a; }
             //
             // returned an array whose element had already been freed, and
-            // `println(p[0])` printed an empty line. Leaking is the documented
-            // safe direction (see the escape comment on ncg_str_releasable).
-            ncg_note_str_escape(elem_nd);
+            // `println(p[0])` printed an empty line.
+            ncg_escape_retain(elem_nd);
             let val_r = ncg_expr(elem_nd);
             // Spill all live regs (including arr_r and val_r) before push call
             let nlive = scratch_depth;
@@ -2292,12 +2701,17 @@ fn ncg_call(int64 node) -> int64 {
         }
     }
 
-    // A string passed to a container-writing builtin escapes: the container now
-    // holds the pointer, and this pass cannot prove it is still the unique owner.
-    // Doing this *before* the arguments are evaluated would be wrong — the call
-    // may itself be the value being bound (`let s = ...`), so the claim is
-    // dropped here, at the call, after the callee has been identified.
-    ncg_note_arg_escapes(callee, args);
+    // A value passed to a container-writing builtin escapes: the container now
+    // holds a second name for it, so the count has to go up by one and the
+    // source slot keeps its own claim. See `ncg_escape_retain`.
+    //
+    // The retain is emitted *before* the arguments are evaluated. It has to be:
+    // the argument registers X0..X7 are live across the call, and a retain
+    // between Phase 2 and the BL would clobber them. Reading the value from
+    // its slot rather than from an evaluated register is what makes the early
+    // position safe — the value the container will hold is a load of that
+    // same slot, and nothing between here and the call changes it.
+    ncg_escape_arg_values(callee, args);
 
     // Reset type tracker before evaluating args
     ncg_last_ty = 0;
@@ -2686,6 +3100,66 @@ fn ncg_stmt(int64 node) -> int64 {
         if (releasable == 0) { local_set_poison(slot, 1); }
         local_set_own_str(slot, owns_str);
 
+        // Array ownership. Mirrors the string pass exactly, including the
+        // retain-on-copy: `let b = a` makes two names over one header, so the
+        // copy must raise the count before the new slot claims it.
+        //
+        // The retain is what makes `let b = a; return b;` correct. Without it,
+        // `b` claims nothing while `a` still does, so the exit block releases
+        // `a` and hands the caller a pointer into freed memory — a
+        // use-after-free, not a leak. See `ncg_emit_arr_retain_r`.
+        //
+        // The re-entry release is what reclaims a `let` inside a loop body. It is
+        // gated on four conditions, all of which must hold:
+        //
+        //   ncg_loop_depth > 0   the slot is written more than once
+        //   !ncg_is_assigned_name  nothing else in the body writes this slot, so
+        //                          its previous contents are always 0 or a value
+        //                          this pass minted
+        //   !local_poison_arr      the slot has never held a value we do not own
+        //   the slot does not already own a reference  — see below
+        //
+        // The fourth condition is what stops the re-entry release from
+        // double-releasing a value that escaped into a container. `push(outer,
+        // a)` drops `a`'s claim (the container now holds the pointer), so on the
+        // next iteration the slot's contents are the *previous* array, which the
+        // container is still pointing at. Releasing it frees the header and the
+        // element buffer out from under the container.
+        //
+        // Without them the leak is confined to that slot — one array per
+        // iteration.
+        let arrrel = ncg_arr_releasable(init);
+        mut owns_arr = 0;
+        if (arrrel == 1 && local_poison_arr[slot] == 0) { owns_arr = 1; }
+        if (owns_arr == 1 && nd_kind[init] == ND_IDENT) {
+            ncg_emit_arr_retain_r(r);
+        }
+        if (arrrel == 0 && local_elem[slot] != 0) {
+            // A container-typed binding whose value this pass did not mint: it
+            // is somebody else's array, so a claim over it would be a
+            // use-after-free. Poison rather than silently assuming.
+            local_set_poison_arr(slot, 1);
+        }
+        // The re-entry release only runs when the slot does *not* already own a
+        // reference. A slot that owns one has a live count of its own, and its
+        // previous contents are that owned value — releasing it here and
+        // releasing it again at scope exit would be a double release.
+        if (owns_arr == 1 && local_poison_arr[slot] == 0
+            && ncg_loop_depth > 0
+            && ncg_is_assigned_name(name) == 0
+            && local_own_arr[slot] == 0) {
+            // The initialiser is already in `r`; the stale value is still in the
+            // slot, so read it from there and release it. `r` is live across the
+            // release, and `ncg_emit_arr_release_r` spills and restores every
+            // live scratch register around its BL — `r` included, because it is
+            // still on the scratch stack at this point.
+            let oldr = scratch_push();
+            ncg_load_slot(oldr, slot);
+            ncg_emit_arr_release_r(oldr);
+            scratch_pop();
+        }
+        local_set_own_arr(slot, owns_arr);
+
         // Store to stack
         if (off >= 0) { a64_str(r, REG_X29, off >> 3); }
         else {
@@ -2704,13 +3178,30 @@ fn ncg_stmt(int64 node) -> int64 {
     if (kind == ND_ASSIGN) {
         let target = nd_i2[node];
         let val    = nd_i3[node];
-        // An assignment into a container drops the source's claim, and it has to
-        // happen *before* the value is evaluated: after that the claim is still
-        // set and the exit block would release a pointer the container now holds.
-        // Index and field targets are containers; a plain name is not.
+        // An assignment into a *container* gives the value a second name, so
+        // the count has to go up by one and the source slot keeps its own
+        // claim. The retain is emitted before the value is evaluated, because
+        // it reads the value from its slot and the slot cannot change between
+        // here and the store.
+        //
+        // Two kinds of target are containers:
+        //
+        //   an index or a field   the array element or the struct field now
+        //                         holds the pointer
+        //   a global              the global outlives this frame, so the value
+        //                         needs a count of its own — the local's claim
+        //                         is discharged at scope exit, and without the
+        //                         extra count the global would be left holding
+        //                         a freed header
+        //
+        // A plain *local* target is not a container: `a = b` makes two live
+        // names over one value, and the assignment path already handles that
+        // by retaining and by releasing the slot's old value.
         let tkind0 = nd_kind[target];
         if (tkind0 == ND_INDEX || tkind0 == ND_FIELD_ACCESS) {
-            ncg_note_str_escape(val);
+            ncg_escape_retain(val);
+        } else if (tkind0 == ND_IDENT) {
+            if (local_find(nd_sv[target]) < 0) { ncg_escape_retain(val); }
         }
         let vr     = ncg_expr(val);
 
@@ -2770,6 +3261,40 @@ fn ncg_stmt(int64 node) -> int64 {
                         if (nd_kind[val] == ND_IDENT) { ncg_emit_retain_r(vr); }
                     }
                     local_set_own_str(slot, owns_new);
+                }
+                // Array assignment. Same shape as the string one, including the
+                // retain-on-copy: `b = a` makes two names over one header, so the
+                // copy raises the count before the destination claims it.
+                //
+                // The old value is released only when the slot actually owns it,
+                // which is a compile-time claim raised by an earlier `let`/`=`
+                // from a producer. A slot that was poisoned never owns, so this
+                // cannot reach a borrowed pointer.
+                //
+                // The claim is gated on the poison flag exactly as the string
+                // one is. Without that gate, a slot holding a *borrow* could
+                // claim it: `mut p = borrow(g); p = [9,9];` — the assignment
+                // releases the borrowed value the slot was holding, and the
+                // caller reads freed memory. The string path has always had the
+                // gate; the array path did not.
+                if (!self_assign) {
+                    if (local_own_arr[slot] == 1) {
+                        let oldr = scratch_push();
+                        ncg_load_slot(oldr, slot);
+                        ncg_emit_arr_release_r(oldr);
+                        scratch_pop();
+                        local_set_own_arr(slot, 0);
+                    }
+                    let arrrel = ncg_arr_releasable(val);
+                    mut owns_new = 0;
+                    if (arrrel == 1 && local_poison_arr[slot] == 0) {
+                        owns_new = 1;
+                        if (nd_kind[val] == ND_IDENT) { ncg_emit_arr_retain_r(vr); }
+                    }
+                    if (arrrel == 0 && local_elem[slot] != 0) {
+                        local_set_poison_arr(slot, 1);
+                    }
+                    local_set_own_arr(slot, owns_new);
                 }
                 if (slot < n_csr) {
                     // Register-promoted param: write to callee-saved reg X19+slot
@@ -2871,6 +3396,14 @@ fn ncg_stmt(int64 node) -> int64 {
             if (nd_kind[val] == ND_IDENT && local_owns_str(nd_sv[val]) == 1) {
                 local_set_own_str_name(nd_sv[val], 0);
             }
+            // And for an array: the caller receives the value and now owns it.
+            // `local_owns_arr` does the slot lookup itself — `local_find(name) >= 0
+            // && local_own_arr[local_find(name)]` looks short-circuited and is not:
+            // `&&` evaluates both sides, so a name that is not a local indexed the
+            // array with -1 and aborted the compiler.
+            if (nd_kind[val] == ND_IDENT && local_owns_arr(nd_sv[val]) == 1) {
+                local_set_own_arr_name(nd_sv[val], 0);
+            }
             a64_mov(REG_X0, r);
             scratch_pop();
         }
@@ -2920,7 +3453,12 @@ fn ncg_stmt(int64 node) -> int64 {
         let cr = ncg_expr(cond_node);
         scratch_pop();
         let patch_exit = a64_cbz(cr, 0);
+        // The body runs more than once over the same slots, so a claiming `let`
+        // inside it must release the previous iteration's value first. See
+        // `ncg_loop_depth`.
+        ncg_loop_depth = ncg_loop_depth + 1;
         ncg_stmts(body_list);
+        ncg_loop_depth = ncg_loop_depth - 1;
         a64_b(loop_top - text_len());   // back-edge (negative offset)
         let exit_addr = text_len();
         a64_patch_bcond(patch_exit, exit_addr);
@@ -2958,7 +3496,9 @@ fn ncg_stmt(int64 node) -> int64 {
         scratch_pop();
         let patch_exit = a64_bcond(COND_GE, 0);   // exit if i >= end
 
+        ncg_loop_depth = ncg_loop_depth + 1;
         ncg_stmts(body_list);
+        ncg_loop_depth = ncg_loop_depth - 1;
 
         // continue lands here (before increment)
         let cont_addr = text_len();
@@ -3074,6 +3614,7 @@ fn ncg_emit_exit() -> int64 {
     }
     ncg_release_models();
     ncg_release_strs();
+    ncg_release_arrs();
     // Reload the parked return value: the destructors left their last handle in
     // X0.
     if (cur_ret_slot >= 0) {
@@ -3225,10 +3766,16 @@ fn ncg_fn_node(int64 fn_node) -> int64 {
     cur_ret_slot = -1;
     mut ret_extra = 0;
     if (ncg_stmts_use_load_model(body_list) == 1 ||
-        ncg_stmts_may_own_str(body_list) == 1) {
+        ncg_stmts_may_own_str(body_list) == 1 ||
+        ncg_stmts_may_own_arr(body_list) == 1) {
         cur_ret_slot = n_params + n_body_base;
         ret_extra    = 1;
     }
+
+    // Record, once, every name this body assigns to. The array `let` path asks
+    // `ncg_is_assigned_name` before releasing a stale slot value, so the table
+    // must be filled before any statement is emitted.
+    ncg_collect_assigns(body_list);
 
     // The nine argument-temporary slots, reserved on the same pre-scan principle
     // as the return slot: `ncg_needs_call_tmp` over-approximates, so a body that
@@ -3709,6 +4256,14 @@ fn codegen_program(int64 structs_list, int64 fns_list, int64 top_list, string ou
     local_own_str  = [0];  arr_reset(local_own_str);
     local_poison   = [0];  arr_reset(local_poison);
     local_elem     = [0];  arr_reset(local_elem);
+    local_is_tensor     = [0]; arr_reset(local_is_tensor);
+    local_own_arr       = [0]; arr_reset(local_own_arr);
+    local_poison_arr    = [0]; arr_reset(local_poison_arr);
+    arr_slots           = [0]; arr_reset(arr_slots);
+    arr_count           = 0;
+    g_asg_hashes        = [0]; arr_reset(g_asg_hashes);
+    g_asg_count         = 0;
+    ncg_loop_depth      = 0;
     model_names    = [""]; arr_reset(model_names);
     model_slots    = [0];  arr_reset(model_slots);
     model_count    = 0;
