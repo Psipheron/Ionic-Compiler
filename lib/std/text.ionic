@@ -100,13 +100,21 @@ fn replace_all(string s, string from, string to) -> string {
 }
 
 /// Joins a [string] array into one string with sep between elements.
+///
+/// This used to start at index 1 and count `len - 1`, copying the 1-based idiom
+/// from `std.data`'s statistics. On an ordinary array that silently drops the
+/// first element: `join(["a","b","c"], ",")` returned `"b,c"`. It is 0-based now,
+/// and the separator goes *between* elements rather than after the last one.
+///
+/// For a large number of pieces prefer `str_join` (the builtin): this allocates a
+/// fresh string per element, so it is quadratic in the result length.
 fn join([string] parts, string sep) -> string {
-    let n = len(parts) - 1;
+    let n = len(parts);
     mut out = "";
-    mut i = 1;
-    while (i < n + 1) {
+    mut i = 0;
+    while (i < n) {
         out = str_concat(out, parts[i]);
-        if (i < n) { out = str_concat(out, sep); }
+        if (i < n - 1) { out = str_concat(out, sep); }
         i = i + 1;
     }
     return out;

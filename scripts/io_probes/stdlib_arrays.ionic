@@ -1,0 +1,93 @@
+// Runtime conformance: every stdlib function that takes an array.
+//
+// Why this probe exists:
+//
+// Two separate off-by-one families shipped in the bundled stdlib, and both
+// produced a plausible wrong answer rather than a failure:
+//
+//   1. `std.data`'s statistics and `std.text`'s join indexed from 1 and counted
+//      len-1, so they dropped the first element. mean_f([1,2,3,4]) was 3.0, and
+//      join(["a","b","c"],",") was "b,c".
+//
+//   2. `std.array`'s arr_reverse/arr_copy built their result by pushing onto
+//      `[0]`, believing it was empty. `len([0])` is 1, so the result carried a
+//      leading 0 and was too long: reversing 3 elements returned length 5.
+//
+// Neither is caught by "does it run" — every one of them exits 0. So each
+// function is asserted against an exact value, including lengths, because
+// family 2 was a length bug that a value-only check could partly miss.
+//
+// `stdev_f` is the population standard deviation of [1,2,3,4], i.e. sqrt(1.25),
+// which `%g` prints as 1.11803 (six significant figures). The expectation is the
+// observed output, not a longer literal — this line was wrong at first because it
+// was written from the arithmetic rather than from the program.
+//
+// Expected: sum          = 60
+// Expected: max          = 30
+// Expected: min          = 10
+// Expected: contains     = 1
+// Expected: index_of     = 1
+// Expected: sum_f        = 6
+// Expected: mean         = 2
+// Expected: reverse len  = 3
+// Expected: reverse      = 30,20,10
+// Expected: copy len     = 3
+// Expected: copy         = 10,20,30
+// Expected: mean_f       = 2.5
+// Expected: min_f        = 1
+// Expected: max_f        = 4
+// Expected: stdev_f      = 1.11803
+// Expected: csv          = 1,2,3,4
+// Expected: join         = a,b,c
+// Expected: join one     = solo
+// Expected: empty mean_f = 0
+
+import std.array.*;
+import std.data.*;
+import std.text.*;
+
+fn main() -> int64 {
+    let a = [10, 20, 30];
+    println(str_concat("sum          = ", int64_to_str(arr_sum(a))));
+    println(str_concat("max          = ", int64_to_str(arr_max(a))));
+    println(str_concat("min          = ", int64_to_str(arr_min(a))));
+    println(str_concat("contains     = ", int64_to_str(arr_contains(a, 20))));
+    println(str_concat("index_of     = ", int64_to_str(arr_index_of(a, 20))));
+
+    let f = [1.0, 2.0, 3.0];
+    println(str_concat("sum_f        = ", float64_to_str(arr_sum_f(f))));
+    println(str_concat("mean         = ", float64_to_str(arr_mean(f))));
+
+    // Lengths as well as values: family 2 was a length bug.
+    let rv = arr_reverse(a);
+    println(str_concat("reverse len  = ", int64_to_str(len(rv))));
+    println(str_concat("reverse      = ", str_concat(
+        int64_to_str(rv[0]), str_concat(",", str_concat(
+        int64_to_str(rv[1]), str_concat(",", int64_to_str(rv[2])))))));
+
+    let cp = arr_copy(a);
+    println(str_concat("copy len     = ", int64_to_str(len(cp))));
+    println(str_concat("copy         = ", str_concat(
+        int64_to_str(cp[0]), str_concat(",", str_concat(
+        int64_to_str(cp[1]), str_concat(",", int64_to_str(cp[2])))))));
+
+    let d = [1.0, 2.0, 3.0, 4.0];
+    println(str_concat("mean_f       = ", float64_to_str(mean_f(d))));
+    println(str_concat("min_f        = ", float64_to_str(min_f(d))));
+    println(str_concat("max_f        = ", float64_to_str(max_f(d))));
+    println(str_concat("stdev_f      = ", float64_to_str(stdev_f(d))));
+    println(str_concat("csv          = ", to_csv_line(d)));
+
+    let parts = ["a", "b", "c"];
+    println(str_concat("join         = ", join(parts, ",")));
+
+    // Single-element join: no separator should appear, and the element must not
+    // be dropped (the old loop dropped index 0 for every input).
+    let one = ["solo"];
+    println(str_concat("join one     = ", join(one, ",")));
+
+    let empty = [0.0];
+    arr_reset(empty);
+    println(str_concat("empty mean_f = ", float64_to_str(mean_f(empty))));
+    return 0;
+}

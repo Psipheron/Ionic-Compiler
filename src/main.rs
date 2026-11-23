@@ -19,7 +19,7 @@ use std::process::Command;
 /// other's source, and there is no build step that could generate one from the
 /// other. scripts/cli_check.sh reads all three and fails if they disagree, so
 /// the duplication is checked rather than merely noted.
-const VERSION: &str = "0.3.0";
+const VERSION: &str = "0.3.1";
 
 fn print_usage() {
     println!("ionic — Ionic compiler v{}", VERSION);
