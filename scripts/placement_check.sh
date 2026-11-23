@@ -29,6 +29,9 @@
 #   no declared pool                    -> no budget in force
 #   using a transferred value           -> rejected (B5)
 #   builtins borrow / temporaries move  -> compiles (B5)
+#   CPU-only I/O in a binding           -> rejected, not only as a bare call
+#   CPU-only I/O via the stat builtins  -> rejected
+#   CPU-only I/O in an @gpu fn body     -> rejected
 #   mastery/04_placement_types.ionic    -> still compiles (the tutorial's reference)
 #   mastery/04_pool_polymorphism.ionic  -> still compiles (transfers, done correctly)
 #   mastery/fail/use_after_move.ionic   -> rejected (the tutorial's fail-case)
@@ -771,6 +774,39 @@ expect_ok "builtins borrow, so a handle can be read twice" \
         let n = mlx_ndim(u);
     }
     return 0;
+}'
+
+# The CPU-only ban has to fire on the CALL, not on the statement shape. A
+# previous version checked only `Stmt::ExprStmt`, so a bare `file_read(p);`
+# inside a gpu block was rejected while `let s = file_read(p);` — the form
+# anyone would actually write — compiled. `expect_reject` is the right
+# assertion here precisely because the old code produced a *wrong answer that
+# still compiled*: a rejection test would have caught it, an "it builds" test
+# would not.
+expect_reject "CPU-only I/O is rejected inside a binding, not just a bare call" \
+  "CPU-only I/O" \
+'fn main() -> int64 {
+    gpu { let s = file_read("/tmp/x"); }
+    return 0;
+}'
+
+# Same rule, reached through the stat builtins rather than file_read. These are
+# the ones this compiler added; listing them here stops one backend growing the
+# ban list while the other does not.
+expect_reject "file_size is CPU-only inside a gpu block" \
+  "CPU-only I/O" \
+'fn main() -> int64 {
+    gpu { if (file_size("/tmp") >= 0) { } }
+    return 0;
+}'
+
+# An @gpu fn body is the same context as a gpu { } block, so the ban has to
+# apply there too rather than only inside the braces.
+expect_reject "the ban also covers an @gpu fn body" \
+  "CPU-only I/O" \
+'@gpu fn step(tensor@gpu w) -> tensor@gpu {
+    println("nope");
+    return w;
 }'
 
 # A temporary has no binding to strand: `f(...).toGpu()` moves nothing that a

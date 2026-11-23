@@ -413,9 +413,6 @@ impl SemanticAnalyzer {
 
             Stmt::ExprStmt(e) => {
                 self.infer_expr(e);
-                if self.in_gpu_block {
-                    self.check_gpu_restrictions(e);
-                }
             }
 
             Stmt::Return(expr) => {
@@ -490,16 +487,31 @@ impl SemanticAnalyzer {
         }
     }
 
-    fn check_gpu_restrictions(&mut self, expr: &Expr) {
-        let forbidden = ["file_read", "file_write", "file_open_read", "file_open_write",
-                         "file_read_line", "file_write_line", "file_close", "load_model"];
-        if let Expr::Call { callee, .. } = expr {
-            if forbidden.contains(&callee.as_str()) {
-                self.error(format!(
-                    "GPU block: `{}` is not allowed inside gpu blocks", callee
-                ));
-            }
-        }
+    /// True for a call that reads CPU state and is therefore banned inside a
+    /// gpu block or an `@gpu` fn body.
+    ///
+    /// This must agree with `is_cpu_only_fn` in src/semantic/checker.ionic —
+    /// that is the reference implementation, and the two disagreeing is the
+    /// exact defect class this backend keeps having to fix. They had drifted:
+    /// `print`, `println`, `getenv`, `read_line`, `get_arg`, `cpu_core_count`,
+    /// `file_size`, `file_write_binary` and `file_exists` were missing here, so
+    /// a gpu block could print and probe the filesystem on this backend while
+    /// the native backend rejected the same program. Only `load_model` was
+    /// listed here and not there; it is dropped for parity (it is a CPU-side
+    /// model loader, but banning it is a placement decision neither checker
+    /// makes — `model@cpu` placement is not tracked at all).
+    ///
+    /// The `file_open_*` / `file_*_line` / `file_close` names are registered by
+    /// this backend and not by the native one, where they are unknown
+    /// functions; both reject them inside a gpu block either way.
+    fn is_cpu_only_fn(name: &str) -> bool {
+        matches!(name,
+            "print" | "println"
+            | "file_read" | "file_write" | "file_write_binary"
+            | "file_size" | "file_exists"
+            | "file_open_read" | "file_open_write"
+            | "file_read_line" | "file_write_line" | "file_close"
+            | "getenv" | "read_line" | "get_arg" | "cpu_core_count")
     }
 
     pub fn infer_expr(&mut self, expr: &Expr) -> Type {
@@ -549,6 +561,23 @@ impl SemanticAnalyzer {
             Expr::Call { callee, args } => {
                 let arg_types: Vec<Type> = args.iter().map(|a| self.infer_expr(a)).collect();
                 if self.in_gpu_block {
+                    // Where a call is made, not just what it returns: the ban
+                    // has to fire for `let s = file_read(p)` as well as for a
+                    // bare `file_read(p);`. Checking only Stmt::ExprStmt missed
+                    // every call on the right-hand side of a binding or inside
+                    // an if condition, which is where the interesting cases are
+                    // — and it is how this backend came to accept a gpu block
+                    // that printed while the native backend rejected it.
+                    if Self::is_cpu_only_fn(callee) {
+                        // Same wording as the self-hosted checker's
+                        // "CPU-only I/O" diagnostic (src/semantic/checker.ionic).
+                        // Two compilers describing one rule in two ways is how
+                        // a shared regression suite ends up passing on the
+                        // backend whose message it happens to match.
+                        self.error(format!(
+                            "'{}' is CPU-only I/O, not allowed inside gpu block", callee
+                        ));
+                    }
                     for (i, at) in arg_types.iter().enumerate() {
                         if matches!(at, Type::Tensor(hw) if *hw.as_ref() == HwTarget::Cpu) {
                             self.error(format!(
