@@ -285,11 +285,17 @@ jobs:
     # actually names this version. The last part is the only one that proves the
     # tap moved, because 2 and 3 fail silently downstream of a valid dispatch.
     #
-    # NOTE: fixing 2 and 3 is a change in the *tap* repository, not here — the
-    # workflow file must be moved to `.github/workflows/` there. The read-back
-    # below is what makes that requirement visible instead of silent: until it
-    # is done, this job fails loudly, which is the correct behaviour for "the
-    # thing we claim to update did not update".
+    # Items 2 and 3 were changes in the *tap* repository, not here: the workflow
+    # file had to move to `.github/workflows/` there, and the formula needed a
+    # rewritable URL. Both are done, and the read-back below is what keeps them
+    # done — if the tap ever regresses, this job fails loudly instead of
+    # reporting success for a tap that did not move.
+    #
+    # The read-back checks the *owner* as well as the version. The tap formula
+    # was seeded pointing at `ByteTheBait/Ionic-Compiler`, a former name of this
+    # repo; that name still redirects, so a formula naming the right version
+    # under the wrong owner downloads correctly and would pass a version-only
+    # check while pointing at a dead name.
     steps:
       - name: Download checksums
         uses: actions/download-artifact@v4
@@ -303,8 +309,19 @@ jobs:
 
       - name: Trigger tap update
         env:
-          # `gh api` reads GH_TOKEN. TAP_TOKEN must carry the `workflow` scope
-          # (a plain repo-scoped PAT cannot write under .github/workflows/).
+          # `gh api` reads GH_TOKEN.
+          #
+          # `repository_dispatch` needs only the `repo` scope (classic PAT), or
+          # "Contents: read and write" on the *tap* repository (fine-grained
+          # PAT). It does NOT need `workflow`: an earlier note here claimed it
+          # did, on the theory that the tap's receiving workflow writes under
+          # `.github/workflows/`. That is wrong — the dispatch endpoint creates
+          # an event, it does not push a file. Verified by dispatching to the
+          # tap with a token scoped `admin:public_key, gist, read:org, repo`,
+          # which returned 204 and started a run.
+          #
+          # The `workflow` scope would only matter if this token pushed a
+          # workflow file over git, which it never does.
           GH_TOKEN: ${{ secrets.TAP_TOKEN }}
         run: |
           VERSION="${{ github.ref_name }}"
@@ -315,13 +332,17 @@ jobs:
           fi
 
           # `gh api` exits non-zero on a non-2xx response, which `curl` did not.
+          # `source_repo` is sent because the tap cannot infer it: the formula it
+          # holds names a former owner of this repo, and deriving the new URL
+          # from the old one reproduced that stale prefix on every release.
           gh api \
             --method POST \
             -H "Accept: application/vnd.github+json" \
             "repos/${{ github.repository_owner }}/homebrew-ionic/dispatches" \
             -f event_type=new-release \
             -f client_payload[version]="$VERSION" \
-            -f client_payload[sha256_arm]="${{ env.SHA256_ARM }}"
+            -f client_payload[sha256_arm]="${{ env.SHA256_ARM }}" \
+            -f client_payload[source_repo]="${{ github.repository }}"
 
           echo "Dispatch accepted for $VERSION."
 
@@ -329,24 +350,33 @@ jobs:
       # rewritten" — the receiving workflow runs asynchronously. Poll the formula
       # until it names the new version, so a job that reports success has
       # evidence the tap actually moved.
+      #
+      # The version alone is not sufficient evidence. The formula was seeded
+      # pointing at `ByteTheBait/Ionic-Compiler`, a previous name of this repo,
+      # and that name still redirects — so a formula naming the right version
+      # under the wrong owner downloads fine and hides the problem. Check the
+      # owner too, which is the part a redirect cannot paper over.
       - name: Verify the formula now names this version
         env:
           GH_TOKEN: ${{ secrets.TAP_TOKEN }}
         run: |
           VERSION="${{ github.ref_name }}"
+          REPO="${{ github.repository }}"
           DEADLINE=$(( $(date +%s) + 180 ))
           while [ "$(date +%s)" -lt "$DEADLINE" ]; do
             FORMULA=$(gh api "repos/${{ github.repository_owner }}/homebrew-ionic/contents/Formula/ionic.rb" \
                         --jq '.content' 2>/dev/null | base64 -d 2>/dev/null || true)
-            if printf '%s' "$FORMULA" | grep -q "releases/download/${VERSION}/"; then
-              echo "Tap formula now points at ${VERSION}."
+            if printf '%s' "$FORMULA" | grep -q "github.com/${REPO}/releases/download/${VERSION}/"; then
+              echo "Tap formula now points at ${REPO} ${VERSION}."
               exit 0
             fi
             sleep 10
           done
 
-          echo "Tap formula does not reference ${VERSION} after 3 minutes." >&2
+          echo "Tap formula does not reference github.com/${REPO} ${VERSION} after 3 minutes." >&2
           echo "The dispatch was accepted, so the receiving workflow either is not" >&2
-          echo "registered (.github/workflows/update-formula.yml in the tap) or" >&2
-          echo "cannot rewrite the formula." >&2
+          echo "registered (.github/workflows/update-formula.yml in the tap), cannot" >&2
+          echo "rewrite the formula, or the formula names a different repository." >&2
+          # Print what the formula actually says, so the log names the mismatch.
+          printf '%s\n' "${FORMULA:-}" | grep -E '^[[:space:]]*(url|homepage)[[:space:]]' >&2 || true
           exit 1

@@ -19,6 +19,14 @@ name: Update formula
 # works for both a literal and an interpolated URL, and it is idempotent —
 # running it twice for the same version changes nothing.
 #
+# The owner/repo prefix is *not* taken from the existing URL. The formula was
+# seeded pointing at `ByteTheBait/Ionic-Compiler`, a former name of the repo;
+# that name redirects, so the stale URL still resolves and nothing looks
+# broken, while every later version inherits the dead prefix. The payload's
+# `source_repo` field is the source of truth, and both the release URL and the
+# `homepage` are rewritten to it. It is required: there is no fallback to the
+# old URL, because falling back is exactly what preserved the stale owner.
+#
 # Fails loudly
 # ------------
 # If the formula cannot be rewritten, this workflow exits non-zero. The main
@@ -45,12 +53,21 @@ jobs:
         env:
           VERSION: ${{ github.event.client_payload.version }}
           SHA_ARM: ${{ github.event.client_payload.sha256_arm }}
+          SOURCE_REPO: ${{ github.event.client_payload.source_repo }}
         run: |
           if [ -z "$VERSION" ] || [ -z "$SHA_ARM" ]; then
             echo "Dispatch is missing version or sha256_arm." >&2
             echo "version='$VERSION' sha256_arm='$SHA_ARM'" >&2
             exit 1
           fi
+          # Required, and not defaulted to the existing formula URL: the seeded
+          # formula names a former owner of the repo (`ByteTheBait`), which
+          # redirects, so inheriting it silently kept every later release on the
+          # dead prefix.
+          case "$SOURCE_REPO" in
+            */*) ;;
+            *) echo "Dispatch is missing source_repo (owner/repo)." >&2; exit 1 ;;
+          esac
           case "$VERSION" in
             v[0-9]*.[0-9]*.[0-9]*) ;;
             *) echo "Refusing to publish non-version tag '$VERSION'." >&2; exit 1 ;;
@@ -68,36 +85,57 @@ jobs:
         env:
           VERSION: ${{ github.event.client_payload.version }}
           SHA_ARM: ${{ github.event.client_payload.sha256_arm }}
+          # The *source* repository, e.g. `Psipheron/Ionic-Compiler`. Required:
+          # without it the URL's owner can only be inherited from whatever the
+          # formula already said, which is how the stale `ByteTheBait` prefix
+          # survived — a redirecting URL looks healthy, so nothing complained
+          # while every release kept publishing under the old name.
+          SOURCE_REPO: ${{ github.event.client_payload.source_repo }}
         run: |
           python3 - <<'PYEOF'
           import os, re, pathlib, sys
 
-          version = os.environ["VERSION"]
-          sha_arm = os.environ["SHA_ARM"]
-          path    = pathlib.Path("Formula/ionic.rb")
-          src     = path.read_text()
+          version     = os.environ["VERSION"]
+          sha_arm     = os.environ["SHA_ARM"]
+          source_repo = os.environ.get("SOURCE_REPO", "").strip()
 
-          url_re = re.compile(r'https://[^"\s]+/releases/download/[^"\s]+')
+          # No fallback to the existing URL. A missing owner is a broken
+          # dispatch, and guessing is what caused the drift in the first place.
+          if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", source_repo):
+              sys.exit(
+                  "dispatch is missing a usable source_repo "
+                  f"(got {source_repo!r}); refusing to guess the owner"
+              )
+
+          path = pathlib.Path("Formula/ionic.rb")
+          src  = path.read_text()
+
+          # Build the URL outright rather than rewriting the old one in place:
+          # the old one carries the owner we are trying to correct.
+          tarball = f"ionic-{version}-aarch64-apple-darwin.tar.gz"
+          new_url = (
+              f"https://github.com/{source_repo}/releases/download/{version}/{tarball}"
+          )
+
+          url_re = re.compile(
+              r'https://github\.com/[^/"\s]+/[^/"\s]+/releases/download/[^"\s]+'
+          )
           m = url_re.search(src)
           if not m:
               sys.exit("no GitHub release URL found in Formula/ionic.rb")
-
           old_url = m.group(0)
 
-          # Two shapes occur: a literal pinned version
-          #   .../download/v0.2.1/ionic-v0.2.1-aarch64-apple-darwin.tar.gz
-          # and an interpolated one
-          #   .../download/#{version}/ionic-...-aarch64-apple-darwin.tar.gz
-          # Both become a *literal* version, which is what Homebrew resolves and
-          # what the release job polls for.
-          new_url = re.sub(r'/releases/download/[^/]+/',
-                           f'/releases/download/{version}/', old_url)
-          new_url = re.sub(r'/ionic-[^/]+-aarch64-apple-darwin\.tar\.gz$',
-                           f'/ionic-{version}-aarch64-apple-darwin.tar.gz', new_url)
-          if version not in new_url or "#{" in new_url:
-              sys.exit(f"could not build a literal URL for {version} from {old_url}")
-
           src = src.replace(old_url, new_url)
+
+          # The homepage carries the same stale owner, so correct it too.
+          src, hp = re.subn(
+              r'(homepage\s+"https://github\.com/)[^/"\s]+/[^/"\s]+(")',
+              lambda mm: mm.group(1) + source_repo + mm.group(2),
+              src,
+              count=1,
+          )
+          if hp == 0:
+              sys.exit("no homepage line found in Formula/ionic.rb")
 
           # Replace the sha256 that follows the URL, whatever its current value.
           src, n = re.subn(
@@ -118,13 +156,16 @@ jobs:
 
           path.write_text(src)
           print(f"Rewrote formula to {version}")
+          print(f"  repo: {source_repo}")
           print(f"  url: {new_url}")
           print(f"  sha256: {sha_arm}")
           PYEOF
 
           # Prove it, rather than assuming the regex landed.
-          grep -q "releases/download/${VERSION}/" Formula/ionic.rb \
-            || { echo "formula does not reference ${VERSION} after rewrite" >&2; exit 1; }
+          grep -q "github.com/${SOURCE_REPO}/releases/download/${VERSION}/" Formula/ionic.rb \
+            || { echo "formula does not point at ${SOURCE_REPO} ${VERSION} after rewrite" >&2; exit 1; }
+          grep -q "homepage \"https://github.com/${SOURCE_REPO}\"" Formula/ionic.rb \
+            || { echo "formula homepage still points at the old owner" >&2; exit 1; }
           grep -q "${SHA_ARM}" Formula/ionic.rb \
             || { echo "formula does not carry the new sha256" >&2; exit 1; }
 
