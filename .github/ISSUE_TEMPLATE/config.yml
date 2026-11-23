@@ -1,0 +1,16 @@
+# Blank issues are disabled: the two templates cover "something is wrong" and
+# "this is one of the documented limits". A free-form issue box mostly collects
+# reports missing the version and the repro, which are the two things that make
+# a compiler bug actionable.
+blank_issues_enabled: false
+
+contact_links:
+  - name: Documentation
+    url: https://github.com/Psipheron/Ionic-Compiler/tree/main/docs
+    about: Language reference, programmer's guide, standard library, memory model.
+  - name: Security issue
+    url: https://github.com/Psipheron/Ionic-Compiler/security/advisories/new
+    about: Report a memory-safety or code-execution problem privately, not as a public issue.
+  - name: Tutorial
+    url: https://github.com/Psipheron/Ionic-Compiler/blob/main/docs/Tutorial/README.md
+    about: A staged path from writing Ionic to owning the compiler.

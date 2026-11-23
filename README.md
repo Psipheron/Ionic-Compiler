@@ -600,9 +600,34 @@ itself (byte-identical object files). End users who install the tarball
 only ever see `ionic_new`.
 
 ---
+## Reporting bugs
+
+**Found a bug? [Open an issue](https://github.com/Psipheron/Ionic-Compiler/issues/new/choose).**
+
+Two things make a report actionable, and without them the same symptom could
+come from three different layers:
+
+- **the exact version** — paste `ionic --version`,
+- **a minimal reproducing program** — the smallest `.ionic` file that shows it,
+  plus the command you ran and the output you got.
+
+Before filing, the [known behaviour
+template](.github/ISSUE_TEMPLATE/known-behaviour.md) lists what is expected
+rather than broken: the two documented leak shapes, `10 / 0` returning `0`, and
+which platforms are supported.
+
+For a memory-safety or build-time code-execution problem, use a [private
+security advisory](https://github.com/Psipheron/Ionic-Compiler/security/advisories/new)
+instead — see [SECURITY.md](SECURITY.md).
+
 ## Contributing
-PR's are always welcome.
-If you want a in-depth intro to the compiler and it's intricacies, look at the [Tutorial](docs/Tutorial/README.md)
+
+PRs are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) first — the short
+version is that `./build.sh --verify-self-hosting` must stay green, and every
+gate in `scripts/` must pass, because a release runs all of them.
+
+If you want an in-depth introduction to the compiler and its intricacies, work
+through the [Tutorial](docs/Tutorial/README.md).
 
 ---
 
