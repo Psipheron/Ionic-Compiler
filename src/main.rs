@@ -11,6 +11,31 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+/// The compiler version, printed by `--version`.
+///
+/// Three things have to agree: this constant, the same string in
+/// src/main.ionic (the self-hosted `--version`), and Cargo.toml. They are
+/// duplicated rather than shared because neither compiler can import the
+/// other's source, and there is no build step that could generate one from the
+/// other. scripts/cli_check.sh reads all three and fails if they disagree, so
+/// the duplication is checked rather than merely noted.
+const VERSION: &str = "0.1.0";
+
+fn print_usage() {
+    println!("ionic — Ionic compiler v{}", VERSION);
+    println!();
+    println!("Usage: ionic <file.ionic> [options]");
+    println!();
+    println!("Options:");
+    println!("  -o <name>      Output binary name");
+    println!("  --run          Compile and immediately execute");
+    println!("  --emit-ir      Print LLVM IR to stdout, do not compile");
+    println!("  --dump-ast     Print AST to stderr, do not compile");
+    println!("  --dump-tokens  Print token stream to stderr, do not compile");
+    println!("  --help         Print this message and exit");
+    println!("  --version      Print the compiler version and exit");
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     let (source_path, flags) = parse_args(&args);
@@ -231,21 +256,47 @@ struct Flags {
 }
 
 fn parse_args(args: &[String]) -> (String, Flags) {
+    // `--help` / `--version` are answered before anything is read, and exit 0.
+    // They must be recognised *here*: this frontend used to treat argv[1] as the
+    // source path unconditionally, so `ionic --version` died with
+    // "Cannot read '--version': No such file or directory" — a missing-file
+    // error for a flag.
+    //
+    // The text lists what *this* binary accepts. src/main.ionic has
+    // --target/--print-link and none of the --dump-*/--emit-ir/--run options, so
+    // a single shared text would describe options one of the two would reject.
+    // scripts/cli_check.sh checks each backend's help against the flags that
+    // backend actually honours, which is what keeps this honest.
+    for a in args.iter().skip(1) {
+        match a.as_str() {
+            "--help" | "-h" => { print_usage(); std::process::exit(0); }
+            "--version" | "-V" => { println!("{}", VERSION); std::process::exit(0); }
+            _ => {}
+        }
+    }
+
     if args.len() < 2 {
-        eprintln!("ionic - Ionic compiler v0.1.0");
-        eprintln!("");
-        eprintln!("Usage: ionic <file.ionic> [options]");
-        eprintln!("");
-        eprintln!("Options:");
-        eprintln!("  -o <name>      Output binary name");
-        eprintln!("  --run          Compile and immediately execute");
-        eprintln!("  --emit-ir      Print LLVM IR to stdout, do not compile");
-        eprintln!("  --dump-ast     Print AST to stderr, do not compile");
-        eprintln!("  --dump-tokens  Print token stream to stderr, do not compile");
-        std::process::exit(0);
+        // No arguments is a usage error, not a request for help: exit 2 so a
+        // script can tell "invoked wrongly" from "asked for help" (exit 0).
+        print_usage();
+        std::process::exit(2);
     }
 
     let source = args[1].clone();
+
+    // A flag where a source file belongs. Without this, `ionic --no-such-flag`
+    // falls through to `fs::read_to_string` and reports
+    // "Cannot read '--no-such-flag': No such file or directory" — the same
+    // missing-file diagnostic a genuinely absent .ionic file produces, so the
+    // user is told to check a path that was never meant to be a path.
+    //
+    // Only when no source is given: `ionic file.ionic --weird` is caught by the
+    // unknown-flag arm below, and a leading '-' on argv[1] can never be a valid
+    // source here because the flag loop would have rejected it downstream.
+    if source.starts_with('-') && source != "-" {
+        eprintln!("Unknown flag: {}", source);
+        std::process::exit(1);
+    }
     let mut flags = Flags {
         dump_tokens: false,
         dump_ast: false,

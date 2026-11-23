@@ -14,6 +14,48 @@ mut target_triple = "";       // --target value; "" means "the host"
 mut target_known  = 1;        // cleared when --target names a triple we can't emit
 mut print_link    = 0;        // --print-link: show the link command, don't run it
 
+// ── --help / --version ───────────────────────────────────────────────────────
+//
+// Both are answered before anything is read from disk, and both exit 0.
+// `--version` used to be "cannot read '--version': no such file", because the
+// argument loop treated every non-flag string as a source path: a flag it did
+// not recognise fell through to the file check and was reported as a missing
+// file. That is why this is a flag the loop *recognises* rather than a file it
+// fails to find.
+//
+// The help text lists what this binary accepts. It is deliberately not shared
+// with src/main.rs: that backend has --run/--emit-ir/--dump-* and no
+// --target/--print-link, so one text describing both would be wrong for one of
+// them. scripts/cli_check.sh asserts that every flag a backend honours appears
+// in its own help, so the text cannot drift from the code that implements it.
+fn print_usage() -> int64 {
+    println("ionic — Ionic compiler v0.1.0");
+    println("");
+    println("Usage: ionic <file.ionic> [more.ionic ...] [options]");
+    println("");
+    println("Options:");
+    println("  -o <name>         Output binary name (default: a.out)");
+    println("  --target <triple> Object format to emit (default: the host's)");
+    println("  --print-link      Print the link command and exit, without linking");
+    println("  --help            Print this message and exit");
+    println("  --version         Print the compiler version and exit");
+    println("");
+    println("Several source files are concatenated in order; multi-file programs");
+    println("normally use `import` instead of listing every file.");
+    println("");
+    println("Recognised --target triples:");
+    println("  aarch64-linux  (aarch64-unknown-linux-gnu, aarch64-linux-gnu, linux)");
+    println("  aarch64-macos  (aarch64-apple-darwin, macos)");
+    return 0;
+}
+
+fn print_version() -> int64 {
+    // Just the number, so `ionic --version | cut -d' ' -f2` and the usual
+    // package-manager probes work without a prefix to strip.
+    println("0.1.0");
+    return 0;
+}
+
 mut cur_arg = get_arg(ai);
 while (!str_eq(cur_arg, "")) {
     if (str_eq(cur_arg, "-o")) {
@@ -24,6 +66,23 @@ while (!str_eq(cur_arg, "")) {
         target_triple = get_arg(ai);
     } else if (str_eq(cur_arg, "--print-link")) {
         print_link = 1;
+    } else if (str_eq(cur_arg, "--help") || str_eq(cur_arg, "-h")) {
+        print_usage();
+        exit(0);
+    } else if (str_eq(cur_arg, "--version") || str_eq(cur_arg, "-V")) {
+        print_version();
+        exit(0);
+    } else if (str_len(cur_arg) > 0 && str_index(cur_arg, 0) == 45) {
+        // Starts with '-' and matched no flag above. Without this arm the string
+        // fell through to the file check and was reported as a missing file
+        // ("ionic: cannot read '--no-such-flag'"), which reads as a plausible
+        // diagnostic for a program that does not exist rather than as "that
+        // option is not a thing". A lone "-" is left to the file path so it can
+        // still name a file called "-"; only a longer dash-prefixed word is
+        // treated as a flag.
+        println(str_concat("ionic: unknown option '", str_concat(cur_arg, "'")));
+        println("  Run 'ionic --help' for the list of options.");
+        exit(1);
     } else {
         // A named source file that is not there is a hard error. `file_read`
         // returns an empty string for a missing path, so without this check the

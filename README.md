@@ -171,6 +171,9 @@ own programs.
 ./ionic_new <file.ionic> -o <output>
 ```
 
+`./ionic_new --help` lists every option this binary accepts; `--version` prints
+the version number alone. (`-h` and `-V` are aliases.)
+
 **Compile and run:**
 ```sh
 ./ionic_new examples/hello_world.ionic -o /tmp/hw && /tmp/hw

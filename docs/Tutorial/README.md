@@ -98,10 +98,14 @@ Confirm each with the compiler, not the prose.
    `ncg_ty_of` still answers "unknown" for a nested-array element and a method
    call. See `docs/memory-model.md §10` and
    `examples/mastery/02_string_array_print.ionic`.
-3. **CLI flags.** `src/main.ionic` accepts only `-o <name>` and source files;
-   there is no `--run` (a legacy `compiler.ionic` accepted it, but that file has
-   been removed). If a doc snippet says `ionic foo.ionic --run`, translate it to
-   compile-then-execute: `./ionic_new foo.ionic -o foo && ./foo`.
+3. **CLI flags.** `src/main.ionic` accepts `-o <name>`, `--target <triple>`,
+   `--print-link`, `--help` and `--version`, plus source files; there is no
+   `--run` (a legacy `compiler.ionic` accepted it, but that file has been
+   removed). If a doc snippet says `ionic foo.ionic --run`, translate it to
+   compile-then-execute: `./ionic_new foo.ionic -o foo && ./foo`. The Rust
+   bootstrap is the one that *does* have `--run` (and `--emit-ir`/`--dump-*`),
+   which is why the two `--help` texts differ by design; `./ionic_new --help`
+   describes whichever binary you are holding and is the reliable way to ask.
 4. **`print` vs `println`**: `print` has no trailing newline (`fputs`); `println`
    appends one (`puts`). Float params are passed as **raw IEEE-754 bit patterns
    in an integer slot**, and `println` of a float prints with `%g`.

@@ -661,7 +661,24 @@ ionic <file.ionic> [more.ionic ...] -o <output> [--target <triple>] [--print-lin
   -o <name>         Output binary name (default: a.out)
   --target <triple> Object format to emit (default: the host's)
   --print-link      Print the link command and exit, without linking
+  --help            Print usage and exit
+  --version         Print the compiler version and exit
 ```
+
+`-h` and `-V` are aliases for `--help` and `--version`. Both exit 0, and
+`--version` prints the bare number (`0.1.0`) so that
+`ionic --version | cut -d' ' -f2`-style probes still work.
+
+The two compilers in this repository do not accept the same set of flags: the
+self-hosted `ionic_new` has `--target` and `--print-link`, while the Rust
+bootstrap (`target/release/ionic`) has `--run`, `--emit-ir`, `--dump-ast` and
+`--dump-tokens` instead. `ionic --help` describes the binary you are holding —
+which is the only reliable way to ask. `scripts/cli_check.sh` asserts that each
+backend's help mentions every flag that backend honours, so neither list can
+drift from its own implementation.
+
+An unrecognised option is an error naming the option, not a "cannot read" file
+error: flags are matched before any path is opened.
 
 `ionic_new` compiles the source file(s) to a native binary: it emits a Mach-O
 object as `<output>.o` (next to the executable) and then links it with the

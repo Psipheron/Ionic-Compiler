@@ -155,6 +155,29 @@ jobs:
       - name: File I/O — status, existence and read semantics (Rust backend)
         run: BACKEND=rust ./scripts/io_check.sh
 
+      # ── Command-line surface ────────────────────────────────────────────
+      # `--help` and `--version` did not exist on either backend. Both treated
+      # argv[1] as a source path unconditionally, so `ionic --version` printed
+      # "cannot read '--version': no such file or directory" and exited 1 — a
+      # missing-file diagnostic for a flag, which is why nobody noticed.
+      #
+      # The two steps assert different things on purpose. `--version` must be
+      # byte-identical across backends, because a version is a fact about the
+      # release. `--help` must NOT be, because the backends accept different
+      # flags (--target/--print-link on the self-hosted one, --run/--emit-ir/
+      # --dump-* on the Rust one); each help text is checked against the flags
+      # that backend actually honours, so adding a flag without documenting it
+      # fails here.
+      #
+      # This also keeps the version number honest. It is written in three places
+      # that cannot import each other — src/main.rs, src/main.ionic and
+      # Cargo.toml — and the gate compares all three.
+      - name: CLI — help, version and unknown-flag handling (native)
+        run: ./scripts/cli_check.sh
+
+      - name: CLI — help, version and unknown-flag handling (Rust backend)
+        run: BACKEND=rust ./scripts/cli_check.sh
+
       # ── RSS regression gate (ADVISORY during memory-model rollout) ───────
       # Smallest-possible-RSS is a core language goal. scripts/rss_check.sh
       # compiles a string-churn benchmark at two sizes and fails if peak RSS

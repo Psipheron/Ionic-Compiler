@@ -16,8 +16,12 @@ fn main() -> int64 {
 Compile and run:
 
 ```sh
-ionic hello.ionic --run
+ionic hello.ionic -o hello
+./hello
 ```
+
+`-o` names the output; the default is `a.out`. `ionic --help` lists the
+options this binary accepts.
 
 Every program with a `fn main() -> int64` uses it as the entry point. The return value becomes the process exit code. Programs without `fn main` run their top-level statements directly — useful for quick scripts.
 

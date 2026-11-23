@@ -56,10 +56,13 @@ Note: each compile also writes an object next to the output as `<out>.o`, and
 **the object path is derived from the output name on purpose** (parallel-build
 safety). See `src/main.ionic` near `obj_path`.
 
-> `src/main.ionic` accepts only `-o <name>` and source files — there is no
-> `--run`. Any doc snippet with `--run` should be read as "compile with `-o`,
-> then execute". (A legacy `src/compiler.ionic` once supported it; that file is
-> gone, and `src/main.ionic` is now the only driver.)
+> `src/main.ionic` accepts `-o <name>`, `--target <triple>`, `--print-link`,
+> `--help` and `--version`, plus source files — there is no `--run`. Any doc
+> snippet with `--run` should be read as "compile with `-o`, then execute". (A
+> legacy `src/compiler.ionic` once supported it; that file is gone, and
+> `src/main.ionic` is now the only driver.) `./ionic_new --help` is the
+> authoritative list for the binary in front of you — the Rust bootstrap accepts
+> a different set (`--run`, `--emit-ir`, `--dump-ast`, `--dump-tokens`).
 
 ---
 
