@@ -1,0 +1,15 @@
+// `file_exists` distinguishes a present file from a missing one.
+//
+// Until now this builtin existed only in the legacy LLVM backends. The
+// self-hosted compiler rejected it with "unknown function", which is why
+// docs/language.md told readers to probe with `file_size(path) >= 0` instead —
+// correct advice, but a workaround for a missing name rather than a design.
+//
+// Expected: 1
+// Expected: 0
+fn main() {
+    let path = "/tmp/ionic_io_probe_exists.txt";
+    let st = file_write(path, "here\n");
+    println(file_exists(path));
+    println(file_exists("/tmp/ionic_io_probe_definitely_missing.txt"));
+}

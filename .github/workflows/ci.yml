@@ -134,6 +134,27 @@ jobs:
       - name: Array RC — aliasing and escapes are memory-safe
         run: ./scripts/arr_rc_check.sh
 
+      # ── File I/O conformance ────────────────────────────────────────────
+      # Runs the same probes through both backends and compares each program's
+      # output against the `// Expected:` lines in its own header.
+      #
+      # The defects it pins down were all invisible from the outside:
+      # `file_write` and `file_write_binary` returned a status that the checker
+      # declared TY_VOID, so the failure could only be ignored; `file_exists`
+      # did not exist on the self-hosted path at all; and the two backends
+      # disagreed about what the same call meant (the Rust one returned a
+      # constant 1 from file_write, and its `file_exists` — `access(F_OK)` — said
+      # yes to a directory).
+      #
+      # Both backends run because agreement is the property under test. The
+      # Rust step is what would have caught the cross-backend divergence, and it
+      # needs a Rust build, so it sits here rather than in a native-only job.
+      - name: File I/O — status, existence and read semantics (native)
+        run: ./scripts/io_check.sh
+
+      - name: File I/O — status, existence and read semantics (Rust backend)
+        run: BACKEND=rust ./scripts/io_check.sh
+
       # ── RSS regression gate (ADVISORY during memory-model rollout) ───────
       # Smallest-possible-RSS is a core language goal. scripts/rss_check.sh
       # compiles a string-churn benchmark at two sizes and fails if peak RSS

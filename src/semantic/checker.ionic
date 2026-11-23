@@ -1145,10 +1145,22 @@ fn sc_consume_operand(int64 operand, int64 line, string how) -> int64 {
 }
 
 // Functions that access CPU state and are banned inside gpu {} blocks
+//
+// Every one of these is a syscall or a stdio call: they read argv, the
+// environment, the terminal, or the filesystem, none of which a gpu { } block
+// has any business doing. The stat() pair belongs here for the same reason as
+// file_read/file_write — it was simply not listed, so a gpu block could probe
+// the filesystem while being forbidden to read a file from it.
 fn is_cpu_only_fn(string name) -> bool {
     if (str_eq(name, "print"))          { return true; }
+    if (str_eq(name, "println"))        { return true; }
     if (str_eq(name, "file_read"))      { return true; }
     if (str_eq(name, "file_write"))     { return true; }
+    if (str_eq(name, "file_write_binary")) { return true; }
+    if (str_eq(name, "file_size"))      { return true; }
+    if (str_eq(name, "file_exists"))    { return true; }
+    if (str_eq(name, "getenv"))         { return true; }
+    if (str_eq(name, "read_line"))      { return true; }
     if (str_eq(name, "get_arg"))        { return true; }
     if (str_eq(name, "cpu_core_count")) { return true; }
     return false;
@@ -1425,11 +1437,29 @@ fn register_builtins() -> int64 {
     register_builtin("target_is_linux",   0, TY_INT64,   "");
     register_builtin("read_line",         0, TY_STR,     "");
     // File I/O — paths and contents are strings.
+    //
+    // The write builtins return a status, not void: 0 on success and -1 when
+    // the file could not be opened. Declaring them TY_VOID made the failure
+    // unobservable in the type system — `if (file_write(p, s) == 0)` was a
+    // compile error ("cannot compare void with int64"), so a program whose
+    // write failed exited 0 having silently done nothing. The runtime has
+    // always returned the status (ionic_file_write, ionic_file_write_binary);
+    // only the declaration was wrong.
+    //
+    // TY_INT64 rather than TY_BOOL because -1 is not a bool. Comparing either
+    // way is fine — ty_compat treats bool and int64 as the same runtime type,
+    // so `if (file_write(...))` and `== 0` both typecheck — but the honest
+    // declaration of "0 or -1" is an integer.
     register_builtin("file_read",         1, TY_STR,     ""); bparam(1, TY_STR);
-    register_builtin("file_write",        2, TY_VOID,    "");
+    register_builtin("file_write",        2, TY_INT64,   "");
     bparam(1, TY_STR); bparam(2, TY_STR);
-    register_builtin("file_write_binary", 2, TY_VOID,    ""); bparam(2, TY_STR);
+    register_builtin("file_write_binary", 2, TY_INT64,   ""); bparam(2, TY_STR);
+    // Byte length of a regular file, or -1 when missing / not a regular file.
     register_builtin("file_size",         1, TY_INT64,   ""); bparam(1, TY_STR);
+    // 1 when a regular file exists at the path, 0 otherwise. Backed by
+    // ionic_file_exists, which is defined in terms of ionic_file_size so the
+    // two can never disagree about an empty file or a directory.
+    register_builtin("file_exists",       1, TY_BOOL,    ""); bparam(1, TY_STR);
     register_builtin("system",            1, TY_INT64,   ""); bparam(1, TY_STR);
     // The *_bits helpers are the compile-time float path: they take and return
     // raw IEEE-754 bit patterns in int64 slots.

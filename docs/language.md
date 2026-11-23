@@ -298,16 +298,42 @@ no float or array overload.
 ### File I/O
 | Function | Description |
 |----------|-------------|
-| `file_read(string path) -> string` | Read entire file |
-| `file_write(string path, string content)` | Write/overwrite file |
-| `file_write_binary(int64[] bytes, string path)` | Write each **element** as one byte (`0`-`255`) |
+| `file_read(string path) -> string` | Read entire file; `""` when it cannot be read |
+| `file_write(string path, string content) -> int64` | Write/overwrite file; `0` on success, `-1` on failure |
+| `file_write_binary(int64[] bytes, string path) -> int64` | Write each **element** as one byte (`0`-`255`); bytes written, or `-1` |
 | `file_size(string path) -> int64` | Byte length, or `-1` if missing / not a regular file |
+| `file_exists(string path) -> bool` | `true` when a regular file is at the path |
 
-> `file_exists` is **not** available on the native path — it is registered only
-> in the legacy LLVM backends, so calling it fails to compile with "unknown
-> function". Use `file_size(path) >= 0` instead, which is exactly equivalent
-> (`ionic_file_size` returns `-1` for a missing path or a non-regular file, and
-> `>= 0` for a real one, including an empty file).
+The write functions return a **status you can check**, not `void`: `0` means the
+file was opened and written, `-1` means it could not be opened. `file_write_binary`
+returns the number of bytes written on success instead of `0`, because a caller
+streaming a partial buffer wants to know how much landed.
+
+```ionic
+if (file_write("/tmp/out.txt", payload) != 0) {
+    println("could not write /tmp/out.txt");
+}
+```
+
+`file_exists` and `file_size` answer different halves of the same question, and
+`file_read` alone cannot answer either:
+
+- `file_exists(p)` — is there a regular file at `p`? A directory is `false`.
+- `file_size(p)` — how many bytes? `-1` means no regular file (an **empty** file
+  is `0`, not `-1`).
+- `file_read(p)` returns `""` both for a missing file and for an empty one, so
+  pair it with `file_exists` or `file_size` when the difference matters:
+
+```ionic
+let cfg = file_read(path);
+if (!file_exists(path)) {
+    println("no config at that path — not the same as an empty one");
+}
+```
+
+`file_exists(p)` and `file_size(p) >= 0` always agree: the runtime defines the
+predicate in terms of the size probe, so an empty file and a directory are
+classified in exactly one place.
 
 ### System
 | Function | Description |

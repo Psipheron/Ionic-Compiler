@@ -121,8 +121,9 @@ If it fails, you have already learned the most important invariant in the repo.
 **00.4 — Discrepancy hunt.** Prove or disprove each of the *seven* "Known
 discrepancies" in the hub using the compiler. In particular: reproduce the
 `mean_f` off-by-one, confirm that the `println(names[0])` pointer bug is *gone*
-(it was fixed by the type oracle — see unit 06 §8), check the missing
-`file_exists`, and prove the ignored `main` return value. Reference:
+(it was fixed by the type oracle — see unit 06 §8), check that a file write's
+status is observable and that `file_exists` classifies an empty file and a
+directory correctly, and prove the ignored `main` return value. Reference:
 `examples/mastery/00_discrepancies.ionic` and
 `examples/mastery/02_string_array_print.ionic`.
 

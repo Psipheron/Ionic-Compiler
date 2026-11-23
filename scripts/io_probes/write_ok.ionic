@@ -1,0 +1,12 @@
+// A write that succeeds reports status 0.
+//
+// This is the case the old declaration made unwritable: `file_write` was
+// registered TY_VOID, so `if (file_write(p, s) == 0)` was a type error
+// ("cannot compare void with int64") and the only way to call it was to ignore
+// the result. The runtime has always returned 0/-1.
+//
+// Expected: 0
+fn main() {
+    let st = file_write("/tmp/ionic_io_probe_ok.txt", "payload\n");
+    println(st);
+}

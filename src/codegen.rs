@@ -284,7 +284,13 @@ impl Codegen {
             self.emit(d);
         }
         self.emit("declare i64  @ionic_file_write_binary(ptr, ptr)");
+        self.emit("declare i64  @ionic_file_write(ptr, ptr)");
         self.emit("declare i64  @ionic_file_size(ptr)");
+        // Ionic's `file_exists` is "a regular file is here", not "the path
+        // resolves". Defined in terms of ionic_file_size in the runtime so an
+        // empty file and a directory are answered the same way the native
+        // backend answers them.
+        self.emit("declare i64  @ionic_file_exists(ptr)");
         self.emit("declare i64  @ionic_arr_reset(ptr)");
         // Transfers between memory pools. Unlike the mlx_* surface these are not
         // in the builtin signature table — Ionic spells them as methods
@@ -308,7 +314,6 @@ impl Codegen {
         self.emit("declare void @ionic_runtime_init(i32, ptr)");
         self.emit("declare ptr  @ionic_get_arg(i64)");
         self.emit("declare i64  @ionic_cpu_core_count()");
-        self.emit("declare i32  @access(ptr, i32)");  // POSIX file_exists
         self.emit("declare i64  @ionic_system(ptr)");
         // String / system builtins used by the self-hosted compiler sources.
         // These map plain Ionic names onto their ionic_* runtime symbols.
@@ -493,10 +498,11 @@ impl Codegen {
         self.emit("declare ptr  @ionic_str_join(ptr, i64, i64, ptr)");
         self.emit("");
 
-        // File-mode constants. `file_write`, `file_open_read` and
-        // `file_open_write` still open streams in IR (they are not string
-        // producers, so the refcount question does not reach them), and they
-        // reference these globals.
+        // File-mode constants. `file_open_read` and `file_open_write` still open
+        // streams in IR (they are not string producers, so the refcount question
+        // does not reach them), and they reference these globals. `file_write`
+        // no longer needs `@mode_w`: it delegates to ionic_file_write, which
+        // returns the status rather than the constant 1 the IR version did.
         self.emit("@mode_r = private constant [2 x i8] c\"r\\00\"");
         self.emit("@mode_w = private constant [2 x i8] c\"w\\00\"");
         self.emit("");
@@ -515,14 +521,24 @@ impl Codegen {
             format!("{} %{}", llty, p.name)
         }).collect();
 
-        let ret_llvm = Self::llvm_ty(&f.ret_ty.to_type());
-
         // Rename user's `fn main()` to avoid collision with the runtime wrapper @main
-        let emit_name = if f.name == "main" && f.params.is_empty() {
+        let is_user_main = f.name == "main" && f.params.is_empty();
+        let emit_name = if is_user_main {
             "ionic_user_main".to_string()
         } else {
             f.name.clone()
         };
+
+        // The wrapper in emit_main calls this as `i64 @ionic_user_main()`, so the
+        // definition has to agree. It did not: a `fn main()` with no return type
+        // was emitted as `define void @ionic_user_main()` and then called as an
+        // i64 function, so every program built by this backend returned whatever
+        // happened to be in X0 — `fn main() { println(7); }` printed 7 and exited
+        // 2. Programs written as `fn main() -> int64` were unaffected, which is
+        // why this survived: the examples that are checked here all return a
+        // value, and the smoke tests compare stdout rather than status.
+        let ret_ty = f.ret_ty.to_type();
+        let ret_llvm = if is_user_main { "i64" } else { Self::llvm_ty(&ret_ty) };
 
         // Emit hw placement metadata as IR comment on the function
         if let Some(hw) = &f.hw {
@@ -540,11 +556,17 @@ impl Codegen {
             self.declare_var(&p.name, slot, ty);
         }
 
+        // Body. A user `main` declared `-> int64` returns from its own `return`;
+        // one declared without a return type has to fall through with a value,
+        // because the wrapper reads i64 out of it. Returning 0 is the same
+        // implicit-return-0 the native backend emits.
         for stmt in &f.body.clone() {
             self.emit_stmt(stmt);
         }
 
-        if f.ret_ty.to_type() == Type::Void {
+        if is_user_main {
+            self.emit("  ret i64 0");
+        } else if ret_ty == Type::Void {
             self.emit("  ret void");
         }
         self.emit("}");
@@ -1180,13 +1202,15 @@ impl Codegen {
                 (r, Type::Int64)
             }
             "file_exists" => {
+                // Ionic's `file_exists` means "a regular file is here", not
+                // "the path resolves": `access(..., F_OK)` returns 0 for a
+                // directory, and the native backend says 0 for one. Both
+                // backends now call the same runtime predicate, which is
+                // defined in terms of ionic_file_size, so they cannot disagree
+                // about an empty file or a directory either.
                 let (path, _) = &args[0];
-                let r32 = self.fresh_reg();
-                self.emit(&format!("  {} = call i32 @access(ptr {}, i32 0)", r32, path));
-                let cmp = self.fresh_reg();
-                self.emit(&format!("  {} = icmp eq i32 {}, 0", cmp, r32));
                 let r = self.fresh_reg();
-                self.emit(&format!("  {} = zext i1 {} to i64", r, cmp));
+                self.emit(&format!("  {} = call i64 @ionic_file_exists(ptr {})", r, path));
                 (r, Type::Int64)
             }
             "load_model" => {
@@ -1307,13 +1331,18 @@ impl Codegen {
                 (r, Type::Str)
             }
             "file_write" => {
-                let (path, _) = &args[0];
+                // Delegated to the runtime rather than emitted as fopen/fputs/
+                // fclose. The IR version returned a constant `1` on every path,
+                // including the one where fopen failed and the stream was NULL —
+                // so a write to an unwritable path looked like success to the
+                // Rust backend while the native backend reported -1 for the same
+                // program. ionic_file_write returns 0 on success and -1 when the
+                // file cannot be opened; one implementation, one answer.
+                let (path, _)    = &args[0];
                 let (content, _) = &args[1];
-                let fp = self.fresh_reg();
-                self.emit(&format!("  {} = call ptr @fopen(ptr {}, ptr @mode_w)", fp, path));
-                self.emit(&format!("  call i32 @fputs(ptr {}, ptr {})", content, fp));
-                self.emit(&format!("  call i32 @fclose(ptr {})", fp));
-                ("1".to_string(), Type::Int64)
+                let r = self.fresh_reg();
+                self.emit(&format!("  {} = call i64 @ionic_file_write(ptr {}, ptr {})", r, path, content));
+                (r, Type::Int64)
             }
             // Byte length of a regular file, or -1 when missing / not a regular
             // file. The native backend maps this to ionic_file_size; without it

@@ -565,20 +565,37 @@ web server. A request that never arrives (client connects and hangs up) makes
 ## 13. File I/O
 
 ```ionic
-// Read / write
+// Read / write. The write returns a status: 0 ok, -1 could not open.
 let content = file_read("data.txt");
-file_write("out.txt", content);
+let st = file_write("out.txt", content);
+if (st != 0) {
+    print("could not write out.txt");
+}
 
 // Check existence
-if (file_size("config.json") >= 0) {
+if (file_exists("config.json")) {
     let cfg = file_read("config.json");
 }
 ```
 
+`file_exists` answers "is there a regular file here?" — a directory is `false`.
 `file_size` returns `-1` for a missing path or a non-regular file and the byte
-count otherwise, so `>= 0` is the existence test. It costs one `stat` and
-allocates nothing; `file_read` mallocs the whole file and Ionic strings are
-never freed, which is why existence checks should not use it.
+count otherwise, so `file_size(p) >= 0` is the same test; an **empty** file is
+`0`, not `-1`. Both cost one `stat` and allocate nothing, and the runtime defines
+`file_exists` in terms of `file_size`, so they cannot disagree. `file_read`
+mallocs the whole file and Ionic strings are never freed, which is why existence
+checks should not use it.
+
+`file_read` returns `""` when the file is missing *and* when it is empty, so a
+read alone cannot tell the two apart. Pair it with `file_exists` when that
+matters:
+
+```ionic
+let cfg = file_read("config.json");
+if (!file_exists("config.json")) {
+    print("no config file — this is not merely an empty one");
+}
+```
 
 ---
 

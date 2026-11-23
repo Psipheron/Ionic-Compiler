@@ -1,0 +1,34 @@
+// A missing file and an empty file are distinguishable — but only by asking
+// twice.
+//
+// `file_read` returns an owned "" on every failure path (docs/memory-model.md
+// §11.1), so a read alone cannot tell "no such file" from "a file with nothing
+// in it": both are zero bytes. Before `file_exists` existed on this path the
+// two were *indistinguishable*, which is the shape of bug that has a program
+// silently treat a typo'd filename as an empty config.
+//
+// The pair is the answer, and this probe is the statement of that contract:
+//
+//     file_exists(p)   "is there a regular file at p?"
+//     file_size(p)     "how many bytes?"  (-1 when there is no file)
+//
+// Expected: 1
+// Expected: 0
+// Expected: 0
+// Expected: -1
+fn main() {
+    let empty_path   = "/tmp/ionic_io_probe_missing_vs_empty.txt";
+    let missing_path = "/tmp/ionic_io_probe_never_written.txt";
+
+    file_write(empty_path, "");
+
+    // An empty file that exists: present, zero bytes.
+    println(file_exists(empty_path));
+    println(file_size(empty_path));
+
+    // A path that was never written: absent, and -1 rather than 0. The -1 is
+    // what makes `file_size(p) < 0` a usable existence test; if it returned 0
+    // it would be indistinguishable from the empty file above.
+    println(file_exists(missing_path));
+    println(file_size(missing_path));
+}

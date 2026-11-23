@@ -1,0 +1,16 @@
+// `file_write_binary` reports status too, and its declaration was wrong in the
+// same way as `file_write`'s: the checker said TY_VOID while the runtime
+// returned a count.
+//
+// Success returns the number of bytes written, which is the array's length —
+// not 0, and not a boolean. A failure returns -1. Both are checked here because
+// the two return values are what a caller has to be able to tell apart.
+//
+// Expected: 3
+// Expected: -1
+fn main() {
+    println(file_write_binary([65, 66, 67], "/tmp/ionic_io_probe_binary.bin"));
+    // Same directory-missing failure as write_fail.ionic, so the two write
+    // builtins are shown to agree about what "failed" means.
+    println(file_write_binary([65], "/tmp/ionic_io_probe_no_such_dir/y.bin"));
+}

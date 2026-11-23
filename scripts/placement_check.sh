@@ -755,6 +755,12 @@ expect_reject "using a value after transferring it back" "use after move" \
 # Builtins BORROW. Reading the same handle twice in one call is the normal case
 # and must stay legal — if a call consumed its operands, `mlx_add(g, g)` would
 # be an error and every expression would need a copy of its inputs.
+#
+# The reads stay inside the block and nothing is printed there: `print`/`println`
+# are CPU-only I/O, so a `println` inside `gpu { }` is (correctly) rejected. An
+# earlier version of this probe printed `mlx_ndim(u)` from inside the block and
+# was passing only because `println` had been left off the CPU-only list while
+# `print` was on it.
 expect_ok "builtins borrow, so a handle can be read twice" \
 'fn main() -> int64 {
     let a = mlx_ones([2, 2], 0);
@@ -762,7 +768,7 @@ expect_ok "builtins borrow, so a handle can be read twice" \
     let g = a.toGpu();
     gpu {
         let u = mlx_add(g, g);
-        println(str_concat("ndim: ", int64_to_str(mlx_ndim(u))));
+        let n = mlx_ndim(u);
     }
     return 0;
 }'

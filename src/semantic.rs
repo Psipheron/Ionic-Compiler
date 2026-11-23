@@ -239,7 +239,10 @@ impl SemanticAnalyzer {
         runtime_builtins(&mut sa.functions);
         // File I/O builtins
         sa.functions.insert("file_read".to_string(),  (vec![Type::Str], Type::Str));
-        sa.functions.insert("file_write".to_string(), (vec![Type::Str, Type::Str], Type::Bool));
+        // Status, not a success flag: 0 on success, -1 when the file cannot be
+        // opened. Type::Bool was wrong in the -1 case and disagreed with the
+        // self-hosted checker; both now say int64.
+        sa.functions.insert("file_write".to_string(), (vec![Type::Str, Type::Str], Type::Int64));
         sa.functions.insert("file_open_read".to_string(),  (vec![Type::Str], Type::Int64));
         sa.functions.insert("file_open_write".to_string(), (vec![Type::Str], Type::Int64));
         sa.functions.insert("file_close".to_string(),      (vec![Type::Int64], Type::Void));

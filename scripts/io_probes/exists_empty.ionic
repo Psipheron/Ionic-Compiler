@@ -1,0 +1,22 @@
+// An empty file exists. This is the case `file_size(path) > 0` gets wrong, and
+// the reason both the docs and `file_present()` in src/main.ionic compare with
+// `>= 0`.
+//
+// It is also why `file_exists` is defined in terms of `ionic_file_size` rather
+// than carrying its own stat: an empty file, a non-empty file and a directory
+// have to be classified in exactly one place or the two builtins will disagree
+// about one of them.
+//
+// Expected: 0
+// Expected: 1
+// Expected: 0
+fn main() {
+    let path = "/tmp/ionic_io_probe_empty.txt";
+    let st = file_write(path, "");
+    println(st);
+    println(file_exists(path));
+    // Zero bytes, not -1: -1 means "no regular file here", and an empty file is
+    // a regular file. That distinction is the whole reason this compares
+    // `>= 0` rather than `> 0`.
+    println(file_size(path));
+}

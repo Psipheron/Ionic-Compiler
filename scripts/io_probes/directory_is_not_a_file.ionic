@@ -1,0 +1,20 @@
+// A directory is not a file.
+//
+// `access(path, F_OK)` says yes to a directory, which is why the Rust backend's
+// original `file_exists` disagreed with the native one: the path resolves, but
+// there is no file to read. Ionic's predicate means "a regular file is here",
+// so both backends now answer 0.
+//
+// This is the case that makes the two backends agree by construction instead of
+// by coincidence: ionic_file_exists is defined in terms of ionic_file_size,
+// which rejects anything that is not S_ISREG.
+//
+// Expected: 0
+// Expected: -1
+fn main() {
+    println(file_exists("/tmp"));
+    // -1, not 0: a directory has no byte length to report. Zero would be
+    // indistinguishable from an empty file, which is the case exists_empty.ionic
+    // pins down.
+    println(file_size("/tmp"));
+}

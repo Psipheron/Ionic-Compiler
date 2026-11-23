@@ -1,0 +1,23 @@
+// A write that cannot open the file reports status -1 and leaves nothing
+// behind.
+//
+// The path is inside a directory that does not exist, so fopen() fails. The
+// point of the probe is that the failure is *observable*: with the old TY_VOID
+// declaration this program did not compile at all, and a program that simply
+// ignored the return value exited 0 having silently done nothing.
+//
+// Expected: -1
+// Expected: absent
+fn main() {
+    let st = file_write("/tmp/ionic_io_probe_no_such_dir/x.txt", "payload\n");
+    println(st);
+    // And the failed write must not have created anything. file_exists is the
+    // predicate under test here as well: a directory that does not exist cannot
+    // hold a file, and a status of -1 with a file present would mean the
+    // runtime wrote something it reported it had not.
+    if (file_exists("/tmp/ionic_io_probe_no_such_dir/x.txt") == 0) {
+        println("absent");
+    } else {
+        println("present");
+    }
+}

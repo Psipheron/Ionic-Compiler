@@ -654,6 +654,18 @@ int64_t ionic_file_size(const char *path) {
     return (int64_t)st.st_size;
 }
 
+/* Does a regular file exist at `path`? 1 or 0.
+ *
+ * Defined *in terms of* ionic_file_size rather than carrying its own stat(2),
+ * so the two builtins cannot drift: `file_exists(p)` and
+ * `file_size(p) >= 0` agree by construction, and the empty-file and
+ * directory cases are answered once. It is a separate name only because that
+ * is what a reader of `if (file_exists(p))` expects to be able to write; the
+ * call is the same stat. */
+int64_t ionic_file_exists(const char *path) {
+    return ionic_file_size(path) >= 0 ? 1 : 0;
+}
+
 /* ── Basic I/O builtins ───────────────────────────────────────────────────── */
 
 int64_t ionic_println(const char *s) { puts(s ? s : ""); return 0; }

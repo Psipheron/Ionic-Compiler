@@ -2786,6 +2786,7 @@ fn ncg_call(int64 node) -> int64 {
     if (str_eq(callee, "file_write_binary")) { real_callee = "ionic_file_write_binary"; }
     if (str_eq(callee, "file_read"))         { real_callee = "ionic_file_read"; }
     if (str_eq(callee, "file_size"))         { real_callee = "ionic_file_size"; }
+    if (str_eq(callee, "file_exists"))       { real_callee = "ionic_file_exists"; }
     if (str_eq(callee, "system"))            { real_callee = "ionic_system"; }
     if (str_eq(callee, "sqrt"))              { real_callee = "ionic_sqrt"; }
     if (str_eq(callee, "fabs"))              { real_callee = "ionic_fabs"; }

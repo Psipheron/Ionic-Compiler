@@ -74,19 +74,39 @@ Reference: `examples/mastery/03_args.ionic`.
 
 ```ionic
 let content = file_read("data.txt");       // whole file -> string ("" if missing)
-file_write("out.txt", content);            // overwrite/create
+file_write("out.txt", content);            // overwrite/create; 0 ok, -1 failed
 ```
 
-> ⚠️ **`file_exists` is advertised in `docs/language.md`/`guide.md` but is *not*
-> registered in the shipped self-hosted compiler** (`register_builtins()` in
-> `src/semantic/checker.ionic` omits it; `native.ionic` doesn't lower it). Using
-> it yields `unknown function 'file_exists'`. Probe with
-> `str_len(file_read(path)) > 0` instead. See the hub's known discrepancies.
-> Also `file_write_binary(path, bytes)` exists.
+Both write functions return a status — `file_write` gives `0` on success and `-1`
+when the file cannot be opened, and `file_write_binary(bytes, path)` gives the
+number of bytes written (or `-1`). Ignoring it is legal but means a failed write is
+indistinguishable from a successful one:
 
-> The runtime leaks these buffers by design today (`docs/memory-model.md §1`). A
-> long-running program that reads files or builds strings grows without bound —
-> that's the gap unit 07 is about.
+```ionic
+if (file_write("/tmp/out.txt", payload) != 0) {
+    print("could not write /tmp/out.txt");
+}
+```
+
+`file_exists(path)` is a builtin on the self-hosted path too, and means "a regular
+file is here" — a directory is `false`, and an **empty** file is `true`. Note that
+`file_read` returns `""` for both a missing file and an empty one, so a read alone
+cannot tell them apart; ask `file_exists` when the difference matters:
+
+```ionic
+let cfg = file_read("config.json");
+if (!file_exists("config.json")) {
+    print("no config file — this is not merely an empty one");
+}
+```
+
+`file_write_binary(bytes, path)` writes each element as one byte (`0`-`255`).
+`scripts/io_check.sh` pins all of this down and runs the same probes through both
+backends.
+
+> The runtime leaks file and string buffers by design today (`docs/memory-model.md
+> §1`). A long-running program that reads files or builds strings grows without
+> bound — that's the gap unit 07 is about.
 
 Reference: `examples/mastery/03_file_io.ionic` (writes then reads a temp file).
 

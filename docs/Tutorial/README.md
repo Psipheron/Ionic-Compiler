@@ -105,11 +105,14 @@ Confirm each with the compiler, not the prose.
 4. **`print` vs `println`**: `print` has no trailing newline (`fputs`); `println`
    appends one (`puts`). Float params are passed as **raw IEEE-754 bit patterns
    in an integer slot**, and `println` of a float prints with `%g`.
-5. **`file_exists` is not a builtin in the shipped self-hosted compiler.** It is
-   absent from `register_builtins()` in `src/semantic/checker.ionic`, and
-   `src/codegen/native.ionic` does not lower it. `docs/language.md`/`guide.md`
-   advertise it; the compiler rejects it with `unknown function 'file_exists'`.
-   Use `str_len(file_read(path)) > 0` as a probe, or add it (capstone 09.1).
+5. **File I/O returns statuses, not `void`.** `file_write(p, s)` returns `0` on
+   success and `-1` when the file cannot be opened; `file_write_binary(bytes, p)`
+   returns the number of bytes written, or `-1`. `file_exists(p)` *is* a builtin on
+   the self-hosted path (`register_builtins()` in `src/semantic/checker.ionic`),
+   and means "a regular file is here" — a directory is `false`, an empty file is
+   `true`. `file_read` returns `""` for both a missing file and an empty one, so
+   pair it with `file_exists` when the difference matters.
+   `scripts/io_check.sh` pins all of this down, on both backends.
 6. **A `tensor@gpu` value may only be *referenced* inside a `gpu { … }` block.**
    Declaring `let d = t.toGpu();` outside a block is fine, but touching `d` in
    CPU context — even passing it to an `@gpu fn` — is rejected with

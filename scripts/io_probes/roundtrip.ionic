@@ -1,0 +1,26 @@
+// A text round trip, through a real file on disk.
+//
+// This is the case every other probe supports: status 0, then a read that
+// returns exactly what was written. `file_write` opens in "w" mode and
+// `file_read` in "rb", so the bytes are unchanged including the trailing
+// newline.
+//
+// Expected: 0
+// Expected: 1
+// Expected: 15
+// Expected: round-trip 123
+fn main() {
+    let path    = "/tmp/ionic_io_probe_roundtrip.txt";
+    let payload = "round-trip 123\n";
+    let st      = file_write(path, payload);
+    let back    = file_read(path);
+    println(st);
+    println(str_eq(back, payload));
+    // The length is checked as well as the equality, so a read that returned
+    // a truncated string could not pass by comparing equal to a truncated
+    // write. "round-trip 123\n" is 15 bytes.
+    println(str_len(back));
+    // Printed without the newline the payload carries, so the expected line
+    // stays on one line.
+    println(str_slice(back, 0, 14));
+}
