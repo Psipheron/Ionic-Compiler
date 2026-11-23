@@ -234,10 +234,22 @@ jobs:
 
           if [ "$PRERELEASE" = "1" ]; then
             echo "Tag '$VERSION' has a hyphen: publishing as a prerelease."
+            # Name the current stable rather than a literal: this said
+            # "Use v0.3.0" long after v0.3.1 was the stable, so every later beta
+            # would have pointed users at an older release than the one they
+            # should actually install.
+            STABLE=$(git tag --list 'v*' \
+                       | grep -Ev -- '-' \
+                       | sort -V \
+                       | tail -1)
+            if [ -z "$STABLE" ]; then
+              STABLE="the latest stable release"
+            fi
+            echo "Stable release for the beta note: $STABLE"
             gh release create "$VERSION" \
               --title "Ionic $VERSION (beta)" \
               --prerelease \
-              --notes "> **Beta.** This is a pre-release: it is published for testing and is not the recommended version. Use v0.3.0 for a stable install.\n\n$(git log $(git describe --tags --abbrev=0 HEAD^)..HEAD --pretty=format:'- %s' 2>/dev/null || echo 'Initial release')" \
+              --notes "> **Beta.** This is a pre-release: it is published for testing and is not the recommended version. Use $STABLE for a stable install.\n\n$(git log $(git describe --tags --abbrev=0 HEAD^)..HEAD --pretty=format:'- %s' 2>/dev/null || echo 'Initial release')" \
               dist/tarball-aarch64-apple-darwin/*.tar.gz
           else
             gh release create "$VERSION" \
