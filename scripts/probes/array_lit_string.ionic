@@ -1,0 +1,34 @@
+// An array-literal element fed by an owning string local, then conditionally
+// reassigned.
+//
+// `[s]` pushes `s` into a freshly minted array. An array literal emits a raw
+// `bl ionic_array_push` and never goes through `ncg_call`, so the function
+// form's escape rule is never applied to it — the element site needs its own
+// retain.
+//
+// The array half of this rule has array-literal coverage elsewhere; this is the
+// *string* element specifically, where the retain is `ionic_rc_retain` rather
+// than `ionic_array_retain`.
+//
+// The conditional reassignment is what makes this catch the use-after-free
+// rather than only the leak; see the long note in `fn_push_string.ionic`. A
+// bare `[s]` only leaks when the claim is dropped, because nothing retains and
+// nothing frees — so a probe without the branch below passes against the buggy
+// compiler. This shape used to print a silently empty line rather than
+// crashing, which is why the probe asserts the text.
+//
+// Expected: hello
+
+fn build() -> [string] {
+    mut s = str_concat("he", "llo");
+    let a: [string] = [s];
+    if (a.len > 999) {
+        s = str_concat("wor", "ld");
+    }
+    return a;
+}
+
+fn main() {
+    let p = build();
+    println(p[0]);
+}

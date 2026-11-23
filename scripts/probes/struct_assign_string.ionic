@@ -1,0 +1,37 @@
+// A struct field assigned *after* construction (`b.val = s`), where the source
+// slot is a local that outlives the store.
+//
+// This is deliberately a different emit site from `struct_field_string.ionic`.
+// A struct literal (`Box { val: s }`) is emitted by the ND_STRUCT_LIT case in
+// `ncg_expr`; an assignment (`b.val = s`) is emitted by the ND_ASSIGN case in
+// `ncg_stmt`. Both are container writes and both must retain, but they are
+// separate code paths, so one can regress without the other.
+//
+// The assignment path is the more delicate of the two: it must retain the value
+// it stores *and* leave the source slot's claim alone, because the slot is read
+// again afterwards. The conditional reassignment is what turns a dropped claim
+// into a visible use-after-free rather than a silent leak — see the long note
+// in `fn_push_string.ionic`.
+//
+// Both prints matter: `b.val` proves the container's reference survived the
+// source slot's release, and `s` proves the source slot was not disturbed.
+//
+// Expected: hello / hello
+
+struct Box { val: string }
+
+fn build() -> Box {
+    mut b = Box { val: "" };
+    mut s = str_concat("he", "llo");
+    b.val = s;
+    if (str_len(b.val) > 999) {
+        s = str_concat("wor", "ld");
+    }
+    println(s);
+    return b;
+}
+
+fn main() {
+    let x = build();
+    println(x.val);
+}

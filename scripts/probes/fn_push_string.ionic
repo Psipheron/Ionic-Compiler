@@ -1,0 +1,44 @@
+// The *function* form of `push`, with a string value.
+//
+// `a.push(v)` and `push(a, v)` are the same container write spelled two ways,
+// but they reach codegen by completely different routes: the method form is an
+// ND_METHOD_CALL and gets the escape rule in `ncg_expr`, while the function
+// form is an ND_CALL and gets it in `ncg_call`. A fix applied to one and not
+// the other leaves half the language unsound, and nothing else in the probe set
+// exercises the function form.
+//
+// The escape site has to retain, and this probe is shaped to *prove* it rather
+// than merely exercise it. A bare escape (`push` then `return`) only exhibits
+// the leak half of the bug: with the claim dropped and nothing retained, the
+// count stays at 1 and the block is simply never freed — no crash, so a probe
+// without the reassignment below passes against the buggy compiler too.
+//
+// The use-after-free needs the *conditional reassignment*:
+//
+//     push(outer, s);                                   // escape: claim must be KEPT
+//     if (never) { s = producer(); }                    // raises a FRESH claim
+//     return outer;                                    // exit block releases s
+//
+// On the path where the branch does not run, `s` still holds the escaped block.
+// If the escape dropped the claim, this assignment re-establishes one over it,
+// and the exit block frees a string the array still points at. The read in
+// `main`, after `build` has returned, is then a use-after-free.
+//
+// Verified: fails under ASan when the escape reverts to dropping the claim.
+//
+// Expected: hello
+
+fn build() -> [string] {
+    mut outer: [string] = [""];
+    mut s = str_concat("he", "llo");
+    push(outer, s);
+    if (outer.len > 999) {
+        s = str_concat("wor", "ld");
+    }
+    return outer;
+}
+
+fn main() {
+    let o = build();
+    println(o[1]);
+}

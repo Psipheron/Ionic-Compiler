@@ -39,14 +39,35 @@
 #                       opposite branches.
 #   loop_reentry        a `let` inside a loop that never escapes — the
 #                       re-entry release must reclaim the previous iteration.
+#   fn_push_string      the *function* form `push(a, v)`, which reaches codegen
+#                       through ncg_call rather than the ND_METHOD_CALL path the
+#                       `.push()` method uses.
+#   array_lit_string    a string array-literal element taken from an owning
+#                       local. An array literal emits a raw `bl`, never through
+#                       ncg_call, so it needs its own retain.
+#   struct_field_string a struct-literal field fed by an owning local.
+#   struct_assign_string
+#                       `b.val = s`, a *different* emit site from the struct
+#                       literal (ND_ASSIGN vs ND_STRUCT_LIT).
 #   cyclic_array        an array that contains itself. The leak is accepted
 #                       (docs/memory-model.md §6.1), so this asserts *safety*
 #                       rather than reclamation: the cyclic graph must stay
 #                       readable, and nothing may be freed while it is
 #                       reachable.
 #
+# Every escape probe carries a *conditional reassignment after the escape*, and
+# that is load-bearing rather than incidental. Dropping the claim without
+# retaining only leaks — the block is never freed, so nothing that reads it
+# crashes, and a probe without the reassignment passes against the buggy
+# compiler. The use-after-free needs an assignment that re-raises a claim over a
+# slot still holding the escaped value on the path where the branch did not run.
+# All four escape probes here were verified to fail under ASan when
+# ncg_escape_retain is reverted to the old drop-the-claim body.
+#
 # Leak detection is off: the accepted leak for a container escape is a
-# *decision*, and a leak report would flag it as a bug.
+# *decision*, and a leak report would flag it as a bug. That is also why the
+# probes above must catch the use-after-free rather than the leak — the harness
+# cannot see the leak at all.
 #
 # Usage:
 #   scripts/arr_rc_check.sh

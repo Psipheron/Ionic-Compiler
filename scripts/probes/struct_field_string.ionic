@@ -1,0 +1,35 @@
+// A struct field fed by an owning string local, then conditionally reassigned.
+//
+// The struct is heap-allocated at ND_STRUCT_LIT and the field store copies the
+// pointer into it. The field is a name of its own for that block, so the count
+// has to cover it — the local that fed it keeps its claim and releases at scope
+// exit, and the field's reference is the extra count.
+//
+// This is the *struct literal* path, not the `b.val = s` assignment path: both
+// retain, but they are separate emit sites (ND_STRUCT_LIT in `ncg_expr` vs
+// ND_ASSIGN in `ncg_stmt`), so one can regress without the other. See
+// `struct_assign_string.ionic` for the other half.
+//
+// The conditional reassignment is what makes this catch the use-after-free
+// rather than only the leak; see the long note in `fn_push_string.ionic`. A
+// bare `Box { val: s }; return b;` passes against the buggy compiler, because
+// a dropped claim with nothing retained only leaks — the block is never freed,
+// so nothing reading it crashes.
+//
+// Expected: hello
+
+struct Box { val: string }
+
+fn build() -> Box {
+    mut s = str_concat("he", "llo");
+    let b = Box { val: s };
+    if (str_len(b.val) > 999) {
+        s = str_concat("wor", "ld");
+    }
+    return b;
+}
+
+fn main() {
+    let x = build();
+    println(x.val);
+}
