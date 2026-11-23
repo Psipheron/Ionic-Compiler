@@ -143,14 +143,22 @@ jobs:
       # no repo-relative fallback can rescue it.
       - name: Smoke test — the packaged tarball compiles and runs standalone
         run: |
-          set -e
+          set -euo pipefail
+          TAG="${{ github.ref_name }}"
           rm -rf /tmp/relcheck && mkdir -p /tmp/relcheck
           tar -xzf "${{ env.TARBALL }}" -C /tmp/relcheck
           ROOT="/tmp/relcheck/$(basename "${{ env.TARBALL }}" .tar.gz)"
 
           # The shipped binary must report the version its tag advertises.
+          #
+          # `TAG` comes from the expression, not from a shell variable set in an
+          # earlier step: `VERSION` in `Package tarball` was step-local and never
+          # reached this one, so an earlier version of this check compared
+          # against the empty string and failed on a correct artifact. A release
+          # gate that fails on good input is worse than no gate, because the
+          # next person disables it.
           GOT="$("$ROOT/ionic" --version)"
-          WANT="${VERSION#v}"
+          WANT="${TAG#v}"
           if [ "$GOT" != "$WANT" ]; then
             echo "packaged binary reports '$GOT', tag is '$WANT'"
             exit 1
