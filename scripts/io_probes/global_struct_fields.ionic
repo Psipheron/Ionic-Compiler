@@ -1,0 +1,54 @@
+// A struct-typed top-level binding: field read, field store, and a copy.
+//
+// All three used to resolve the field against an *empty* type name, so the
+// field index stayed 0 and every field read or wrote field 0. Inside a function
+// the same code worked, which is why it survived: every example that touched
+// struct fields did it from a local.
+//
+// The cause differed per backend but the symptom was identical, which is what
+// makes this worth pinning in one probe rather than two:
+//
+//   native  codegen tracked the struct type in a global that `ncg_expr` set as
+//           a side effect. The local and call-return paths set it; the
+//           top-level-global path did not.
+//   rust    the global pre-pass inferred the type of `T { ... }` by falling
+//           through to the `Str` default, so a field access on it inside a
+//           function saw a string receiver and emitted the constant 0.
+//
+// Expected: 11
+// Expected: 22
+// Expected: 33
+// Expected: 99
+// Expected: 11
+// Expected: 33
+// Expected: 11
+struct T { a: int64, b: int64, c: int64 }
+
+let t = T { a: 11, b: 22, c: 33 };
+
+fn read_b() -> int64 {
+    return t.b;
+}
+
+fn set_b() -> int64 {
+    t.b = 99;
+    return 0;
+}
+
+fn main() {
+    println(t.a);
+    println(read_b());
+    println(t.c);
+    set_b();
+    // 99, and a and c untouched: the buggy store wrote field 0, so this used to
+    // print 11 here and 99 for `t.a` below.
+    println(t.b);
+    println(t.a);
+    println(t.c);
+    // A copy of a global is a fresh local, and it has to carry the type too or
+    // the field index goes back to 0 on the copy — which prints 0 here, not 11.
+    // 11 rather than 22 because the copy happens after set_b, and set_b only
+    // writes b.
+    let u = t;
+    println(u.a);
+}

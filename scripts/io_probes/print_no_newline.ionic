@@ -1,0 +1,27 @@
+// `print` does not append a newline; `println` does. Exactly one.
+//
+// Both backends once printed through a shared format table whose every entry
+// ended in "\n", so `print` emitted a newline it does not have: on the Rust
+// backend these four calls ran onto four lines while the native backend put
+// them on one. `println` looked right by accident, because the newline it
+// wanted happened to already be in the format string.
+//
+// Nothing catches that from the outside except looking at the bytes, which is
+// why the expectation is the exact run of bytes rather than a line count. The
+// one newline below is println(7)'s; none of the print calls contributes one,
+// so the "|" that follows 7 starts its own line.
+//
+// Expected: ab|7
+// Expected: |2.5|
+fn main() {
+    print("a");
+    print("b");
+    print("|");
+    println(7);
+    print("|");
+    // 2.5, not 2.500000: every float crosses the runtime boundary as an
+    // IEEE-754 bit pattern and is printed by ionic_print_float64, which formats
+    // with "%g". A backend using "%lf" prints 2.500000 here and fails.
+    print(2.5);
+    println("|");
+}

@@ -665,10 +665,6 @@ mut g_asg_count  = 0;
 // that entered the loop a previous time. See `local_poison_arr`.
 mut ncg_loop_depth = 0;
 
-// Tracks the struct type name of the most recently evaluated expression.
-// Set by ncg_expr whenever it evaluates a struct-typed expression.
-mut ncg_last_stype = "";
-
 // ── Function return-struct-type table (populated by codegen_program) ─────────
 mut fn_ret_stype_hashes = [0];   // str_hash(fname) for struct-returning fns
 mut fn_ret_stypes       = [""];  // struct name returned
@@ -1735,8 +1731,7 @@ fn ncg_ty_of(int64 n) -> int64 {
 }
 
 // Struct type name of the value an expression produces, or "" when it is not a
-// struct or cannot be resolved. The pure equivalent of `ncg_last_stype`, which
-// is a side effect of emission and unusable at a point that has not emitted yet.
+// struct or cannot be resolved.
 //
 // Needed for field access: `ncg_ty_of` could not say what `b.val` was, so
 // `println(b.val)` fell through to the int64 printer and printed the field's
@@ -2139,7 +2134,6 @@ fn ncg_expr(int64 node) -> int64 {
 
     if (kind == ND_IDENT) {
         let name = nd_sv[node];
-        ncg_last_stype = "";  // reset before early returns; overridden for struct-typed locals below
 
         // 1. Check local variable (function-scope) FIRST so that function
         //    parameters and inner bindings shadow top-level globals AND
@@ -2150,7 +2144,6 @@ fn ncg_expr(int64 node) -> int64 {
         let slot = local_find(name);
         if (slot >= 0) {
             let r = scratch_push();
-            ncg_last_stype = local_get_stype(name);
             ncg_last_ty    = local_get_str(name);
             if (slot < n_csr) {
                 // Register-promoted param: read from callee-saved reg X19+slot
@@ -2354,8 +2347,6 @@ fn ncg_expr(int64 node) -> int64 {
         if (ncg_last_ty == 2) {
             text_u32(0x9E670000 | (r << 5) | r);  // FMOV D{r}, X{r}
         }
-        // Propagate struct return type so field accesses work
-        ncg_last_stype = ncg_fn_stype(nd_sv[node]);
         return r;
     }
 
@@ -2508,9 +2499,20 @@ fn ncg_expr(int64 node) -> int64 {
             return r;
         }
         let obj_r    = ncg_expr(obj_node);
-        // ncg_expr sets ncg_last_stype; capture it immediately before it's overwritten
-        let sname_fa = ncg_last_stype;
-        // Struct field: look up field index using the type tracked by ncg_last_stype.
+        // Ask the oracle for the receiver's struct type. The earlier version
+        // read a global that `ncg_expr` maintained as a side effect of emission,
+        // which only worked for a struct-typed *local*: a top-level struct
+        // binding is a global, and the global branch never set it. So every
+        // `t.field` on a global resolved against an empty type name,
+        // `st_field_offset` returned -1, and the field index stayed 0 —
+        // `let t = T { a: 11, b: 22, c: 33 }; t.b` read 11. Inside a function the
+        // same code worked, which is why it survived: the examples that read
+        // struct fields all did it from a function.
+        //
+        // `ncg_stype_of` consults the checker's symbol table for a global, so
+        // the answer was there all along. It is the only source of this
+        // information now; do not reintroduce a side-effect tracker.
+        let sname_fa = ncg_stype_of(obj_node);
         let st_fa = st_find(sname_fa);
         mut fidx = 0;
         if (st_fa != 0) {
@@ -2574,7 +2576,6 @@ fn ncg_expr(int64 node) -> int64 {
             flist  = nd_i3[flist];
             fidx2  = fidx2 + 1;
         }
-        ncg_last_stype = sname;   // propagate struct type
         return ptr_r;
     }
 
@@ -3006,7 +3007,11 @@ fn ncg_stmt(int64 node) -> int64 {
         // Record string, float, and struct types for future loads of this local.
         if (ncg_last_ty == 1) { local_set_str(slot, 1); }
         if (ncg_last_ty == 2) { local_set_float(slot, 1); }
-        if (!str_eq(ncg_last_stype, "")) { local_set_stype(slot, ncg_last_stype); }
+        // The struct type comes from the oracle. Recording it from an emission
+        // side effect instead left `let u = t;` (t a top-level global) untyped,
+        // so `u.b` then read field 0.
+        let init_stype = ncg_stype_of(init);
+        if (!str_eq(init_stype, "")) { local_set_stype(slot, init_stype); }
         // Record the element type when this local is an array, so an element
         // load can be typed. The annotation is authoritative; an array literal
         // is the fallback for an unannotated binding.
@@ -3345,7 +3350,11 @@ fn ncg_stmt(int64 node) -> int64 {
             let obj_node_a = nd_i2[target];
             let field_a    = nd_sv[target];
             let obj_r_a    = ncg_expr(obj_node_a);
-            let sname_a    = ncg_last_stype;
+            // The oracle — see the matching note in ncg_expr's
+            // ND_FIELD_ACCESS arm. An emission side effect was empty for a
+            // top-level struct binding, so a store through a global computed
+            // field index 0 and overwrote the struct's first field.
+            let sname_a    = ncg_stype_of(obj_node_a);
             let st_a       = st_find(sname_a);
             mut fidx_a     = 0;
             if (st_a != 0) {
@@ -4276,7 +4285,6 @@ fn codegen_program(int64 structs_list, int64 fns_list, int64 top_list, string ou
     fn_ret_stypes       = [""]; arr_reset(fn_ret_stypes);
     fn_ret_count        = 0;
     ncg_has_user_main = 0;
-    ncg_last_stype = "";
     const_names  = [0]; arr_reset(const_names);  const_count = 0;
     const_vals   = [0]; arr_reset(const_vals);
     glob_names   = [0]; arr_reset(glob_names);   glob_count  = 0;

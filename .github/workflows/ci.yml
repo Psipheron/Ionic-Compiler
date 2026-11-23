@@ -134,25 +134,38 @@ jobs:
       - name: Array RC — aliasing and escapes are memory-safe
         run: ./scripts/arr_rc_check.sh
 
-      # ── File I/O conformance ────────────────────────────────────────────
+      # ── Runtime conformance ─────────────────────────────────────────────
       # Runs the same probes through both backends and compares each program's
-      # output against the `// Expected:` lines in its own header.
+      # output against the `// Expected:` lines in its own header. The set is
+      # wider than the name of the script suggests — it began as file I/O and
+      # now covers every case where the two backends have to produce the same
+      # bytes.
       #
-      # The defects it pins down were all invisible from the outside:
-      # `file_write` and `file_write_binary` returned a status that the checker
-      # declared TY_VOID, so the failure could only be ignored; `file_exists`
-      # did not exist on the self-hosted path at all; and the two backends
-      # disagreed about what the same call meant (the Rust one returned a
-      # constant 1 from file_write, and its `file_exists` — `access(F_OK)` — said
-      # yes to a directory).
+      # The defects it pins down were all invisible from the outside, because
+      # each one is a wrong answer that exits 0:
+      #
+      #   file_write / file_write_binary  returned a status the checker declared
+      #     TY_VOID, so the failure could only be ignored; `file_exists` did not
+      #     exist on the self-hosted path at all; and the Rust backend returned a
+      #     constant 1 from file_write while its `file_exists` — access(F_OK) —
+      #     said yes to a directory.
+      #   print                           appended a newline it does not have, so
+      #     every example's output ran onto its own lines on the Rust backend
+      #     while the native one printed it correctly. `println` was right by
+      #     accident, the newline already being in the shared format string.
+      #   a struct-typed top-level binding  resolved every field against an empty
+      #     type name, so t.b read field 0. The native backend tracked the type
+      #     in an emission side effect that the global path never set; the Rust
+      #     one typed the global as Str and emitted the constant 0. Both are
+      #     silent, and both worked inside a function, which is why they lasted.
       #
       # Both backends run because agreement is the property under test. The
-      # Rust step is what would have caught the cross-backend divergence, and it
+      # Rust step is what would have caught each cross-backend divergence, and it
       # needs a Rust build, so it sits here rather than in a native-only job.
-      - name: File I/O — status, existence and read semantics (native)
+      - name: Runtime conformance — I/O, print and struct globals (native)
         run: ./scripts/io_check.sh
 
-      - name: File I/O — status, existence and read semantics (Rust backend)
+      - name: Runtime conformance — I/O, print and struct globals (Rust backend)
         run: BACKEND=rust ./scripts/io_check.sh
 
       # ── Command-line surface ────────────────────────────────────────────
