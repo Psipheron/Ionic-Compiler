@@ -99,6 +99,21 @@ impl Codegen {
     }
 
     // ── Ptr ↔ i64 coercions for array element storage ────────────────────────
+    //
+    // An array's backing store is `i64` slots whatever the element type, so
+    // every value that goes in or comes out has to be converted at the boundary.
+    // Three kinds need it: pointers (ptrtoint/inttoptr), and floats, whose bit
+    // pattern travels in the slot (bitcast). Only integers need nothing.
+    //
+    // The float half was missing, and the failure was loud rather than silent
+    // only by luck: `let a = [1.5, 2.5]` emitted
+    // `call void @ionic_array_push(ptr %r1, i64 1.50000000000000000)`, which
+    // clang rejects with "floating point constant invalid for type". The same
+    // omission on the way back out would have been worse — `let d = a[0]` for a
+    // `[float64]` yields the i64 slot loaded straight into a `double` slot,
+    // which is a type error clang happens to report. A float array therefore
+    // did not work at all on this backend, which is why five stdlib statistics
+    // functions failed to compile the moment they were written 0-based.
 
     fn is_ptr_ty(ty: &Type) -> bool {
         matches!(ty, Type::Str | Type::Array(_) | Type::Struct(_) | Type::Tensor(_) | Type::Model(_))
@@ -109,6 +124,10 @@ impl Codegen {
             let r = self.fresh_reg();
             self.emit(&format!("  {} = ptrtoint ptr {} to i64", r, val));
             r
+        } else if *ty == Type::Float64 {
+            let r = self.fresh_reg();
+            self.emit(&format!("  {} = bitcast double {} to i64", r, val));
+            r
         } else {
             val.to_string()
         }
@@ -118,6 +137,10 @@ impl Codegen {
         if Self::is_ptr_ty(ty) {
             let r = self.fresh_reg();
             self.emit(&format!("  {} = inttoptr i64 {} to ptr", r, val));
+            r
+        } else if *ty == Type::Float64 {
+            let r = self.fresh_reg();
+            self.emit(&format!("  {} = bitcast i64 {} to double", r, val));
             r
         } else {
             val.to_string()
@@ -334,7 +357,12 @@ impl Codegen {
         self.emit("declare i64  @ionic_str_contains(ptr, ptr)");
         self.emit("declare i64  @ionic_str_starts_with(ptr, ptr)");
         self.emit("declare i64  @ionic_str_ends_with(ptr, ptr)");
-        self.emit("declare ptr  @ionic_format(ptr)");
+        // ionic_format takes the format string plus up to seven variadic string
+        // arguments. The declaration has to spell them out: with `(ptr)` alone,
+        // LLVM lets the extra arguments through but the call is to a symbol the
+        // runtime defines with a different prototype, and `format` had no arm in
+        // emit_call at all, so programs using it referenced a bare `@format`.
+        self.emit("declare ptr  @ionic_format(ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr)");
         self.emit("declare i64  @ionic_str_to_int64(ptr)");
         self.emit("declare i64  @ionic_str_hash(ptr)");
         self.emit("declare i64  @ionic_target_is_linux()");
@@ -1235,6 +1263,20 @@ impl Codegen {
                 self.emit(&format!("  call void @ionic_model_free(ptr {})", v));
                 ("0".to_string(), Type::Void)
             }
+            // model_forward(model, tensor) -> tensor. Without this arm the call
+            // fell through to the user-function path, which defaults an unknown
+            // callee to `i64` and emits `@model_forward` — a symbol nothing
+            // defines, typed as an integer where the binding expects a pointer.
+            // Both the link and the LLVM type check failed, so any program doing
+            // placement work (every one of them loads a model first) could not
+            // be built by this backend.
+            "model_forward" => {
+                let (mdl, _) = &args[0];
+                let (t, _)   = &args[1];
+                let r = self.fresh_reg();
+                self.emit(&format!("  {} = call ptr @ionic_model_forward(ptr {}, ptr {})", r, mdl, t));
+                (r, Type::Tensor(Box::new(HwTarget::Cpu)))
+            }
             "piper_forward" => {
                 let (mdl, _) = &args[0];
                 let (ph, _)  = &args[1];
@@ -1463,6 +1505,36 @@ impl Codegen {
                 let r = self.fresh_reg();
                 self.emit(&format!("  {} = call i64 @ionic_str_contains(ptr {}, ptr {})", r, s, sub));
                 (r, Type::Int64)
+            }
+            // format(fmt, ...) -> string. The runtime takes seven variadic string
+            // pointers after the format; this arm fills them positionally.
+            //
+            // Without it the call fell through to the generic user-function path
+            // and emitted `@format`, which nothing defines — so every program
+            // using format (including the README's front-page fib example)
+            // failed to link on this backend. The native backend maps the name
+            // to ionic_format, which is why the gap was invisible there.
+            "format" => {
+                let (fmt, _) = &args[0];
+                // Each slot must carry its own type in the IR (`ptr %r7`), not
+                // just the value name: LLVM arguments are typed individually.
+                let mut slots: Vec<String> = Vec::with_capacity(7);
+                for (v, t) in args.iter().skip(1) {
+                    if *t != Type::Str {
+                        // A non-string argument would be a checker error upstream;
+                        // passing null keeps the declaration well-typed rather
+                        // than putting an i64 where a ptr belongs.
+                        slots.push("ptr null".to_string());
+                    } else {
+                        slots.push(format!("ptr {}", v));
+                    }
+                }
+                while slots.len() < 7 { slots.push("ptr null".to_string()); }
+                let r = self.fresh_reg();
+                self.emit(&format!(
+                    "  {} = call ptr @ionic_format(ptr {}, {})",
+                    r, fmt, slots.join(", ")));
+                (r, Type::Str)
             }
             "str_starts_with" => {
                 let (s, _) = &args[0];

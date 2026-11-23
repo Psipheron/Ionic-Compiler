@@ -3,13 +3,16 @@
 // Run:
 //   ./ionic_new examples/mastery/00_discrepancies.ionic -o /tmp/d && /tmp/d
 //
-// You will see:
-//   1. mean_f([1,2,3,4]) = 3   (WRONG; a correct mean is 2.5) — the std.data
-//      off-by-one, because those helpers assume 1-based arrays while Ionic
-//      arrays are 0-based. Still open.
-//   2. println(names[0]) prints "alice". This one used to be a discrepancy and
-//      is now FIXED: dispatch asks the codegen type oracle (ncg_ty_of) instead
-//      of guessing from the shape of the AST node.
+// This file used to reproduce two live bugs. Both are now fixed, so it is a
+// regression reference: the output below is the *correct* output.
+//
+//   1. mean_f([1,2,3,4]) = 2.5. It printed 3 until the std.data helpers were
+//      rewritten to be 0-based; they assumed 1-based arrays, so every stat
+//      silently dropped the first element while still returning a plausible
+//      number.
+//   2. println(names[0]) prints "alice". It printed the element's pointer as an
+//      integer until dispatch asked the codegen type oracle (ncg_ty_of)
+//      instead of guessing from the shape of the AST node.
 //
 // (Discrepancy 3 — CLI/`--run` — is about the tooling, not output. Discrepancy
 //  4 — print vs println — is shown in 01_print_variants.ionic.)
@@ -20,7 +23,7 @@ mut names = ["alice", "bob"];
 
 let a = [1.0, 2.0, 3.0, 4.0];
 println(str_concat("mean_f([1,2,3,4]) = ", float64_to_str(mean_f(a))));
-println("   (correct answer is 2.5; std.data drops index 0)");
+println("   (correct answer is 2.5; this printed 3 before std.data was fixed)");
 
 // Discrepancy 2, formerly a bug: this printed the element's pointer as an
 // integer. It now prints the string. See examples/mastery/02_string_array_print.ionic

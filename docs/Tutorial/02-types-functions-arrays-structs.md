@@ -1,7 +1,8 @@
 # 02 — Types, Functions, Arrays, Structs
 
 **Goal:** understand how Ionic infers and checks types, how arrays really behave
-(including a real bug in the stdlib), and how structs and methods work.
+(including an off-by-one that shipped in the stdlib), and how structs and
+methods work.
 
 ---
 
@@ -72,31 +73,36 @@ println(str_concat("a[2] = ", int64_to_str(a[2])));    // 30
 
 Reference: `examples/mastery/02_arrays.ionic`.
 
-### 3.1 The `lib/std/data.ionic` off-by-one (a real bug)
+### 3.1 The `lib/std/data.ionic` off-by-one (found, and fixed)
 
-Several helpers in `lib/std/data.ionic` assume **1-based** arrays:
+Several helpers in `lib/std/data.ionic` used to assume **1-based** arrays:
 
 ```ionic
 fn mean_f([float64] a) -> float64 {
-    let n = len(a) - 1;     // they treat len as "last index"
+    let n = len(a) - 1;     // they treated len as "last index"
     ...
-    mut i = 1;              // and start at 1, skipping index 0
+    mut i = 1;              // and started at 1, skipping index 0
     while (i < n + 1) { total = total + a[i]; i = i + 1; }
     return total / int64_to_float64(n);
 }
 ```
 
-Given `[1.0, 2.0, 3.0, 4.0]`, `mean_f` returns **3.0** (mean of 2,3,4), not 2.5.
-It silently drops the first element. `min_f`, `max_f`, `stdev_f`, and
-`to_csv_line` share the assumption. Reproduce it:
+Given `[1.0, 2.0, 3.0, 4.0]`, that returned **3.0** (the mean of 2,3,4), not 2.5 —
+silently dropping the first element. `min_f`, `max_f`, `stdev_f` and
+`to_csv_line` shared the assumption.
+
+They were rewritten to be 0-based in the 0.3.0 cycle. The lesson survives the
+fix, and it is the reason the file now carries a comment about it: the result was
+still a plausible number, so nothing failed — no type error, no crash, no
+warning. Only an assertion on an exact value catches it.
 
 ```sh
 ./ionic_new examples/mastery/02_data_bug.ionic -o /tmp/db && /tmp/db
 ```
 
-`mean_f([1,2,3,4])` prints `3` while a correct mean is `2.5`. This is exercise
-09.2's first task — decide whether the fix is the library or the array
-convention.
+prints `mean = 2.5`, `min = 1`, `max = 4`, `csv = 1,2,3,4`. The file is kept as
+the regression reference, and exercise 09.2 asks you to verify it rather than
+re-fix it.
 
 ### 3.2 Printing a string that is not a literal (was broken, now fixed)
 
@@ -174,9 +180,11 @@ inferred type of `x` and `y` and the op the checker rewrote. Verify with output.
 `a[2]`. Then trigger the bounds check and record the exact runtime message.
 Reference: `examples/mastery/02_arrays.ionic`.
 
-**02.3 — Reproduce the data bug.** Compile `examples/mastery/02_data_bug.ionic`
-and show that `mean_f` returns `3` for `[1,2,3,4]`. Predict what `max_f`
-returns and verify.
+**02.3 — Verify the data fix.** Compile `examples/mastery/02_data_bug.ionic`;
+it must print `mean = 2.5`, `min = 1`, `max = 4`, `csv = 1,2,3,4`. The bug it
+used to demonstrate was a silent wrong answer, so predict what those four lines
+*would* say under the old 1-based indexing and check your prediction against the
+prose in §3.1.
 
 **02.4 — Struct mutation.** Create a struct under a `let` binding and mutate a
 field. Explain why this is legal.
@@ -193,7 +201,8 @@ question. Reference: `examples/mastery/02_string_array_print.ionic`.
 ## Checkpoint 02
 
 - [ ] You can describe propagation-based inference in three sentences.
-- [ ] You know arrays are 0-indexed *and* that `data.ionic` assumes 1-based.
+- [ ] You know arrays are 0-indexed, and why the `data.ionic` helpers returning
+      plausible-but-wrong numbers was harder to catch than a crash.
 - [ ] You can explain the difference between `.len` and `len()`.
 - [ ] You can name the two places string-ness used to be lost at codegen (array
       element loads, and parameters) and say what fixed them.

@@ -18,7 +18,9 @@ Bundled under `lib/std/`:
 - `std.io` — `readline`, `readline_n`, `eprint`, `eprintln`, `print_hr`.
 - `std.data` — `lower`, `upper`, `clean`, `normalize_ws`, `split_char`,
   `split_csv`, `parse_csv`, `mean_f`, `stdev_f`, `min_f`, `max_f`, `to_csv_line`.
-  ⚠️ the `*_f` stats and `to_csv_line` assume 1-based arrays — see unit 02 §3.1.
+  The `*_f` stats and `to_csv_line` are 0-based, matching the language. They
+  used to assume 1-based arrays and silently dropped the first element — see
+  unit 02 §3.1 for why that was hard to notice.
 - `std.text` — `tokenize`, `words`, `count_substr`, `replace_all`, `join`.
 - `std.http` — `get`, `post`, `status`, `body`, `urlencode` (raw-socket HTTP/1.1).
 

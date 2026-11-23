@@ -85,13 +85,15 @@ Stage B — Compiler owner (mastery)
 These are documented *because* they are the kind of detail only a builder knows.
 Confirm each with the compiler, not the prose.
 
-1. **Array indexing is 0-based and bounds-checked at runtime.** `a[0]` is the
-   first element; `a[len(a)]` aborts with `ionic: index out of bounds`. But the
-   bundled `lib/std/data.ionic` (`mean_f`, `min_f`, `max_f`, `stdev_f`,
-   `to_csv_line`) treats index 1 as the first element and skips index 0. On a
-   direct array built as `[1.0, 2.0, 3.0, 4.0]` this silently drops the first
-   element (`mean_f` returns `3.0`, not `2.5`). This is a real bug — see the
-   capstone.
+1. **~~`lib/std/data.ionic` treats arrays as 1-based~~ — fixed.** `mean_f`,
+   `min_f`, `max_f`, `stdev_f` and `to_csv_line` used index 1 as the first
+   element and `len(a) - 1` as the count, so on a plain array they silently
+   dropped the first element (`mean_f([1.0,2.0,3.0,4.0])` returned `3.0`, not
+   `2.5`). They are 0-based now and agree with the language. `parse_csv` was not
+   affected — it starts at 1 because `split_char` seeds an empty slot 0.
+
+   The array indexing *rule* is unchanged and still worth knowing: `a[0]` is the
+   first element and `a[len(a)]` aborts with `ionic: index out of bounds`.
 2. **~~`println(arr[i])` prints a pointer~~ — fixed.** This used to print the
    element's pointer as an integer for `[string]` arrays, and likewise for a
    string *parameter* (`fn show(string s) { println(s); }`). Both were symptoms

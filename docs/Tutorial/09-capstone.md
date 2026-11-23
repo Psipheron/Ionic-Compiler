@@ -21,7 +21,8 @@ Touch points, in order:
    `register_builtins()` (`src/semantic/checker.ionic:~638`).
 2. **Codegen** — map the Ionic name to a C symbol in the call-lowering switch
    (`src/codegen/native.ionic`, the `real_callee = "ionic_…"` remaps), and add it
-   to any string-returning type lists so `ncg_last_ty` is set.
+   to the string-returning builtin list the type oracle (`ncg_sty_of` /
+   `ncg_ty_of`) consults, so `print`/`println` dispatch picks the string variant.
 3. **Runtime** — implement `char *ionic_str_repeat_char(int64_t code, int64_t n);`
    in `src/ionic_model_runtime.c`.
 4. **Example + smoke test** — add a program under `examples/` that exercises it.
@@ -31,21 +32,25 @@ expected output; the compiler emits no new warnings.
 
 ---
 
-## Task 09.2 — Fix the `lib/std/data.ionic` off-by-one
+## Task 09.2 — ~~Fix the `lib/std/data.ionic` off-by-one~~ (done — verify it)
 
-The stats helpers assume 1-based arrays; Ionic arrays are 0-based (unit 02 §3.1).
+The stats helpers used to assume 1-based arrays while Ionic arrays are 0-based
+(unit 02 §3.1). They were rewritten to 0-based in the 0.3.0 cycle, so
+`mean_f([1.0,2.0,3.0,4.0])` now returns `2.5`, `max_f` → `4.0`, `min_f` → `1.0`.
 
-1. Decide the **contract**: the fix is either (a) rewrite the helpers to be
-   0-based, or (b) keep the helpers and document a 1-based "statistics array"
-   convention. Justify your choice in one paragraph.
-2. Implement it. `mean_f([1.0,2.0,3.0,4.0])` must return `2.5`; `max_f` → `4.0`;
-   `min_f` → `1.0`; `stdev_f` must be correct.
-3. Check `to_csv_line` and the `min_f`/`max_f` names — note these collide with
-   `std.math.min_f`/`max_f` (a real naming hazard). Consider whether importing
-   both modules is even legal.
+The exercise is now to **verify rather than implement**, which is the more
+useful habit anyway:
 
-**Grade:** a new example asserts the four numeric results; the compiler still
-self-hosts; `docs/stdlib.md` is updated to match.
+1. Read `lib/std/data.ionic` and confirm each of the five functions indexes from
+   0 and counts `len(a)`. Write a program asserting the four numeric results; it
+   must print exactly those values, not "close enough".
+2. Find the one function in that file that *legitimately* starts at index 1 and
+   explain why (`parse_csv` — `split_char` seeds an empty slot 0).
+3. Note that `data.ionic`'s `min_f`/`max_f` collide with `std.math`'s
+   `min_f`/`max_f`, which is a real naming hazard. Import both and see what
+   happens.
+
+**Grade:** your assertions pass on both backends; the compiler still self-hosts.
 
 ---
 

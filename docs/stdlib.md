@@ -177,6 +177,65 @@ Prints a horizontal rule of `width` dashes to stdout.
 
 ---
 
+## `std.data`
+
+Text cleaning, CSV parsing, and descriptive statistics over `[float64]`.
+
+```ionic
+import std.data.*;
+```
+
+#### Text
+
+| Function | Description |
+|----------|-------------|
+| `trim(string s) -> string` | Strip leading/trailing ASCII spaces |
+| `lower(string s) -> string` | Lowercase ASCII letters |
+| `upper(string s) -> string` | Uppercase ASCII letters |
+| `clean(string s) -> string` | Drop everything but alphanumerics and spaces |
+| `normalize_ws(string s) -> string` | Collapse whitespace runs to one space, trim ends |
+
+#### CSV
+
+| Function | Description |
+|----------|-------------|
+| `split_char(string s, int64 delim) -> [string]` | Split on one byte (e.g. `10` for `\n`) |
+| `split_csv(string s) -> [string]` | Split one line on commas, honouring `"` quotes |
+| `parse_csv(string csv) -> [[string]]` | Whole document to a table; blank lines dropped |
+
+Every splitting helper in this file follows the same convention: **slot 0 of the
+result is unused**, because the arrays are built by pushing onto a seed element.
+`parse_csv` starts its row loop at index 1 for exactly that reason.
+
+#### Statistics
+
+| Function | Description |
+|----------|-------------|
+| `mean_f([float64] a) -> float64` | Arithmetic mean; `0.0` when empty |
+| `stdev_f([float64] a) -> float64` | Population standard deviation; `0.0` when `len < 2` |
+| `min_f([float64] a) -> float64` | Smallest element; `0.0` when empty |
+| `max_f([float64] a) -> float64` | Largest element; `0.0` when empty |
+| `to_csv_line([float64] a) -> string` | Comma-separated values, no trailing comma |
+
+These are **0-based**, like every other array operation in the language. They
+were not, once: the first version indexed from 1 and treated `len(a) - 1` as the
+count, so on a plain array every result silently dropped the first element
+(`mean_f([1.0,2.0,3.0,4.0])` returned `3.0` instead of `2.5`). Nothing failed —
+no type error, no warning — which is why it survived. If you are porting code
+from an older checkout, assert one exact value rather than eyeballing output.
+
+```ionic
+let a = [1.0, 2.0, 3.0, 4.0];
+println(float64_to_str(mean_f(a)));    // 2.5
+println(to_csv_line(a));               // 1,2,3,4
+```
+
+> **Naming hazard:** `std.data` and `std.math` both export `min_f` and `max_f`,
+> with different signatures (`[float64]` vs two scalars). Two wildcard imports
+> therefore shadow one with the other; prefer named imports.
+
+---
+
 ## Terminal TUI framework (`lepton`)
 
 The alternate-screen TUI framework is no longer part of the stdlib. It lives in
