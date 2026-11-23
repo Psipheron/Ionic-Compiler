@@ -1,18 +1,24 @@
 class Ionic < Formula
   desc "Statically-typed compiled language for data science and AI workloads"
   homepage "https://github.com/Psipheron/Ionic-Compiler"
-  version "v0.2.1"
+  version "v0.3.1"
   license "MIT"
 
-  on_arm do
-    url "https://github.com/Psipheron/Ionic-Compiler/releases/download/#{version}/ionic-#{version}-aarch64-apple-darwin.tar.gz"
-    sha256 "PLACEHOLDER_ARM64_SHA256"
-  end
+  # One architecture. The release workflow builds exactly
+  # `ionic-<version>-aarch64-apple-darwin.tar.gz` and nothing else, so an
+  # `on_intel` branch here could only ever point at a URL that is never
+  # produced — with a literal `PLACEHOLDER_X86_SHA256` for a checksum. That made
+  # `brew install` on an Intel Mac a 404 instead of an honest "not supported",
+  # and the arm64 placeholder meant the arm64 branch could not install either.
+  #
+  # This is the reference copy; the live formula is in the tap repository and is
+  # rewritten there on every stable release. Keep the two shapes identical or
+  # the tap's rewrite step will not apply.
+  depends_on arch: :arm64
+  depends_on macos: :sonoma
 
-  on_intel do
-    url "https://github.com/Psipheron/Ionic-Compiler/releases/download/#{version}/ionic-#{version}-x86_64-apple-darwin.tar.gz"
-    sha256 "PLACEHOLDER_X86_SHA256"
-  end
+  url "https://github.com/Psipheron/Ionic-Compiler/releases/download/#{version}/ionic-#{version}-aarch64-apple-darwin.tar.gz"
+  sha256 "cdf3e95783a669e1da4970d6dcb106e0d9204a7b61ae4c583729a743b24a785d"
 
   def install
     # The self-hosted `ionic` locates its bundled standard library and C

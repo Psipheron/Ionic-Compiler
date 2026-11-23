@@ -1,9 +1,36 @@
 name: Update formula
 
-# Triggered by the main ionic repo's release workflow via repository_dispatch
+# Triggered by the Ionic-Compiler release workflow via repository_dispatch.
+#
+# IMPORTANT: this file must live at `.github/workflows/update-formula.yml`.
+# GitHub only registers workflows under a leading-dot `.github/` directory; an
+# older copy sat at `workflows/update-formula.yml` (no dot) and was therefore
+# never loaded, so dispatches were accepted and silently did nothing.
+#
+# What this rewrites
+# ------------------
+# The version is pinned in a literal release URL, because that is what Homebrew
+# resolves and what the main repo's release job polls for. The formula once had
+# no `version` line at all, so an updater that rewrote `version "vX.Y.Z"`
+# matched nothing.
+#
+# The rewrite is URL-driven rather than line-driven: it finds the release URL,
+# builds the new one from it, and replaces it together with its sha256. That
+# works for both a literal and an interpolated URL, and it is idempotent —
+# running it twice for the same version changes nothing.
+#
+# Fails loudly
+# ------------
+# If the formula cannot be rewritten, this workflow exits non-zero. The main
+# repo's release job polls the formula afterwards and also fails, so a tap that
+# did not move can never look like a success.
+
 on:
   repository_dispatch:
     types: [new-release]
+
+permissions:
+  contents: write
 
 jobs:
   update:
@@ -14,45 +41,101 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Rewrite formula version and checksums
+      - name: Validate dispatch payload
+        env:
+          VERSION: ${{ github.event.client_payload.version }}
+          SHA_ARM: ${{ github.event.client_payload.sha256_arm }}
         run: |
-          python3 - \
-            "${{ github.event.client_payload.version }}" \
-            "${{ github.event.client_payload.sha256_arm }}" \
-            "${{ github.event.client_payload.sha256_x86 }}" \
-            << 'PYEOF'
-          import sys, re, pathlib
+          if [ -z "$VERSION" ] || [ -z "$SHA_ARM" ]; then
+            echo "Dispatch is missing version or sha256_arm." >&2
+            echo "version='$VERSION' sha256_arm='$SHA_ARM'" >&2
+            exit 1
+          fi
+          case "$VERSION" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "Refusing to publish non-version tag '$VERSION'." >&2; exit 1 ;;
+          esac
+          case "$SHA_ARM" in
+            [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]*) ;;
+            *) echo "sha256_arm does not look like a sha256: '$SHA_ARM'" >&2; exit 1 ;;
+          esac
+          # A prerelease must never move the stable formula.
+          case "$VERSION" in
+            *-*) echo "Refusing to point the stable formula at prerelease '$VERSION'." >&2; exit 1 ;;
+          esac
 
-          version, sha_arm, sha_x86 = sys.argv[1], sys.argv[2], sys.argv[3]
-          f   = pathlib.Path("Formula/ionic.rb")
-          src = f.read_text()
+      - name: Rewrite formula to the dispatched version
+        env:
+          VERSION: ${{ github.event.client_payload.version }}
+          SHA_ARM: ${{ github.event.client_payload.sha256_arm }}
+        run: |
+          python3 - <<'PYEOF'
+          import os, re, pathlib, sys
 
-          # Update version line
-          src = re.sub(r'version "v[\d.]+"', f'version "{version}"', src)
+          version = os.environ["VERSION"]
+          sha_arm = os.environ["SHA_ARM"]
+          path    = pathlib.Path("Formula/ionic.rb")
+          src     = path.read_text()
 
-          # Update URL templates (they embed #{version} so they self-update)
-          # Update sha256 inside on_arm block
-          src = re.sub(
-              r'(?s)(on_arm\b.*?sha256 ")[0-9a-fA-F]+"',
-              lambda m: m.group(0)[:m.group(0).rfind('"', 0, -1) + 1] + sha_arm + '"',
+          url_re = re.compile(r'https://[^"\s]+/releases/download/[^"\s]+')
+          m = url_re.search(src)
+          if not m:
+              sys.exit("no GitHub release URL found in Formula/ionic.rb")
+
+          old_url = m.group(0)
+
+          # Two shapes occur: a literal pinned version
+          #   .../download/v0.2.1/ionic-v0.2.1-aarch64-apple-darwin.tar.gz
+          # and an interpolated one
+          #   .../download/#{version}/ionic-...-aarch64-apple-darwin.tar.gz
+          # Both become a *literal* version, which is what Homebrew resolves and
+          # what the release job polls for.
+          new_url = re.sub(r'/releases/download/[^/]+/',
+                           f'/releases/download/{version}/', old_url)
+          new_url = re.sub(r'/ionic-[^/]+-aarch64-apple-darwin\.tar\.gz$',
+                           f'/ionic-{version}-aarch64-apple-darwin.tar.gz', new_url)
+          if version not in new_url or "#{" in new_url:
+              sys.exit(f"could not build a literal URL for {version} from {old_url}")
+
+          src = src.replace(old_url, new_url)
+
+          # Replace the sha256 that follows the URL, whatever its current value.
+          src, n = re.subn(
+              r'(url\s+"[^"]+"\s*\n\s*sha256\s+")[0-9a-fA-F]+(")',
+              lambda mm: mm.group(1) + sha_arm + mm.group(2),
               src,
+              count=1,
           )
-          # Update sha256 inside on_intel block
-          src = re.sub(
-              r'(?s)(on_intel\b.*?sha256 ")[0-9a-fA-F]+"',
-              lambda m: m.group(0)[:m.group(0).rfind('"', 0, -1) + 1] + sha_x86 + '"',
-              src,
-          )
+          if n == 0:
+              sys.exit("no sha256 line found after the release URL")
 
-          f.write_text(src)
-          print(f"Updated formula to {version}")
+          # Keep a `version` line in sync if the formula has one. It is optional:
+          # Homebrew can read the version from the URL.
+          if re.search(r'^\s*version\s+"', src, re.M):
+              src = re.sub(r'^(\s*version\s+")[^"]+(")',
+                           lambda mm: mm.group(1) + version + mm.group(2),
+                           src, count=1, flags=re.M)
+
+          path.write_text(src)
+          print(f"Rewrote formula to {version}")
+          print(f"  url: {new_url}")
+          print(f"  sha256: {sha_arm}")
           PYEOF
+
+          # Prove it, rather than assuming the regex landed.
+          grep -q "releases/download/${VERSION}/" Formula/ionic.rb \
+            || { echo "formula does not reference ${VERSION} after rewrite" >&2; exit 1; }
+          grep -q "${SHA_ARM}" Formula/ionic.rb \
+            || { echo "formula does not carry the new sha256" >&2; exit 1; }
 
       - name: Commit and push
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Formula/ionic.rb
-          git diff --staged --quiet && echo "No changes" && exit 0
+          if git diff --staged --quiet; then
+            echo "Formula already at ${{ github.event.client_payload.version }}"
+            exit 0
+          fi
           git commit -m "ionic ${{ github.event.client_payload.version }}"
           git push

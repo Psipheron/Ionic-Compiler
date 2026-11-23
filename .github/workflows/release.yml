@@ -52,6 +52,47 @@ jobs:
           CLI_REQUIRE_TAG: "1"
         run: ./scripts/cli_check.sh
 
+      # ── The gates that decide whether this tag ships ──────────────────────
+      #
+      # These live in ci.yml and nowhere else, and ci.yml triggers on pushes to
+      # `main` and on pull requests. A tag push matches neither, and a release
+      # can legitimately be cut from a maintenance branch — v0.3.1 was, from
+      # release/0.3 — so a tag can reach this job having run none of them. That
+      # is not hypothetical: v0.3.1 shipped with zero gates executed, and
+      # v0.3.0 shipped a stdlib that returned wrong answers for every statistic.
+      #
+      # The fix is not "remember to merge to main first". A release job that
+      # assumes something outside itself ran is a release job that can ship
+      # anything. So the gates run here, against the exact tree being packaged.
+      #
+      # Ordering: cheapest and most fundamental first, so an obvious break
+      # fails in seconds rather than after the RSS benchmarks.
+      #
+      # These are the *native* gates only. `ionic_new` is what the tarball
+      # ships; the Rust bootstrap is a separate cross-OS path with its own
+      # coverage in ci.yml, and testing it here would mean installing a
+      # toolchain this job otherwise does not need.
+      - name: Gate — producer ownership contract (RC)
+        run: ./scripts/rc_check.sh
+
+      - name: Gate — array RC aliasing and escapes
+        run: ./scripts/arr_rc_check.sh
+
+      - name: Gate — runtime conformance (I/O, print, struct globals, stdlib)
+        run: ./scripts/io_check.sh
+
+      - name: Gate — CLI surface
+        run: ./scripts/cli_check.sh
+
+      - name: Gate — model RAII
+        run: ./scripts/model_raii_check.sh
+
+      - name: Gate — hardware placement
+        run: ./scripts/placement_check.sh
+
+      - name: Gate — RSS regression
+        run: ./scripts/rss_check.sh
+
       - name: Package tarball
         run: |
           VERSION="${{ github.ref_name }}"
@@ -84,6 +125,63 @@ jobs:
         with:
           name: tarball-aarch64-apple-darwin
           path: "*.tar.gz"
+
+      # ── Test the artifact, not the source tree ─────────────────────────────
+      #
+      # Every gate above runs `ionic_new` out of the repo, where lib/ and
+      # src/ionic_model_runtime.c sit in their usual places. A tarball can
+      # still be wrong: the packaging step assembles a different directory
+      # layout, and the installed compiler finds the standard library and
+      # runtime by resolving its *own path* ($IONIC_ROOT). A release whose
+      # tarball omitted lib/, or put it one level off, would pass every gate
+      # and fail for every user.
+      #
+      # This is also the specific check that was missing when v0.3.0 shipped a
+      # stdlib whose statistics dropped the first element: the sources were
+      # fixed after the tag was cut, and nothing ever ran the packaged binary
+      # against a stdlib call. Extracting to /tmp and compiling from `/` means
+      # no repo-relative fallback can rescue it.
+      - name: Smoke test — the packaged tarball compiles and runs standalone
+        run: |
+          set -e
+          rm -rf /tmp/relcheck && mkdir -p /tmp/relcheck
+          tar -xzf "${{ env.TARBALL }}" -C /tmp/relcheck
+          ROOT="/tmp/relcheck/$(basename "${{ env.TARBALL }}" .tar.gz)"
+
+          # The shipped binary must report the version its tag advertises.
+          GOT="$("$ROOT/ionic" --version)"
+          WANT="${VERSION#v}"
+          if [ "$GOT" != "$WANT" ]; then
+            echo "packaged binary reports '$GOT', tag is '$WANT'"
+            exit 1
+          fi
+
+          # Exercise the bundled standard library from an unrelated CWD. The
+          # expected values are the ones the stdlib contract promises, so this
+          # fails if the tarball's lib/ is stale, missing, or not found.
+          cat > /tmp/relcheck/probe.ionic <<'EOF'
+          import std.array.*;
+          import std.data.*;
+          import std.text.*;
+          fn main() -> int64 {
+              let a = [1.0, 2.0, 3.0, 4.0];
+              println(str_concat("mean=", float64_to_str(mean_f(a))));
+              println(str_concat("csv=", to_csv_line(a)));
+              let n = [10, 20, 30];
+              println(str_concat("revlen=", int64_to_str(len(arr_reverse(n)))));
+              let s = ["a", "b", "c"];
+              println(str_concat("join=", join(s, ",")));
+              return 0;
+          }
+          EOF
+
+          ( cd / && "$ROOT/ionic" /tmp/relcheck/probe.ionic -o /tmp/relcheck/probe )
+          OUT="$(/tmp/relcheck/probe)"
+          echo "$OUT"
+          printf '%s\n' "$OUT" | grep -qx "mean=2.5"    || (echo "stdlib mean wrong in tarball"; exit 1)
+          printf '%s\n' "$OUT" | grep -qx "csv=1,2,3,4" || (echo "stdlib csv wrong in tarball"; exit 1)
+          printf '%s\n' "$OUT" | grep -qx "revlen=3"    || (echo "arr_reverse wrong in tarball"; exit 1)
+          printf '%s\n' "$OUT" | grep -qx "join=a,b,c"  || (echo "join wrong in tarball"; exit 1)
 
       - name: Save checksum
         run: |
@@ -155,17 +253,35 @@ jobs:
     # the two jobs are ever split across workflows.
     if: ${{ !contains(github.ref_name, '-') }}
 
-    # Dispatches a `new-release` event to ByteTheBait/homebrew-ionic, where
-    # an update-formula.yml workflow at `.github/workflows/update-formula.yml`
-    # rewrites Formula/ionic.rb with the new version + SHA256.
-    # IMPORTANT: GitHub requires the receiving workflow file to live under
-    # `.github/workflows/` *and* to be on the default branch at dispatch
-    # time. Older releases of this tap had `workflows/update-formula.yml`
-    # (no leading dot) which GitHub Actions ignored. After pasting the file
-    # at `.github/workflows/update-formula.yml` (PAT or GitHub.com UI — the
-    # `workflow` OAuth scope is required to write to that path), the tap
-    # updates automatically on every tagged release.
-
+    # Dispatches a `new-release` event to the homebrew tap, where
+    # `.github/workflows/update-formula.yml` rewrites Formula/ionic.rb with the
+    # new version + SHA256.
+    #
+    # This step used to report success while doing nothing. Three independent
+    # things were wrong, and because `curl` exits 0 on an HTTP error the job
+    # stayed green through all of them:
+    #
+    #   1. The response was `401 Bad credentials` — TAP_TOKEN was missing or
+    #      expired — and nothing checked the status.
+    #   2. The receiving workflow lived at `workflows/update-formula.yml`, with
+    #      no leading dot, so GitHub never registered it. A successful dispatch
+    #      would still have updated nothing.
+    #   3. The tap formula had no `version` line, and pinned the version inside
+    #      a literal release URL, so the updater's `version "vX.Y.Z"` rewrite
+    #      matched nothing even when it did run.
+    #
+    # The result was that `brew install` served v0.2.1 through four later
+    # releases. So this step now: uses `gh api`, which fails the step on a
+    # non-2xx response; verifies the dispatch was accepted rather than trusting
+    # curl's exit code; and then *reads the formula back* and fails unless it
+    # actually names this version. The last part is the only one that proves the
+    # tap moved, because 2 and 3 fail silently downstream of a valid dispatch.
+    #
+    # NOTE: fixing 2 and 3 is a change in the *tap* repository, not here — the
+    # workflow file must be moved to `.github/workflows/` there. The read-back
+    # below is what makes that requirement visible instead of silent: until it
+    # is done, this job fails loudly, which is the correct behaviour for "the
+    # thing we claim to update did not update".
     steps:
       - name: Download checksums
         uses: actions/download-artifact@v4
@@ -179,17 +295,50 @@ jobs:
 
       - name: Trigger tap update
         env:
-          TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
+          # `gh api` reads GH_TOKEN. TAP_TOKEN must carry the `workflow` scope
+          # (a plain repo-scoped PAT cannot write under .github/workflows/).
+          GH_TOKEN: ${{ secrets.TAP_TOKEN }}
         run: |
           VERSION="${{ github.ref_name }}"
-          curl -X POST \
-            -H "Authorization: token $TAP_TOKEN" \
-            -H "Accept: application/vnd.github.v3+json" \
-            https://api.github.com/repos/${{ github.repository_owner }}/homebrew-ionic/dispatches \
-            -d "{
-              \"event_type\": \"new-release\",
-              \"client_payload\": {
-                \"version\": \"$VERSION\",
-                \"sha256_arm\": \"${{ env.SHA256_ARM }}\"
-              }
-            }"
+
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "TAP_TOKEN is not set; the tap cannot be updated." >&2
+            exit 1
+          fi
+
+          # `gh api` exits non-zero on a non-2xx response, which `curl` did not.
+          gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            "repos/${{ github.repository_owner }}/homebrew-ionic/dispatches" \
+            -f event_type=new-release \
+            -f client_payload[version]="$VERSION" \
+            -f client_payload[sha256_arm]="${{ env.SHA256_ARM }}"
+
+          echo "Dispatch accepted for $VERSION."
+
+      # A 204 from the dispatches endpoint means "event queued", not "formula
+      # rewritten" — the receiving workflow runs asynchronously. Poll the formula
+      # until it names the new version, so a job that reports success has
+      # evidence the tap actually moved.
+      - name: Verify the formula now names this version
+        env:
+          GH_TOKEN: ${{ secrets.TAP_TOKEN }}
+        run: |
+          VERSION="${{ github.ref_name }}"
+          DEADLINE=$(( $(date +%s) + 180 ))
+          while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+            FORMULA=$(gh api "repos/${{ github.repository_owner }}/homebrew-ionic/contents/Formula/ionic.rb" \
+                        --jq '.content' 2>/dev/null | base64 -d 2>/dev/null || true)
+            if printf '%s' "$FORMULA" | grep -q "releases/download/${VERSION}/"; then
+              echo "Tap formula now points at ${VERSION}."
+              exit 0
+            fi
+            sleep 10
+          done
+
+          echo "Tap formula does not reference ${VERSION} after 3 minutes." >&2
+          echo "The dispatch was accepted, so the receiving workflow either is not" >&2
+          echo "registered (.github/workflows/update-formula.yml in the tap) or" >&2
+          echo "cannot rewrite the formula." >&2
+          exit 1
