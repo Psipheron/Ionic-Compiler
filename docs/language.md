@@ -388,20 +388,30 @@ lines and fatal at ten thousand: this pattern in the compiler's own import
 expander made it peak at 798 MB on a 328 KB input.
 
 `str_join` copies each piece exactly once. Collect the pieces in a `[string]`
-and join them in one call:
+and join them in one call from index 0:
 
 ```ionic
-mut parts: [string] = [""];        // slot 0 unused, as with every Ionic array
+mut parts: [string] = [""];
+arr_reset(parts);                  // now genuinely empty
 for (line in lines) { push(parts, line); }
-let s = str_join(parts, 1, len(parts) - 1, "\n");
+let s = str_join(parts, 0, len(parts), "\n");
 ```
+
+`[""]` is a **one-element** array holding an empty string, not an empty array —
+`len([""])` is 1, exactly as `len([0])` is 1. So the seed has to be cleared with
+`arr_reset` before pushing, and the join starts at 0. Leaving the seed in and
+starting at 1 does *not* work here: `str_join` emits the separator after every
+element, so the leading empty string produces a leading `\n` and the result
+begins with a blank line. Believing `[0]` (or `[""]`) is empty is exactly what
+produced the off-by-one bugs in the bundled stdlib.
 
 The separator goes **after every element, including the last** — it is a
 terminator, not a separator — so the example above ends with a trailing `\n`,
 matching `line + "\n"` per piece. `first` is a 0-based index into the array and
 `count` is clamped to the end, so `str_join(a, 0, len(a), ",")` joins everything.
 `std.text`'s `join(parts, sep)` is the separator-*between* form built on
-`str_concat`; it is fine for a handful of pieces and quadratic for many.
+`str_concat`; it indexes from 0 too, and is fine for a handful of pieces but
+quadratic for many.
 
 #### Memory: what the compiler reclaims, and what it does not
 
@@ -712,8 +722,8 @@ ionic <file.ionic> [more.ionic ...] -o <output> [--target <triple>] [--print-lin
 ```
 
 `-h` and `-V` are aliases for `--help` and `--version`. Both exit 0, and
-`--version` prints the bare number (`0.3.0`) so that
-`ionic --version | cut -d' ' -f2`-style probes still work.
+`--version` prints the bare number alone (`0.3.1`, or `1.0.0-beta.1` for a
+prerelease) so that `ionic --version | cut -d' ' -f2`-style probes still work.
 
 The two compilers in this repository do not accept the same set of flags: the
 self-hosted `ionic_new` has `--target` and `--print-link`, while the Rust

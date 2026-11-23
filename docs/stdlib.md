@@ -142,11 +142,21 @@ Sets every element to `val` in-place.
 #### `arr_reverse([int64] a) -> [int64]`
 Returns a new array with elements in reversed order.
 
+```ionic
+arr_reverse([10, 20, 30])   // [30, 20, 10], length 3
+```
+
+Both this and `arr_copy` used to build their result on `[0]`, which is a
+one-element array rather than an empty one, so every result carried a leading `0`
+and was longer than the input. Both are correct now; assert the *length* as well
+as the values if you are regression-testing, because that was the shape of the
+bug.
+
 #### `arr_index_of([int64] a, int64 x) -> int64`
 Returns the first index of `x`, or `-1` if not found.
 
 #### `arr_copy([int64] a) -> [int64]`
-Returns a shallow copy.
+Returns a shallow copy. Same history as `arr_reverse` above.
 
 ---
 
