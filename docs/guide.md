@@ -587,8 +587,9 @@ if (file_exists("config.json")) {
 count otherwise, so `file_size(p) >= 0` is the same test; an **empty** file is
 `0`, not `-1`. Both cost one `stat` and allocate nothing, and the runtime defines
 `file_exists` in terms of `file_size`, so they cannot disagree. `file_read`
-mallocs the whole file and Ionic strings are never freed, which is why existence
-checks should not use it.
+mallocs the whole file, so an existence check should use `file_size` rather than
+read a potentially large file just to discard it. (The result is reference-counted
+like any other string, so it is not a permanent leak — but it is still wasted work.)
 
 `file_read` returns `""` when the file is missing *and* when it is empty, so a
 read alone cannot tell the two apart. Pair it with `file_exists` when that
@@ -700,3 +701,19 @@ let model = load_model("...");         // parse error — `model` is reserved
 ```ionic
 for (i in 0..3) { ... }    // i = 0, 1, 2
 ```
+
+**A `let` inside a loop leaks** — one string allocation per iteration:
+```ionic
+for (i in 0..n) {
+    let t = int64_to_str(i);   // leaks ~48 bytes per iteration
+}
+```
+Bind outside the loop and assign inside it instead; that form is reclaimed:
+```ionic
+mut t = "";
+for (i in 0..n) { t = int64_to_str(i); }   // previous value released
+```
+See "Memory: what the compiler reclaims, and what it does not" in the
+[language reference](language.md#memory-what-the-compiler-reclaims-and-what-it-does-not)
+for the second shape that leaks — a producer result passed straight into a
+user-defined function.

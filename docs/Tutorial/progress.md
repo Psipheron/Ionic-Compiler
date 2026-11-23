@@ -85,8 +85,8 @@ A realistic full pass is 4–6 weeks at a few focused hours a week.
 - [ ] I can name all five optimizer passes
 
 ### Unit 07 — Memory model & runtime
-- [ ] Exercise 07.1 — measured the string leak (RSS growth)
-- [ ] Exercise 07.2 — quoted the intentional-leak comment + `IonicArray`
+- [ ] Exercise 07.1 — measured both churn shapes (one flat, one growing)
+- [ ] Exercise 07.2 — quoted `rc_alloc`'s header arithmetic + `IonicArray`
 - [ ] Exercise 07.3 — quoted the bounds check
 - [ ] Exercise 07.4 — traced the four `model` RAII sites
 - [ ] Exercise 07.5 — listed the oracle's `OTY_OTHER` blind spots

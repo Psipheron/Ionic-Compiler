@@ -31,6 +31,27 @@ jobs:
       # ship a compiler that no longer reproduces itself, which is the property
       # the whole self-hosting claim rests on.
 
+      # ── The version the tarball advertises must be the version it contains ──
+      # The tarball name comes from `github.ref_name` (the tag), but the binary
+      # inside takes its version from src/main.ionic and Cargo.toml. Those are
+      # independent, so a tag can ship a binary that misreports itself — which
+      # is exactly what happened between v0.2.1 and the 0.3.0 bump: the sources
+      # said 0.1.0, and nothing compared that to the tag.
+      #
+      # ci.yml does not cover this. It runs on pushes to `main` and on pull
+      # requests; a tag push matches neither, so a release would be built and
+      # published with no version check at all. cli_check.sh's tag assertion is
+      # only load-bearing if something invokes it on the tagged commit, and this
+      # is that something. It exits non-zero on a mismatch, failing the job
+      # before the tarball is built.
+      - name: Assert tag, sources and --version agree
+        env:
+          # Without this the tag comparison is skipped whenever HEAD is not
+          # exactly a tag — which in this job would mean the check silently did
+          # nothing. A release runs on a tag by definition, so demand one.
+          CLI_REQUIRE_TAG: "1"
+        run: ./scripts/cli_check.sh
+
       - name: Package tarball
         run: |
           VERSION="${{ github.ref_name }}"

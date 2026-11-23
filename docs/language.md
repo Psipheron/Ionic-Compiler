@@ -403,6 +403,52 @@ matching `line + "\n"` per piece. `first` is a 0-based index into the array and
 `std.text`'s `join(parts, sep)` is the separator-*between* form built on
 `str_concat`; it is fine for a handful of pieces and quadratic for many.
 
+#### Memory: what the compiler reclaims, and what it does not
+
+Strings are reference-counted and the compiler emits the releases. For the
+common loop shapes this is complete: a `mut` slot reassigned each iteration
+releases the value it is replacing, and a producer result passed straight into a
+copying builtin is reclaimed after the call.
+
+Two shapes are **not** reclaimed, and they are worth knowing before you write a
+hot loop.
+
+```ionic
+for (i in 0..n) {
+    let t = int64_to_str(i);   // allocates every iteration, never released
+    use(t);
+}
+```
+
+A `let` inside a loop body leaks one block per iteration. Releasing it on loop
+re-entry is unsound under the current single-exit-block design, because the slot
+may be holding a value the program never owned — a `getenv` result, for
+instance — so the compiler leaves it alone rather than guess. Measured at
+~48 bytes per iteration for a small string; a loop of ten million iterations
+therefore grows by roughly 480 MB.
+
+The second shape is a producer result handed to a *user* function. The compiler
+reclaims an argument temporary only for callees it knows copy their arguments
+(`str_concat` and its siblings); a user function may keep the pointer past its
+return, so the temporary is left alone. Passing `int64_to_str(i)` straight into
+your own helper in a loop grows the same way the `let` form does.
+
+The workaround for both is to bind outside the loop and **assign** inside it,
+which the memory model does reclaim:
+
+```ionic
+mut t = "";
+for (i in 0..n) {
+    t = int64_to_str(i);       // previous value released on reassignment
+    use(t);
+}
+```
+
+`scripts/rss_check.sh` asserts both shapes: growth must be flat for the
+assignment form, and is capped at a recorded ceiling for the `let` form, so a
+regression in either is caught. The design rationale is in
+[docs/memory-model.md](memory-model.md) §9.
+
 ### ML model
 | Function | Description |
 |----------|-------------|
@@ -666,7 +712,7 @@ ionic <file.ionic> [more.ionic ...] -o <output> [--target <triple>] [--print-lin
 ```
 
 `-h` and `-V` are aliases for `--help` and `--version`. Both exit 0, and
-`--version` prints the bare number (`0.1.0`) so that
+`--version` prints the bare number (`0.3.0`) so that
 `ionic --version | cut -d' ' -f2`-style probes still work.
 
 The two compilers in this repository do not accept the same set of flags: the

@@ -182,30 +182,35 @@ jobs:
       # that backend actually honours, so adding a flag without documenting it
       # fails here.
       #
-      # This also keeps the version number honest. It is written in three places
-      # that cannot import each other — src/main.rs, src/main.ionic and
-      # Cargo.toml — and the gate compares all three.
+      # This also keeps the version number honest. It is written in five places
+      # that cannot import each other — src/main.rs, src/main.ionic (twice: the
+      # `--version` output and the `--help` banner), Cargo.toml, and the IR
+      # banner in codegen — and the gate compares all of them. Since the 0.3.0
+      # bump it also asserts the release tag agrees with `--version`, because
+      # release.yml names the tarball from the tag.
       - name: CLI — help, version and unknown-flag handling (native)
         run: ./scripts/cli_check.sh
 
       - name: CLI — help, version and unknown-flag handling (Rust backend)
         run: BACKEND=rust ./scripts/cli_check.sh
 
-      # ── RSS regression gate (ADVISORY during memory-model rollout) ───────
+      # ── RSS regression gate ──────────────────────────────────────────────
       # Smallest-possible-RSS is a core language goal. scripts/rss_check.sh
-      # compiles a string-churn benchmark at two sizes and fails if peak RSS
-      # grows with N. It currently FAILS by design: the runtime still leaks, so
-      # this records the baseline and gives the ownership work a number to
-      # defend. The measured baseline is ~80 B/iter for the shipped benchmark
-      # (two allocations: a 32-byte int64_to_str and a length-dependent
-      # str_concat), and ~48 B/iter for a single int64_to_str — an earlier
-      # comment here said "~48", which was the one-allocation figure compared
-      # against the two-allocation benchmark, not a regression.
-      # `continue-on-error` keeps CI green for unrelated work and shows a red
-      # step so the leak stays visible. When the memory model lands, delete
-      # `continue-on-error` to make this a hard gate.
-      - name: RSS regression gate (advisory until memory model lands)
-        continue-on-error: true
+      # measures two allocation shapes at two sizes:
+      #
+      #   assignment (`s = ...` into a mut slot) — fixed by the memory model, so
+      #   growth must be flat; 0 bytes over 200k..800k today.
+      #
+      #   let-in-loop (`let t = ...` in the body) — a KNOWN LEAK, documented in
+      #   docs/memory-model.md §9 and measured at ~48 bytes/iter. Bounded rather
+      #   than fixed, so a regression still fails.
+      #
+      # This used to carry `continue-on-error: true` with a comment claiming it
+      # failed by design. By the time the assignment path was fixed that was
+      # false — the gate passes — and an advisory gate that passes is just a
+      # gate nobody reads. It is hard now. The remaining leak is the let shape,
+      # and it is asserted with an explicit ceiling rather than excused.
+      - name: RSS regression gate
         run: ./scripts/rss_check.sh
 
       - name: Smoke test — hello world (self-hosted compiler)

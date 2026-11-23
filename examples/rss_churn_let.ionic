@@ -1,0 +1,40 @@
+// RSS benchmark — the `let`-in-a-loop leak.
+//
+// This is the *other* allocation shape, and it behaves differently from
+// examples/rss_churn.ionic on purpose. That one assigns into a `mut` slot
+// (`s = ...`), so the slot carries a claim column and the loop re-entry
+// releases the previous value. This one declares a fresh `let` inside the
+// loop body, and that is known to leak one block per iteration.
+//
+// Why it is not fixed yet (see docs/memory-model.md §9, and the comment at the
+// emission site in src/codegen/native.ionic): releasing on re-entry is unsound
+// under the single-exit-block design, because the slot may be holding a borrow
+// — a `getenv` result, say — that the program never owned. Until the slot can
+// distinguish an owned block from a borrowed one, re-entry leaves it alone.
+//
+// So this file exists to *measure* the leak, not to assert its absence.
+// scripts/rss_check.sh asserts two different things about the two shapes:
+//
+//   rss_churn.ionic      growth must be ~flat (the assignment path is fixed)
+//   rss_churn_let.ionic  growth per iteration must stay under a ceiling, so a
+//                        regression is caught now and the fixed state is
+//                        detected later
+//
+// Run manually:
+//   ./ionic_new examples/rss_churn_let.ionic -o /tmp/rss_let
+//   /usr/bin/time -l /tmp/rss_let 2>&1 | grep 'maximum resident'
+
+fn main() -> int64 {
+    let n = 300000;
+    mut i = 0;
+    mut last = "";
+    while (i < n) {
+        // One allocation per iteration, bound by `let` — never released.
+        let t = int64_to_str(i);
+        last = t;
+        i = i + 1;
+    }
+    // Keep the loop live so it cannot be dead-code eliminated.
+    println(str_concat("iters=", str_concat(int64_to_str(n), str_concat(" last=", last))));
+    return 0;
+}

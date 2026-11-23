@@ -31,8 +31,11 @@ tells you how to verify it yourself (see [Known discrepancies](#known-discrepanc
   the repo.
 - The object is keyed on the **output name** (`<out>.o`), so parallel builds are
   isolated. Don't "fix" that.
-- Ionic has **no GC**. Memory is C-style; the reclamation story is a plan, not a
-  shipped feature. See unit [07](07-memory-model-and-runtime.md).
+- Ionic has **no GC**, but it is no longer "C-style, nothing is freed". Strings
+  and arrays are reference-counted and the compiler emits the releases; two
+  specific loop shapes still leak by design. The blanket "the reclamation story
+  is a plan" reading is out of date — see unit
+  [07](07-memory-model-and-runtime.md) and `docs/memory-model.md` §9.
 - `bool` and `int64` are the **same at runtime**. Do not assume `[1, true]` is a
   type error — it is accepted, and infers `[int64]`.
 
@@ -121,12 +124,13 @@ Confirm each with the compiler, not the prose.
    Declaring `let d = t.toGpu();` outside a block is fine, but touching `d` in
    CPU context — even passing it to an `@gpu fn` — is rejected with
    `tensor@gpu 'd' used outside gpu block`. Do GPU work inside the block.
-7. **`main`'s return value is *not* used as the process exit code.** The generated
-   `main` wrapper calls `ionic_user_main(...)` and then unconditionally loads `0`
-   into the return register (`src/codegen/native.ionic`, `ncg_main_wrapper`,
-   ~line 2055: `a64_load_imm(REG_X0, 0)`). `fn main() -> int64 { return 7; }`
-   still exits `0`. `docs/guide.md` says otherwise. Use `exit(code)` — verified to
-   work — to set a status.
+7. **~~`main`'s return value is not used as the process exit code~~ — fixed.**
+   The wrapper used to call `ionic_user_main(...)` and then load `0` into the
+   return register, so `fn main() -> int64 { return 7; }` exited `0` on both
+   backends. It now propagates the value: the same program exits `7` on the
+   native backend and on the Rust bootstrap. `docs/guide.md` was always right
+   about the intent; the codegen was not. `exit(code)` remains available when you
+   want to leave from the middle of a program.
 
 ---
 

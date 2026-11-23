@@ -1,21 +1,28 @@
-// Mastery 07.1 — demonstrate the string leak (no GC, no refcounting today).
+// Mastery 07.1 — the two string-churn shapes, side by side.
 //
-// Each iteration builds two fresh strings (int64_to_str + str_concat) and
-// rebinds `s`, so the previous values become garbage that is never freed.
+// This example used to demonstrate "the string leak": two fresh strings per
+// iteration, rebound into `s`, never freed. That is no longer true. Rebinding a
+// `mut` slot releases the value it replaces, so this loop is flat in N and the
+// example demonstrates the opposite of what it was written to.
+//
+// It is kept because the contrast is the lesson. This shape — assign into a
+// `mut` slot — is reclaimed. Declaring `let t = ...` *inside* the loop body is
+// not, and leaks one block per iteration (see examples/rss_churn_let.ionic and
+// the "Memory" section of docs/language.md).
 //
 //   ./ionic_new examples/mastery/07_leak.ionic -o /tmp/leak
-//   /usr/bin/time -l /tmp/leak 2>&1 | grep -E "maximum resident"
+//   /usr/bin/time -l /tmp/leak 2>&1 | grep "maximum resident"
 //
-// Watch "maximum resident set size" grow with N. The compiler has the same
-// leak, which is why docs/memory-model.md exists.
+// Compare the RSS against the same program written with the `let` form, and
+// against ./scripts/rss_check.sh, which asserts both numbers.
 
 fn main() -> int64 {
     let n = 1000000;              // lower this if it runs too long
     mut s = "";
     mut i = 0;
     while (i < n) {
-        s = str_concat(int64_to_str(i), "-x");   // two allocations per iteration
-        i = i + 1;
+        s = str_concat(int64_to_str(i), "-x");   // two allocations per iteration,
+        i = i + 1;                               // both released on rebind
     }
     println(str_concat("last value: ", s));
     println(str_concat("iterations: ", int64_to_str(n)));

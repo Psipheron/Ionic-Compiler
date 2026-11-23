@@ -1,8 +1,8 @@
 # 07 — Memory Model & Runtime
 
-**Goal:** understand exactly how Ionic allocates and (doesn't) free memory today,
-why the design chose deterministic ownership, the shipped `model` RAII slice, and
-the allocation audit and type oracle that gate the reference-counting slice. This
+**Goal:** understand exactly how Ionic allocates and frees memory today, why the
+design chose deterministic ownership, the shipped `model` RAII slice, and the
+allocation audit and type oracle that gate the reference-counting slice. This
 unit is the heart of becoming a compiler *owner* rather than a compiler *user*.
 
 Primary source: `docs/memory-model.md`. Secondary: `src/ionic_model_runtime.c`,
@@ -12,24 +12,41 @@ Primary source: `docs/memory-model.md`. Secondary: `src/ionic_model_runtime.c`,
 
 ## 1. The shipped reality
 
-Ionic today has **no GC, no reference counting, no lifetimes**. It is C-style:
+**Read this section with `docs/memory-model.md` open.** When this unit was
+written Ionic had no reference counting at all, and the text said so. Reference
+counting has since landed for strings and arrays, so the old blanket claim ("every
+producer allocates and never frees") is now wrong in a way that matters: it makes
+the leak seem unavoidable when the compiler reclaims most loop shapes. The
+subsections below record what an earlier reader was taught, and what is true now.
 
 - **Strings** are `malloc`'d C strings (`char *`), treated as immutable. Every
   `str_concat`, `int64_to_str`, `float64_to_str`, `str_slice`, `format`,
-  `char_to_str`, `file_read`, `read_line` allocates a fresh buffer and never frees
-  it. The runtime says so:
+  `char_to_str`, `file_read`, `read_line` allocates a **reference-counted** block
+  — an 8-byte header in front of the payload, count starting at 1 — and the
+  compiler emits releases. A `mut` slot reassigned in a loop and a producer temp
+  passed straight into a copying builtin are both reclaimed; `scripts/rss_check.sh`
+  asserts the first is flat in N (0 bytes of growth over 200k..800k iterations).
 
-  ```c
-  return buf; /* caller owns — but Ionic treats strings as const; leak is acceptable for now */
-  ```
+  Two shapes are still leaked on purpose, and they are the ones an exercise
+  should measure, not the blanket "strings leak": a `let` re-executed by a loop,
+  and a producer temp passed to a *user* function. Both are ~48 bytes/iter for a
+  small string. `docs/language.md` documents them for users;
+  `docs/memory-model.md` §9 has the design reason.
 
 - **Arrays** have a header `struct IonicArray { i64 len; i64 cap; void *data; }`
-  (`src/ionic_model_runtime.c:77`) with a separate `malloc`/`realloc`'d data region.
-- **Structs** are `malloc`'d at construction (`ND_STRUCT_LIT`).
-- The only explicit free is `model_free(m)`.
+  (`src/ionic_model_runtime.c:77`) with a separate `malloc`/`realloc`'d data
+  region. Array slots carry their own claim column (§11.4), but **elements are
+  never released** — that is a design decision, not an oversight.
+- **Structs** are `malloc`'d at construction (`ND_STRUCT_LIT`) and remain
+  **uncounted**, so aggregate reference counting is not complete.
+- `model_free(m)` is not the only explicit free any more: `mlx_free` releases a
+  tensor handle, and the compiler emits releases for counted blocks.
 
-Consequence: any long-running program that churns strings/arrays/structs grows
-without bound. The compiler itself leaks for this reason.
+Consequence: a long-running program that churns strings in the two shapes above
+grows without bound. The blanket statement this section used to make — that the
+compiler itself leaks for this reason — is no longer accurate: the compiler's own
+import expander was moved onto `str_join` for the quadratic-concatenation reason,
+not because nothing is ever freed.
 
 ---
 
@@ -196,13 +213,18 @@ worth internalising (unit 08).
 
 ## Exercises
 
-**07.1 — Measure the leak.** Write a loop that concatenates strings ~1e6 times
-and observe RSS growth (e.g. `/usr/bin/time -l`). Confirm strings are never
-freed. Reference: `examples/mastery/07_leak.ionic`.
+**07.1 — Measure the leak, in a shape that still leaks.** Write a loop that
+concatenates strings ~1e6 times and observe RSS growth with
+`/usr/bin/time -l`. Then run the same loop with the binding hoisted out and
+**assigned** inside. The first grows, the second does not — that difference is
+the memory model, and it is why `scripts/rss_check.sh` measures both.
+Reference: `examples/rss_churn.ionic` (flat) and `examples/rss_churn_let.ionic`
+(grows); `examples/mastery/07_leak.ionic` is the assignment shape and no longer
+leaks, which is itself worth confirming.
 
-**07.2 — Read the allocators.** In `src/ionic_model_runtime.c`, quote the line
-comment that documents the intentional string leak, and quote the `IonicArray`
-struct. Explain the 24-byte header.
+**07.2 — Read the allocators.** In `src/ionic_model_runtime.c`, find
+`rc_alloc` and quote how the 8-byte header and the returned payload relate;
+then quote the `IonicArray` struct and explain its 24-byte header.
 
 **07.3 — Find the bounds check.** Quote `ionic_array_get` and show where the
 `index out of bounds` message is produced.
