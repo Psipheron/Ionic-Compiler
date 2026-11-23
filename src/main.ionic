@@ -29,7 +29,7 @@ mut print_link    = 0;        // --print-link: show the link command, don't run 
 // them. scripts/cli_check.sh asserts that every flag a backend honours appears
 // in its own help, so the text cannot drift from the code that implements it.
 fn print_usage() -> int64 {
-    println("ionic — Ionic compiler v0.3.0");
+    println("ionic — Ionic compiler v1.0.0-beta.1");
     println("");
     println("Usage: ionic <file.ionic> [more.ionic ...] [options]");
     println("");
@@ -52,7 +52,7 @@ fn print_usage() -> int64 {
 fn print_version() -> int64 {
     // Just the number, so `ionic --version | cut -d' ' -f2` and the usual
     // package-manager probes work without a prefix to strip.
-    println("0.3.0");
+    println("1.0.0-beta.1");
     return 0;
 }
 

@@ -109,20 +109,51 @@ jobs:
           path: dist
 
       - name: Create release and upload assets
+        id: create
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           VERSION="${{ github.ref_name }}"
 
-          gh release create "$VERSION" \
-            --title "Ionic $VERSION" \
-            --notes "$(git log $(git describe --tags --abbrev=0 HEAD^)..HEAD --pretty=format:'- %s' 2>/dev/null || echo 'Initial release')" \
-            dist/tarball-aarch64-apple-darwin/*.tar.gz
+          # A tag containing a hyphen is a prerelease (v1.0.0-beta.1). Two things
+          # must not happen to one: it must not be marked "latest", and it must
+          # not move the Homebrew formula, or `brew install ionic` on every
+          # machine starts tracking a beta. GitHub treats a release with
+          # --prerelease as non-latest, and the tap job below keys off the same
+          # flag.
+          case "$VERSION" in
+            *-*) PRERELEASE=1 ;;
+            *)   PRERELEASE=0 ;;
+          esac
+
+          if [ "$PRERELEASE" = "1" ]; then
+            echo "Tag '$VERSION' has a hyphen: publishing as a prerelease."
+            gh release create "$VERSION" \
+              --title "Ionic $VERSION (beta)" \
+              --prerelease \
+              --notes "> **Beta.** This is a pre-release: it is published for testing and is not the recommended version. Use v0.3.0 for a stable install.\n\n$(git log $(git describe --tags --abbrev=0 HEAD^)..HEAD --pretty=format:'- %s' 2>/dev/null || echo 'Initial release')" \
+              dist/tarball-aarch64-apple-darwin/*.tar.gz
+          else
+            gh release create "$VERSION" \
+              --title "Ionic $VERSION" \
+              --notes "$(git log $(git describe --tags --abbrev=0 HEAD^)..HEAD --pretty=format:'- %s' 2>/dev/null || echo 'Initial release')" \
+              dist/tarball-aarch64-apple-darwin/*.tar.gz
+          fi
+
+          # Consumed by anything downstream that must differ for a beta.
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
 
   update-tap:
     name: Update Homebrew tap
     needs: publish-release
     runs-on: ubuntu-latest
+
+    # Never move the formula for a prerelease. `brew install ionic` resolves the
+    # formula's single stable URL, so pointing it at a beta would hand every
+    # user a pre-release build without them asking for one. The version string
+    # is the check, not the publish job's output, so this stays correct even if
+    # the two jobs are ever split across workflows.
+    if: ${{ !contains(github.ref_name, '-') }}
 
     # Dispatches a `new-release` event to ByteTheBait/homebrew-ionic, where
     # an update-formula.yml workflow at `.github/workflows/update-formula.yml`
