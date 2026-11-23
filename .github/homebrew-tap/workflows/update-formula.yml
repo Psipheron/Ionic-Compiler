@@ -149,9 +149,18 @@ jobs:
 
           # Keep a `version` line in sync if the formula has one. It is optional:
           # Homebrew can read the version from the URL.
+          #
+          # The tag carries a leading `v` (`v0.3.1`) but the formula must not.
+          # Homebrew's own audit rule forbids it (rubocops/version.rb: "should
+          # not have a leading 'v'"), and it is not cosmetic:
+          # Version.new("v0.3.1") != Version.new("0.3.1"), so the keg is named
+          # `v0.3.1` and any comparison against a `v`-less version is wrong.
+          # Only the *version line* is stripped — the release URL legitimately
+          # keeps the tag as-is, and the release job's read-back greps the URL.
+          formula_version = version[1:] if version.startswith("v") else version
           if re.search(r'^\s*version\s+"', src, re.M):
               src = re.sub(r'^(\s*version\s+")[^"]+(")',
-                           lambda mm: mm.group(1) + version + mm.group(2),
+                           lambda mm: mm.group(1) + formula_version + mm.group(2),
                            src, count=1, flags=re.M)
 
           path.write_text(src)
@@ -168,6 +177,14 @@ jobs:
             || { echo "formula homepage still points at the old owner" >&2; exit 1; }
           grep -q "${SHA_ARM}" Formula/ionic.rb \
             || { echo "formula does not carry the new sha256" >&2; exit 1; }
+          # Homebrew rejects a leading `v` in `version`, and it is not cosmetic:
+          # Version.new("v0.3.1") != Version.new("0.3.1"). Assert the absence
+          # rather than trusting the rewrite above to have applied.
+          if grep -qE '^[[:space:]]*version[[:space:]]+"v' Formula/ionic.rb; then
+            echo "Formula version still has a leading 'v'; Homebrew forbids it." >&2
+            grep -E '^[[:space:]]*version[[:space:]]' Formula/ionic.rb >&2
+            exit 1
+          fi
 
       - name: Commit and push
         run: |

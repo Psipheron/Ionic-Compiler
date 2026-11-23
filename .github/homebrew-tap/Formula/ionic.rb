@@ -1,7 +1,14 @@
 class Ionic < Formula
   desc "Statically-typed compiled language for data science and AI workloads"
   homepage "https://github.com/Psipheron/Ionic-Compiler"
-  version "v0.3.1"
+  # No leading `v` here: Homebrew's audit forbids it (rubocops/version.rb) and
+  # Version.new("v0.3.1") != Version.new("0.3.1"), so the keg would be named
+  # `v0.3.1`.
+  #
+  # The tag *does* have the `v`, so the URL below cannot interpolate `version`
+  # directly or it would ask for .../download/0.3.1/ionic-0.3.1-... and 404.
+  # The prefix is re-added explicitly.
+  version "0.3.1"
   license "MIT"
 
   # One architecture. The release workflow builds exactly
@@ -17,7 +24,7 @@ class Ionic < Formula
   depends_on arch: :arm64
   depends_on macos: :sonoma
 
-  url "https://github.com/Psipheron/Ionic-Compiler/releases/download/#{version}/ionic-#{version}-aarch64-apple-darwin.tar.gz"
+  url "https://github.com/Psipheron/Ionic-Compiler/releases/download/v#{version}/ionic-v#{version}-aarch64-apple-darwin.tar.gz"
   sha256 "cdf3e95783a669e1da4970d6dcb106e0d9204a7b61ae4c583729a743b24a785d"
 
   def install
