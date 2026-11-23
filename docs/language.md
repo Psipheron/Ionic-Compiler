@@ -722,7 +722,7 @@ ionic <file.ionic> [more.ionic ...] -o <output> [--target <triple>] [--print-lin
 ```
 
 `-h` and `-V` are aliases for `--help` and `--version`. Both exit 0, and
-`--version` prints the bare number alone (`0.3.1`, or `1.0.0-beta.1` for a
+`--version` prints the bare number alone (`1.0.0`, or `1.1.0-beta.1` for a
 prerelease) so that `ionic --version | cut -d' ' -f2`-style probes still work.
 
 The two compilers in this repository do not accept the same set of flags: the
