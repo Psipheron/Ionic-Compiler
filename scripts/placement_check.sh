@@ -35,6 +35,10 @@
 #   CPU-only I/O in a binding           -> rejected, not only as a bare call
 #   CPU-only I/O via the stat builtins  -> rejected
 #   CPU-only I/O in an @gpu fn body     -> rejected
+#   CPU I/O reached via an untagged fn  -> rejected (the taint is interprocedural)
+#   an untagged PURE helper             -> still callable from a gpu block
+#   a tensor@cpu reached via p.field    -> rejected inside a gpu block
+#   a tensor@cpu reached via arr[i]     -> rejected inside a gpu block
 #   mastery/04_placement_types.ionic    -> still compiles (the tutorial's reference)
 #   mastery/04_pool_polymorphism.ionic  -> still compiles (transfers, done correctly)
 #   mastery/fail/use_after_move.ionic   -> rejected (the tutorial's fail-case)
@@ -879,6 +883,88 @@ expect_reject "the ban also covers an @gpu fn body" \
     return w;
 }'
 
+# ── The rules close over the call graph, not just the call site ──────────────
+#
+# Every rule above inspects what is written *at that site*, which leaves a hole
+# exactly one call deep: an unannotated helper is CPU context (docs/language.md
+# says so), but it is not `@cpu`, so calling it from a gpu block tripped no
+# rule while the stdio inside it was never in a gpu context either. The block
+# compiled and did CPU I/O in a GPU context — the thing these rules exist to
+# forbid.
+expect_reject "an untagged helper that does CPU I/O is not callable from gpu" \
+  "reaches CPU-only I/O" \
+'fn stealth_logger(string msg) -> int64 {
+    println(msg);
+    return 1;
+}
+fn main() -> int64 {
+    gpu { let x = stealth_logger("bypass?"); }
+    return 0;
+}'
+
+# Transitivity: the taint has to follow the chain, not stop at the first hop.
+# `chain_outer` contains no I/O of its own; it reaches it through `stealth`.
+expect_reject "the taint follows a chain of calls" \
+  "reaches CPU-only I/O" \
+'fn stealth(string s) -> int64 { println(s); return 1; }
+fn chain_outer(string s) -> int64 { return stealth(s); }
+fn main() -> int64 {
+    gpu { let c = chain_outer("transitive"); }
+    return 0;
+}'
+
+# The other half of the rule: an untagged helper that touches no CPU state is
+# pure and must stay callable. Tainting every unannotated callee would make the
+# feature useless rather than merely porous, so this is the assertion that
+# keeps the previous one honest.
+expect_ok "an untagged pure helper is still callable from gpu" \
+'fn pure_double(int64 x) -> int64 { return x * 2; }
+fn main() -> int64 {
+    gpu {
+        let n = pure_double(21);
+        let b = mlx_zeros([n, n], 0).toGpu();
+    }
+    return 0;
+}'
+
+# ── A tensor is placement-typed however it is reached ───────────────────────
+#
+# The bare-name rule lives in sc_expr's ND_IDENT arm. A `tensor@cpu` also
+# reaches a gpu context through a struct field or an array element, and neither
+# path went through that arm — so both compiled, and the block did host-pool
+# work (mlx_matmul on SRAM handles) with no diagnostic. These pin the two
+# spellings to the same rule.
+expect_reject "a tensor@cpu struct field is rejected inside a gpu block" \
+  "tensor@cpu field 'data' used inside gpu block" \
+'struct Payload { data: tensor@cpu, id: int64 }
+fn main() -> int64 {
+    let p = Payload { data: mlx_zeros([2, 2], 0), id: 42 };
+    gpu { let y = mlx_add(p.data, p.data); }
+    return 0;
+}'
+
+expect_reject "a tensor@cpu array element is rejected inside a gpu block" \
+  "tensor@cpu element used inside gpu block" \
+'fn main() -> int64 {
+    let box_arr = [mlx_zeros([2, 2], 0)];
+    gpu { let z = mlx_add(box_arr[0], box_arr[0]); }
+    return 0;
+}'
+
+# ...and the mirror case, so the new checks are placement rules rather than a
+# blanket ban on reaching a tensor through a field or an element.
+expect_ok "a tensor@gpu struct field is fine inside a gpu block" \
+'struct Payload { data: tensor@gpu, id: int64 }
+fn main() -> int64 {
+    let raw = mlx_zeros([2, 2], 0);
+    let g = raw.toGpu();
+    gpu {
+        let p = Payload { data: g, id: 1 };
+        let y = mlx_add(p.data, p.data);
+    }
+    return 0;
+}'
+
 # A temporary has no binding to strand: `f(...).toGpu()` moves nothing that a
 # later line could name.
 expect_ok "transferring a temporary consumes no binding" \
@@ -1026,7 +1112,13 @@ fn main() -> int64 {
     let g = a.toGpu();
     fails = fails + check("SRAM released the bytes", mlx_pool_bytes(0) == cpu_base);
     fails = fails + check("VRAM charged exactly once", mlx_pool_bytes(1) - gpu_base == 4194304);
-    gpu { fails = fails + check("transfer lands in VRAM", mlx_pool(g) == 1); }
+    // The observation happens inside the block, but the assertion does not:
+    // `check` prints, and `println` is CPU-only I/O — which the checker now
+    // rejects inside a gpu context, including through an unannotated helper.
+    // Reading `mlx_pool(g)` there is tensor introspection and belongs inside.
+    mut pool_of_g = -1;
+    gpu { pool_of_g = mlx_pool(g); }
+    fails = fails + check("transfer lands in VRAM", pool_of_g == 1);
 
     let c = g.toCpu();
     fails = fails + check("return lands in SRAM", mlx_pool(c) == 0);
@@ -1042,10 +1134,12 @@ fn main() -> int64 {
     let q = mlx_multiply(p, p);
     fails = fails + check("builtin result is SRAM", mlx_pool(q) == 0);
     let pg = p.toGpu();
+    mut pool_of_qg = -1;
     gpu {
         let qg = mlx_multiply(pg, pg);
-        fails = fails + check("gpu builtin result is VRAM", mlx_pool(qg) == 1);
+        pool_of_qg = mlx_pool(qg);
     }
+    fails = fails + check("gpu builtin result is VRAM", pool_of_qg == 1);
     mlx_free(q);
     mlx_free(pg.toCpu());
 

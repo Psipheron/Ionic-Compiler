@@ -19,6 +19,13 @@ pub struct SemanticAnalyzer {
     /// Only builtins are pool-polymorphic; a user `@cpu fn(tensor@cpu)` stays
     /// a promise about where the work happens.
     builtins: HashSet<String>,
+    /// For each user function that can reach CPU-only work, the builtin (or
+    /// `@cpu` callee) at the bottom of the chain. Absent means "pure".
+    ///
+    /// Filled by `compute_cpu_taint` before any body is analysed, because the
+    /// question is interprocedural and a call site needs the answer. Mirrors
+    /// `fn_taints` / `fn_taint_leafs` in src/semantic/checker.ionic.
+    cpu_taint: HashMap<String, String>,
     in_gpu_block: bool,
     loop_depth: usize,
     errors: Vec<String>,
@@ -187,6 +194,7 @@ impl SemanticAnalyzer {
             functions: HashMap::new(),
             structs: HashMap::new(),
             builtins: HashSet::new(),
+            cpu_taint: HashMap::new(),
             in_gpu_block: false,
             loop_depth: 0,
             errors: Vec::new(),
@@ -272,6 +280,11 @@ impl SemanticAnalyzer {
             self.functions.insert(f.name.clone(), (param_types, f.ret_ty.to_type()));
         }
 
+        // Answer "does this function reach CPU-only work?" for every function
+        // before any body is analysed, because a call site needs the answer and
+        // the reachability is interprocedural — see compute_cpu_taint.
+        self.compute_cpu_taint(program);
+
         // Top-level lets/muts first so function bodies can reference them
         for stmt in &program.top_level {
             self.analyze_stmt(stmt, &Type::Void);
@@ -353,6 +366,28 @@ impl SemanticAnalyzer {
         }
         matches!((got, want),
             (Type::Bool, Type::Int64) | (Type::Int64, Type::Bool))
+    }
+
+    /// The placement rule applied to a value that did not arrive as a bare name.
+    ///
+    /// The bare-name rule is the argument check in `Expr::Call`. A `tensor@cpu`
+    /// can also reach a gpu context through a struct field (`p.data`) or an array
+    /// element (`box[0]`), and neither path went through that rule — so both
+    /// compiled, and the block did host-pool work with no diagnostic. Sharing one
+    /// implementation keeps the spellings from drifting apart. Mirrors
+    /// sc_check_placement_value() in src/semantic/checker.ionic.
+    fn check_placement_value(&mut self, ty: &Type, what: &str) {
+        let Type::Tensor(hw) = ty else { return };
+        if self.in_gpu_block && **hw == HwTarget::Cpu {
+            self.error(format!(
+                "`tensor@cpu` {} in gpu block — use `.toGpu()` first", what
+            ));
+        }
+        if !self.in_gpu_block && **hw == HwTarget::Gpu {
+            self.error(format!(
+                "`tensor@gpu` {} outside gpu block — use `.toCpu()` first", what
+            ));
+        }
     }
 
     fn analyze_stmt(&mut self, stmt: &Stmt, ret_ty: &Type) {
@@ -514,6 +549,50 @@ impl SemanticAnalyzer {
             | "getenv" | "read_line" | "get_arg" | "cpu_core_count")
     }
 
+    /// Fill `cpu_taint`: for each user function that can reach CPU-only work,
+    /// the name of the thing at the bottom of the chain.
+    ///
+    /// Why this is a whole-program pass — an unannotated helper is CPU context
+    /// (docs/language.md: "`@cpu fn` bodies and unannotated functions run in
+    /// CPU context"), but it is not `@cpu`, so the placement rules above saw
+    /// nothing wrong with calling it from a gpu block:
+    ///
+    ///     fn stealth_logger(string msg) -> int64 { println(msg); return 1; }
+    ///     gpu { let x = stealth_logger("bypass?"); }     // compiled, did stdio
+    ///
+    /// Every rule stated at the call site inspects only what is written there,
+    /// so the hole is exactly one call deep. Closing it means asking the call
+    /// graph, which cannot be answered one body at a time.
+    ///
+    /// Deliberately NOT "ban every unannotated callee": `fn double(int64 x)` is
+    /// pure and must stay callable. Tainting only what actually reaches CPU
+    /// state keeps this from being a false rejection — which here would be far
+    /// worse than the hole, because it would make the feature unusable rather
+    /// than merely porous. Mirrors gpu_taint_compute() in
+    /// src/semantic/checker.ionic.
+    fn compute_cpu_taint(&mut self, program: &Program) {
+        let fns: HashMap<&str, &FnDef> =
+            program.fns.iter().map(|f| (f.name.as_str(), f)).collect();
+
+        // A fixpoint, not one pass: `a` is tainted by calling `b`, and that may
+        // only become known after `a` was scanned. With N functions N rounds
+        // suffice; the cap is a safety net, not an expected exit.
+        let cap = program.fns.len() + 1;
+        for _ in 0..cap {
+            let mut changed = false;
+            for f in &program.fns {
+                if self.cpu_taint.contains_key(&f.name) {
+                    continue;
+                }
+                if let Some(leaf) = taint_stmts(&f.body, &fns, &self.cpu_taint) {
+                    self.cpu_taint.insert(f.name.clone(), leaf);
+                    changed = true;
+                }
+            }
+            if !changed { break; }
+        }
+    }
+
     pub fn infer_expr(&mut self, expr: &Expr) -> Type {
         match expr {
             Expr::IntLit(_)    => Type::Int64,
@@ -576,6 +655,19 @@ impl SemanticAnalyzer {
                         // backend whose message it happens to match.
                         self.error(format!(
                             "'{}' is CPU-only I/O, not allowed inside gpu block", callee
+                        ));
+                    }
+                    // ...and a callee that merely *reaches* CPU-only work is
+                    // banned too. Without this the hole is one call deep: an
+                    // unannotated helper is CPU context by default, but it is
+                    // not `@cpu`, so `println` inside it is invisible to the
+                    // rules above while the gpu block performs stdio through it.
+                    // The taint is computed once, over the whole call graph —
+                    // see compute_cpu_taint.
+                    if let Some(leaf) = self.cpu_taint.get(callee) {
+                        self.error(format!(
+                            "Function `{}` reaches CPU-only I/O (`{}`) and cannot be called from a gpu context",
+                            callee, leaf
                         ));
                     }
                     for (i, at) in arg_types.iter().enumerate() {
@@ -673,6 +765,13 @@ impl SemanticAnalyzer {
                     Type::Struct(sname) => {
                         if let Some(fields) = self.structs.get(sname).cloned() {
                             if let Some((_, ty)) = fields.iter().find(|(f, _)| f == field) {
+                                // A tensor field is placement-typed exactly as a
+                                // name is. `p.data` used to slip past the
+                                // argument rule because the type arrived through
+                                // a field rather than an expression the call
+                                // rule inspected — the block then did host-pool
+                                // work with no diagnostic.
+                                self.check_placement_value(ty, &format!("field `{}`", field));
                                 ty.clone()
                             } else {
                                 self.error(format!("No field `{}` on struct `{}`", field, sname));
@@ -690,7 +789,15 @@ impl SemanticAnalyzer {
                 let obj_ty = self.infer_expr(obj);
                 self.infer_expr(idx);
                 match obj_ty {
-                    Type::Array(inner) => *inner,
+                    Type::Array(inner) => {
+                        // ...and an element is placement-typed too. This was the
+                        // second structural bypass: `box[0]` reached a
+                        // host-pool tensor without passing through the name
+                        // rule, so a gpu block multiplied SRAM handles with no
+                        // diagnostic.
+                        self.check_placement_value(&inner, "element");
+                        *inner
+                    }
                     Type::Str => Type::Int64, // char as int
                     _ => Type::Unknown,
                 }
@@ -725,6 +832,99 @@ impl SemanticAnalyzer {
                     other => { self.error(format!("`.toCpu()` requires a tensor, got `{}`", other)); Type::Unknown }
                 }
             }
+        }
+    }
+}
+
+// ── Interprocedural CPU taint: the walkers ───────────────────────────────────
+//
+// Free functions rather than methods because they must run over a body without
+// the analyzer's scopes installed: `compute_cpu_taint` walks every function
+// before any body is type-checked, and the walk is concerned with *calls* only
+// — it never names a variable or assigns a type. Borrowing `&mut self` for that
+// would make the pass depend on scope state it does not use.
+//
+// `taint_stmts` / `taint_expr` return the leaf that reached CPU state, or None,
+// so the caller keeps the first cause found rather than the last one visited.
+// Mirrors taint_expr / taint_stmts in src/semantic/checker.ionic.
+
+fn taint_stmts(stmts: &[Stmt], fns: &HashMap<&str, &FnDef>, taint: &HashMap<String, String>) -> Option<String> {
+    for s in stmts {
+        if let Some(leaf) = taint_stmt(s, fns, taint) {
+            return Some(leaf);
+        }
+    }
+    None
+}
+
+fn taint_stmt(stmt: &Stmt, fns: &HashMap<&str, &FnDef>, taint: &HashMap<String, String>) -> Option<String> {
+    match stmt {
+        Stmt::Let { init, .. } => taint_expr(init, fns, taint),
+        Stmt::Assign { target, value } => {
+            let t = match target {
+                AssignTarget::Ident(_) => None,
+                AssignTarget::Field(obj, _) => taint_expr(obj, fns, taint),
+                AssignTarget::Index(obj, idx) => {
+                    taint_expr(obj, fns, taint).or_else(|| taint_expr(idx, fns, taint))
+                }
+            };
+            t.or_else(|| taint_expr(value, fns, taint))
+        }
+        Stmt::ExprStmt(e) => taint_expr(e, fns, taint),
+        Stmt::Return(e) => e.as_ref().and_then(|x| taint_expr(x, fns, taint)),
+        Stmt::If { cond, then_block, else_block } => taint_expr(cond, fns, taint)
+            .or_else(|| taint_stmts(then_block, fns, taint))
+            .or_else(|| else_block.as_ref().and_then(|b| taint_stmts(b, fns, taint))),
+        Stmt::While { cond, body } => {
+            taint_expr(cond, fns, taint).or_else(|| taint_stmts(body, fns, taint))
+        }
+        Stmt::For { start, end, body, .. } => taint_expr(start, fns, taint)
+            .or_else(|| taint_expr(end, fns, taint))
+            .or_else(|| taint_stmts(body, fns, taint)),
+        Stmt::GpuBlock(body) => taint_stmts(body, fns, taint),
+        Stmt::Break | Stmt::Continue | Stmt::Import(_) => None,
+    }
+}
+
+fn taint_expr(expr: &Expr, fns: &HashMap<&str, &FnDef>, taint: &HashMap<String, String>) -> Option<String> {
+    match expr {
+        Expr::IntLit(_) | Expr::FloatLit(_) | Expr::StringLit(_)
+        | Expr::BoolLit(_) | Expr::Ident(_) => None,
+
+        Expr::BinOp { lhs, rhs, .. } => {
+            taint_expr(lhs, fns, taint).or_else(|| taint_expr(rhs, fns, taint))
+        }
+        Expr::UnOp { expr, .. } => taint_expr(expr, fns, taint),
+        Expr::ToGpu(inner) | Expr::ToCpu(inner) => taint_expr(inner, fns, taint),
+        Expr::FieldAccess { obj, .. } => taint_expr(obj, fns, taint),
+        Expr::Index { obj, idx } => {
+            taint_expr(obj, fns, taint).or_else(|| taint_expr(idx, fns, taint))
+        }
+        Expr::ArrayLit(elems) => elems.iter().find_map(|e| taint_expr(e, fns, taint)),
+        Expr::StructLit { fields, .. } => fields.iter().find_map(|(_, v)| taint_expr(v, fns, taint)),
+
+        Expr::MethodCall { obj, args, .. } => taint_expr(obj, fns, taint)
+            .or_else(|| args.iter().find_map(|a| taint_expr(a, fns, taint))),
+
+        Expr::Call { callee, args } => {
+            // A CPU-only builtin in the body taints it directly.
+            if SemanticAnalyzer::is_cpu_only_fn(callee) {
+                return Some(callee.clone());
+            }
+            // A `@cpu`-annotated callee is CPU context by declaration.
+            if let Some(f) = fns.get(callee.as_str()) {
+                if f.hw.as_ref().map(|h| h.is_cpu()).unwrap_or(false) {
+                    return Some(callee.clone());
+                }
+            }
+            // ...and an already-tainted callee propagates the leaf at the
+            // bottom of *its* chain, so `a -> b -> println` names `println`.
+            if let Some(leaf) = taint.get(callee) {
+                return Some(leaf.clone());
+            }
+            // The arguments are evaluated here, so a call in an argument is
+            // reachable from this body too.
+            args.iter().find_map(|a| taint_expr(a, fns, taint))
         }
     }
 }

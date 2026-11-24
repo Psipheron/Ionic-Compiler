@@ -42,6 +42,25 @@ fn opt_fold_float(int64 op, int64 lbits, int64 rbits) -> int64 {
     return 0;
 }
 
+// Negate a float bit pattern.
+//
+// IEEE-754 negation is a sign-bit flip — exactly what the ARM64 FNEG the codegen
+// emits does — and NOT `0.0 - x`. The two differ on zero and on nothing else:
+// rounding `0.0 - 0.0` to nearest gives `+0.0`, so folding `-0.0` as a
+// subtraction produced `+0.0` while the identical expression at run time (FNEG)
+// produced `-0.0`. The folder and the hardware disagreed on the one input where
+// the sign is the whole point. Flipping the bit is also right for the
+// infinities, and it leaves a NaN's payload untouched instead of quieting it the
+// way an arithmetic op would.
+//
+// The sign bit is written `1 << 63` rather than as the literal
+// `-9223372036854775808`, because the lexer saturates an out-of-range integer
+// literal to INT64_MAX: the literal spelling of the sign bit parses to
+// `9223372036854775807`, whose XOR flips everything *but* the sign.
+fn fneg_bits(int64 bits) -> int64 {
+    return bits ^ (1 << 63);
+}
+
 // Fold a builtin float function call when all args are constant floats.
 // Returns a new ND_FLOAT node with the result bit pattern, or 0 if not foldable.
 fn opt_fold_float_call(string callee, int64 head) -> int64 {
@@ -501,8 +520,13 @@ fn opt_expr(int64 node) -> int64 {
             if (op == OP_BITNOT) { return new_node(ND_INT, "", ~v, 0, 0, 0); }
         }
         // Negating a float constant: flip the sign bit in the bit pattern.
+        //
+        // NOT `0.0 - x`. An IEEE-754 negate is a sign-bit flip (what the FNEG
+        // the codegen emits does), and subtraction rounds `0.0 - 0.0` to `+0.0`,
+        // so the folded `-0.0` came out as `+0.0` while the same expression at
+        // run time produced `-0.0`. See `fneg_bits`.
         if (ck == ND_FLOAT && op == OP_NEG) {
-            return new_node(ND_FLOAT, "", fsub_bits(0, nd_iv[cn]), 0, 0, 0);
+            return new_node(ND_FLOAT, "", fneg_bits(nd_iv[cn]), 0, 0, 0);
         }
         return node;
     }

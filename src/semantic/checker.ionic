@@ -96,6 +96,14 @@ fn elem_sv(int64 e) -> string {
 }
 
 // Decode an array element type from its sv-string form ("" means unknown).
+//
+// The two tensor codes are part of the round trip. `elem_sv` encodes every type
+// except TY_ARRAY and TY_STRUCT, so a `[tensor@cpu]` binding stores "9" in its
+// sv column — and this function used to discard it, reporting TY_UNKNOWN for an
+// element type the array had recorded. That is what let a `tensor@cpu` element
+// be read inside a `gpu { }` block with no placement diagnostic: the index
+// expression's type was unknown, so nothing downstream could tell it was a
+// host-pool value.
 fn elem_from_sv(string sv) -> int64 {
     if (str_len(sv) == 0) { return TY_UNKNOWN; }
     let v = str_to_int64(sv);
@@ -103,6 +111,8 @@ fn elem_from_sv(string sv) -> int64 {
     if (v == TY_FLOAT64) { return TY_FLOAT64; }
     if (v == TY_STR)     { return TY_STR; }
     if (v == TY_BOOL)    { return TY_BOOL; }
+    if (v == TY_TENSOR_CPU) { return TY_TENSOR_CPU; }
+    if (v == TY_TENSOR_GPU) { return TY_TENSOR_GPU; }
     // TY_VOID/TY_ARRAY as element types are not supported; treat as unknown.
     return TY_UNKNOWN;
 }
@@ -589,6 +599,12 @@ mut fn_pstarts = [0];
 mut fn_hws     = [0];   // hw annotation node per fn (0 = none) — for @cpu/@gpu checks
 mut fn_is_builtin = [0]; // 1 for registered builtins, 0 for user functions
 mut fn_pool_poly = [0];  // 1 = result pool is inferred from the first tensor arg
+// 1 when calling this function from a GPU context would (transitively) perform
+// CPU-only work — see `gpu_taint_compute`. Parallel to fn_names, filled by a
+// whole-program pre-pass because the question is interprocedural.
+mut fn_taints  = [0];
+// The callee that makes fn_taints[i] true, for the diagnostic.
+mut fn_taint_leafs = [""];
 mut fn_count   = 0;
 // Flat param table
 mut fp_tys   = [0];
@@ -1478,6 +1494,199 @@ fn is_cpu_only_fn(string name) -> bool {
     return false;
 }
 
+// ── Transitive CPU-only reachability (the "untagged helper" hole) ────────────
+//
+// The GPU-boundary rules are stated at three places — a `tensor@cpu` name used
+// in a gpu context, a CPU-only builtin called in a gpu context, and an `@cpu`
+// function called in a gpu context — and all three inspect only what is written
+// *at that site*. That leaves a hole one call deep:
+//
+//     fn stealth_logger(string msg) -> int64 { println(msg); return 1; }
+//     gpu { let x = stealth_logger("did I bypass the @gpu I/O rules?"); }
+//
+// `stealth_logger` carries no annotation, so it is not `@cpu` and the third rule
+// does not fire; the `println` inside it is not in a gpu context, so the second
+// rule does not fire either. The block compiles and the GPU context performs
+// stdio — the exact thing the rules exist to forbid. The same shape smuggles a
+// `@cpu` callee one level down, or a CPU-only builtin two levels down.
+//
+// The fix is to close the rule over the call graph: an unannotated function is
+// CPU context (docs/language.md says so: "`@cpu fn` bodies and unannotated
+// functions run in CPU context"), so a function that can reach CPU-only work is
+// a CPU-context function, and calling it from a GPU context is the same error as
+// writing the `println` there directly.
+//
+// Deliberately NOT "ban every unannotated callee": an untagged helper that only
+// does integer arithmetic is pure and must stay callable from a gpu block —
+// `fn double(int64 x) -> int64 { return x * 2; }` is not CPU-bound work.
+// Tainting only what actually reaches CPU state is what keeps this from being a
+// false rejection, and a false rejection here would be far worse than the hole:
+// it would make the feature useless rather than merely porous.
+//
+// Computing it needs every body, and a fixpoint rather than one pass, because
+// the reachability is transitive: `a` calls `b` calls `println` must taint both,
+// and the order the definitions appear in must not matter.
+mut g_taint_hit  = 0;   // set by the walker when it finds CPU-only reachability
+mut g_taint_leaf = "";  // the builtin / annotation that made it so, for the message
+
+// Record a hit. First one wins, so the message names the I/O that is actually
+// reachable rather than whichever call the walker happened to visit last.
+fn taint_hit(string leaf) -> int64 {
+    if (g_taint_hit == 0) { g_taint_hit = 1; g_taint_leaf = leaf; }
+    return 0;
+}
+
+fn taint_expr(int64 n) -> int64 {
+    if (n == 0 || g_taint_hit == 1) { return 0; }
+    let k = nd_kind[n];
+
+    if (k == ND_CALL) {
+        let callee = nd_sv[n];
+        if (is_cpu_only_fn(callee)) { taint_hit(callee); return 0; }
+        let f = fn_find(callee);
+        if (f != 0) {
+            if (hw_ann_is_cpu(fn_hws[f])) { taint_hit(callee); return 0; }
+            if (fn_is_builtin[f] == 0 && fn_taints[f] == 1) {
+                // Report the ultimate cause, not the intermediate helper, so a
+                // chain `a -> b -> println` names `println`.
+                taint_hit(fn_taint_leafs[f]);
+                return 0;
+            }
+        }
+        mut a = nd_i2[n];
+        while (a != 0) { taint_expr(nd_i2[a]); if (g_taint_hit == 1) { return 0; } a = nd_i3[a]; }
+        return 0;
+    }
+
+    // `&&` is not short-circuit in this compiler, so every branch is written out.
+    if (k == ND_BINOP) {
+        taint_expr(nd_i2[n]);
+        if (g_taint_hit == 0) { taint_expr(nd_i3[n]); }
+        return 0;
+    }
+    if (k == ND_UNOP || k == ND_FIELD_ACCESS) { taint_expr(nd_i2[n]); return 0; }
+    if (k == ND_TO_GPU || k == ND_TO_CPU)     { taint_expr(nd_i2[n]); return 0; }
+    if (k == ND_INDEX) {
+        taint_expr(nd_i2[n]);
+        if (g_taint_hit == 0) { taint_expr(nd_i3[n]); }
+        return 0;
+    }
+    if (k == ND_METHOD_CALL) {
+        taint_expr(nd_i2[n]);
+        mut a = nd_i3[n];
+        while (a != 0) { taint_expr(nd_i2[a]); if (g_taint_hit == 1) { return 0; } a = nd_i3[a]; }
+        return 0;
+    }
+    if (k == ND_ARRAY_LIT || k == ND_STRUCT_LIT) {
+        taint_expr(nd_i2[n]);
+        return 0;
+    }
+    if (k == ND_FIELD_INIT) { taint_expr(nd_i2[n]); return 0; }
+
+    return 0;
+}
+
+fn taint_stmts(int64 list) -> int64 {
+    mut c = list;
+    while (c != 0) {
+        taint_stmt(nd_i2[c]);
+        if (g_taint_hit == 1) { return 0; }
+        c = nd_i3[c];
+    }
+    return 0;
+}
+
+fn taint_stmt(int64 node) -> int64 {
+    if (node == 0 || g_taint_hit == 1) { return 0; }
+    let k = nd_kind[node];
+
+    if (k == ND_LET)    { taint_expr(nd_i3[node]); return 0; }
+    if (k == ND_ASSIGN) {
+        taint_expr(nd_i2[node]);
+        if (g_taint_hit == 0) { taint_expr(nd_i3[node]); }
+        return 0;
+    }
+    if (k == ND_EXPR_STMT || k == ND_RETURN) { taint_expr(nd_i2[node]); return 0; }
+
+    if (k == ND_IF) {
+        taint_expr(nd_i2[node]);
+        if (g_taint_hit == 0) { taint_stmts(nd_i2[nd_i3[node]]); }
+        if (g_taint_hit == 0 && nd_i4[node] != 0) { taint_stmts(nd_i2[nd_i4[node]]); }
+        return 0;
+    }
+    if (k == ND_WHILE) {
+        taint_expr(nd_i2[node]);
+        if (g_taint_hit == 0) { taint_stmts(nd_i2[nd_i3[node]]); }
+        return 0;
+    }
+    if (k == ND_FOR) {
+        taint_expr(nd_i2[node]);
+        if (g_taint_hit == 0) { taint_expr(nd_i3[node]); }
+        if (g_taint_hit == 0) { taint_stmts(nd_i2[nd_i4[node]]); }
+        return 0;
+    }
+    if (k == ND_BLOCK)     { taint_stmts(nd_i2[node]); return 0; }
+    if (k == ND_GPU_BLOCK) { taint_stmts(nd_i2[node]); return 0; }
+
+    return 0;
+}
+
+// Fill `fn_taints` for every user function. Runs before any body is checked, so
+// a call site can consult it. Builtins keep taint 0 — `is_cpu_only_fn` covers
+// them directly, and they have no body to walk.
+//
+// The loop is a fixpoint, not a single pass: a function is tainted by calling a
+// function that is tainted, and that second fact may only become known after the
+// first function was scanned. The round cap is a safety net against a pathological
+// program, not an expected exit condition — with N functions N rounds suffice.
+fn gpu_taint_compute(int64 fns_list) -> int64 {
+    mut changed = 1;
+    mut rounds  = 0;
+    while (changed == 1 && rounds <= fn_count) {
+        changed = 0;
+        mut fnode = fns_list;
+        while (fnode != 0) {
+            let def = nd_i2[fnode];
+            let fi  = fn_find(nd_sv[def]);
+            if (fi != 0 && fn_is_builtin[fi] == 0 && fn_taints[fi] == 0) {
+                g_taint_hit  = 0;
+                g_taint_leaf = "";
+                let body = nd_i4[def];
+                if (body != 0) { taint_stmts(nd_i2[body]); }
+                if (g_taint_hit == 1) {
+                    fn_taints[fi]      = 1;
+                    fn_taint_leafs[fi] = g_taint_leaf;
+                    changed = 1;
+                }
+            }
+            fnode = nd_i3[fnode];
+        }
+        rounds = rounds + 1;
+    }
+    return 0;
+}
+
+// The placement rule applied to a value that did not arrive as a bare name.
+//
+// The bare-name rule lives in sc_expr's ND_IDENT arm. A `tensor@cpu` can also
+// reach a gpu context through a struct field (`p.data`) or an array element
+// (`box[0]`), and neither path went through that arm, so both compiled: the
+// block did `mlx_matmul(p.data, p.data)` on host-pool handles with no
+// diagnostic. Sharing one implementation is what keeps the two spellings from
+// drifting apart again.
+fn sc_check_placement_value(int64 ty, string what) -> int64 {
+    if (sc_in_conversion == 1) { return 0; }
+    if (sc_in_gpu_block == 1 && ty == TY_TENSOR_CPU) {
+        sc_error_at(str_concat("tensor@cpu ", str_concat(what, " used inside gpu block")),
+            "call .toGpu() to move it to the GPU first");
+    }
+    if (sc_in_gpu_block == 0 && ty == TY_TENSOR_GPU) {
+        sc_error_at(str_concat("tensor@gpu ", str_concat(what, " used outside gpu block")),
+            "call .toCpu() to bring it back to the CPU first");
+    }
+    return 0;
+}
+
 // ── sc_expr result globals ────────────────────────────────────────────────────
 mut sc_ty      = 0;
 mut sc_sv      = "";
@@ -1550,6 +1759,8 @@ fn register_fn_node(int64 node) -> int64 {
         fn_hws[fn_count]     = hw_node;
         fn_is_builtin[fn_count] = 0;
         fn_pool_poly[fn_count]  = 0;
+        fn_taints[fn_count]     = 0;
+        fn_taint_leafs[fn_count] = "";
     } else {
         push(fn_names,   name);
         push(fn_ret_tys, ret_ty);
@@ -1557,6 +1768,8 @@ fn register_fn_node(int64 node) -> int64 {
         push(fn_hws,     hw_node);
         push(fn_is_builtin, 0);
         push(fn_pool_poly,  0);
+        push(fn_taints,     0);
+        push(fn_taint_leafs, "");
     }
     let pstart = fp_count + 1;
     if (fn_count < len(fn_pstarts)) { fn_pstarts[fn_count] = pstart; }
@@ -1648,6 +1861,8 @@ fn register_builtin(string name, int64 pcount, int64 ret_ty, string ret_sv) -> i
         fn_hws[fn_count]     = 0;
         fn_is_builtin[fn_count] = 1;
         fn_pool_poly[fn_count]  = 0;
+        fn_taints[fn_count]     = 0;
+        fn_taint_leafs[fn_count] = "";
     } else {
         push(fn_names,   name);
         push(fn_ret_tys, ret_ty);
@@ -1656,6 +1871,8 @@ fn register_builtin(string name, int64 pcount, int64 ret_ty, string ret_sv) -> i
         push(fn_hws,     0);
         push(fn_is_builtin, 1);
         push(fn_pool_poly,  0);
+        push(fn_taints,     0);
+        push(fn_taint_leafs, "");
     }
     let pstart = fp_count + 1;
     if (fn_count < len(fn_pstarts)) { fn_pstarts[fn_count] = pstart; }
@@ -2204,6 +2421,24 @@ fn sc_expr(int64 node) -> int64 {
                 "cannot be called from a GPU context (gpu block or @gpu fn)");
         }
 
+        // ...and neither can an *unannotated* function that reaches CPU state.
+        // The `@cpu` check above covers what the declaration says; this covers
+        // what the body does. Without it the annotation is the only defence,
+        // and an unannotated helper — which is CPU context by default — is an
+        // open door: `fn log(string s) { println(s); }` called from a gpu block
+        // performed stdio there while every rule said it could not.
+        //
+        // Only functions that actually *reach* CPU-only work are tainted (see
+        // gpu_taint_compute), so a pure helper stays callable. The message names
+        // the builtin at the bottom of the chain, which is the thing the reader
+        // has to move out of the block.
+        if (sc_in_gpu_block == 1 && fn_taints[fi] == 1 && fn_is_builtin[fi] == 0) {
+            sc_error_at(str_concat("function '", str_concat(callee, "'")),
+                str_concat(str_concat(str_concat("reaches CPU-only I/O ('", fn_taint_leafs[fi]),
+                                      "') and cannot be called from a gpu context"),
+                           " (gpu blocks may only perform tensor compute)"));
+        }
+
         let want_argc = fn_pcounts[fi];
         if (want_argc >= 0 && got_argc != want_argc) {
             sc_error_at(str_concat("wrong arg count calling '", str_concat(callee, "'")),
@@ -2355,6 +2590,12 @@ fn sc_expr(int64 node) -> int64 {
         if (fty == TY_UNKNOWN) {
             sc_error_at(str_concat("no field '", str_concat(field, str_concat("' on struct '", str_concat(obj_sv, "'")))), "");
         }
+        // A tensor field is a placement-typed value just like a name. `p.data`
+        // inside a gpu block used to slip past the ND_IDENT rule because the
+        // type arrived through a field instead of a binding, so the block did
+        // host-pool work with no diagnostic.
+        sc_active_node = node;
+        sc_check_placement_value(fty, str_concat(str_concat("field '", field), "'"));
         sc_ty = fty; sc_sv = st_field_sv(st_idx, field); return 0;
     }
 
@@ -2369,7 +2610,14 @@ fn sc_expr(int64 node) -> int64 {
             sc_ty = TY_INT64; sc_sv = ""; return 0;
         }
         if (obj_ty == TY_ARRAY) {
-            sc_ty = elem_from_sv(obj_sv); sc_sv = ""; return 0;
+            let ety = elem_from_sv(obj_sv);
+            // The element is as placement-typed as a name is. This was the other
+            // hole: `box_arr[0]` reached a host-pool tensor without passing
+            // through the ND_IDENT rule, because `elem_from_sv` used to report
+            // TY_UNKNOWN for the tensor codes and there was no check here.
+            sc_active_node = node;
+            sc_check_placement_value(ety, "element");
+            sc_ty = ety; sc_sv = ""; return 0;
         }
         if (obj_ty != TY_UNKNOWN) {
             sc_error_at("index operator", str_concat("cannot index into ", ty_name(obj_ty, obj_sv)));
@@ -2873,6 +3121,11 @@ fn sc_program(int64 structs_list, int64 fns_list, int64 top_list) -> int64 {
     pre_pass_structs(structs_list);
     pre_pass_fns(fns_list);
     register_builtins();
+    // Answer "does this function reach CPU-only work?" for every function
+    // before any body is checked, because a call site needs the answer and the
+    // reachability is interprocedural: it cannot be derived from one body at a
+    // time. See the note above gpu_taint_compute.
+    gpu_taint_compute(fns_list);
     pool_scan_toplevel(top_list);
 
     // Pre-declare top-level globals so functions that reference them work.

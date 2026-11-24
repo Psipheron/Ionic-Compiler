@@ -2758,8 +2758,32 @@ fn ncg_call(int64 node) -> int64 {
         else                      { ncg_last_ty = 0; }
     }
 
-    // Remap Ionic builtin names → C runtime functions
+    // Remap Ionic builtin names → C runtime functions.
+    //
+    // Only for names the *program does not define*. A user function may legally
+    // be called `str_to_int64`, and the checker resolves calls to the user's
+    // declaration (user functions are registered before builtins, and `fn_find`
+    // returns the first match). Codegen has to agree: without this guard every
+    // call to a user `str_to_int64` was rewritten to `ionic_str_to_int64`, so
+    //
+    //     fn str_to_int64(string s) -> int64 { ... }   // returns 10
+    //     println(int64_to_str(str_to_int64("123")));  // printed 123
+    //
+    // ran the runtime's saturating `strtoll` instead of the program's own code —
+    // a silent wrong answer, and the reason the *compiler's own* lexer mis-parsed
+    // an out-of-range literal: `src/lexer/lexer.ionic` defines its own
+    // `str_to_int64` and every call to it was hijacked, so
+    // `9223372036854775808` lexed to INT64_MAX instead of wrapping.
+    //
+    // The check is name-based and applies to the whole block, not just this one
+    // entry, because the hijack is a property of the name collision rather than
+    // of any particular builtin.
+    mut user_defined = 0;
+    let declared = fn_find(callee);
+    if (declared != 0 && fn_is_builtin[declared] == 0) { user_defined = 1; }
+
     mut real_callee = callee;
+    if (user_defined == 0) {
     if (str_eq(callee, "main")) { real_callee = "ionic_user_main"; }
     if (str_eq(callee, "println")) {
         if (ncg_last_ty == 1)      { real_callee = "ionic_println"; }
@@ -2925,6 +2949,7 @@ fn ncg_call(int64 node) -> int64 {
     if (str_eq(callee, "mlx_weights_key_at"))  { real_callee = "ionic_mlx_weights_key_at"; }
     if (str_eq(callee, "mlx_weights_get"))     { real_callee = "ionic_mlx_weights_get"; }
     if (str_eq(callee, "mlx_save_safetensors")) { real_callee = "ionic_mlx_save_safetensors"; }
+    }   // end `user_defined == 0` — a user function keeps its own symbol
 
     // Reclaim any producer temporaries among the arguments. The stash has to
     // happen here — after Phase 2 put the values in X0..X7 and before the BL —
