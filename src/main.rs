@@ -199,6 +199,20 @@ fn main() {
     let mut clang_args: Vec<String> = vec![
         ir_path.clone(), "-o".to_string(), out_bin.clone(), "-lm".to_string(),
     ];
+    // The IR this backend emits carries no `target triple`, and that is not an
+    // omission to be filled in: the module is host-agnostic (it calls
+    // `ionic_target_is_linux()` and lets the runtime decide), so clang is the
+    // one that knows which machine this binary is for.
+    //
+    // On Darwin clang reports that as `warning: overriding the module target
+    // triple with arm64-apple-macosx<os version> [-Woverride-module]`, on every
+    // compile, because the triple it overrides with is versioned by the host
+    // OS. Pinning one into the IR is not a fix: a triple that matches this
+    // machine (macosx27.0.0 here) is simply wrong on the next macOS, and a
+    // wrong one warns just the same (macosx14.0.0 warns on macosx27.0.0).
+    // Retargeting is exactly what we want clang to do, so the diagnostic is
+    // turned off at the one site that asks for it.
+    clang_args.push("-Wno-override-module".to_string());
     if has_runtime {
         clang_args.push(runtime_obj.to_string());
     }
