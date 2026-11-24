@@ -114,7 +114,12 @@ jobs:
           mkdir -p "${STAGING}/lib"
           cp -R lib/. "${STAGING}/lib/"
           mkdir -p "${STAGING}/src"
+          # The backends are #included, not separately compiled, so they have to
+          # travel with the core file: an installed compiler that shipped only
+          # ionic_model_runtime.c would fail with "'ionic_runtime_ort.inc' file
+          # not found" the first time a user compiled anything.
           cp src/ionic_model_runtime.c "${STAGING}/src/"
+          cp src/ionic_runtime_ort.inc src/ionic_runtime_mlx.inc "${STAGING}/src/"
 
           tar -czf "${STAGING}.tar.gz" "${STAGING}"
           echo "TARBALL=${STAGING}.tar.gz" >> "$GITHUB_ENV"

@@ -333,7 +333,12 @@ jobs:
           cp ionic_new "$STAGE/ionic"
           cp README.md "$STAGE/"
           cp -R lib/. "$STAGE/lib/"
+          # The backends are #included by the core file, so all three travel
+          # together. Shipping only the .c would make the packaged compiler fail
+          # on the first user program with a missing-include error, which is
+          # exactly the class of bug this step exists to catch.
           cp src/ionic_model_runtime.c "$STAGE/src/"
+          cp src/ionic_runtime_ort.inc src/ionic_runtime_mlx.inc "$STAGE/src/"
           ( cd /tmp/ionic-pkg && tar -czf ionic-vTEST.tar.gz "$(basename $STAGE)" )
           rm -rf /tmp/ionic-extract && mkdir /tmp/ionic-extract
           tar -xzf /tmp/ionic-pkg/ionic-vTEST.tar.gz -C /tmp/ionic-extract

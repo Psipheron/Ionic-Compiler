@@ -769,11 +769,18 @@ where backend discovery runs.
 ```sh
 # on the build machine
 ionic app.ionic -o app --target aarch64-linux
-scp app.o src/ionic_model_runtime.c target:
+scp app.o src/ionic_model_runtime.c src/ionic_runtime_ort.inc \
+    src/ionic_runtime_mlx.inc target:
 
 # on the Linux ARM64 target
 clang app.o ionic_model_runtime.c -o app -lm
 ```
+
+All three runtime files have to travel together and stay in the same directory:
+`ionic_model_runtime.c` is the core, and it `#include`s the two `.inc` backends,
+so a target holding only the `.c` fails with `'ionic_runtime_ort.inc' file not
+found`. Only the `.c` is named on the `clang` line — the preprocessor resolves
+the includes relative to it.
 
 `--print-link` prints the exact `clang` command line (including any detected
 `-DIONIC_HAVE_*`, `-I`, `-L` and `-l` backend flags) and exits without linking.

@@ -218,6 +218,15 @@ if (cross_compiling == 1) {
     println(str_concat("  clang ", str_concat(obj_path,
         str_concat(" ", str_concat(rt_src, str_concat(" -o ", str_concat(out_name, " -lm")))))));
     println("");
+    // The runtime is three files, not one: the backends are #included by the
+    // core, so they must sit beside it in the same directory on the target or
+    // the compile fails with "'ionic_runtime_ort.inc' file not found".
+    println("Copy all three runtime files together — ionic_model_runtime.c,");
+    println("ionic_runtime_ort.inc and ionic_runtime_mlx.inc — keeping them in");
+    println("the same directory as each other:");
+    println("");
+    println(str_concat("  scp ", str_concat(obj_path, " src/ionic_model_runtime.c src/ionic_runtime_ort.inc src/ionic_runtime_mlx.inc target:")));
+    println("");
     println("Add -DIONIC_HAVE_ORT -I<dir> -L<dir> -lonnxruntime at that link if the");
     println("program uses ONNX inference. Backend discovery runs on the machine");
     println("that links, not the one that compiles.");
