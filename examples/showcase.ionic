@@ -3,7 +3,7 @@
 
 // ── Type inference ────────────────────────────────────────────────
 let greeting = "AIL v0.1.0 — Java style, C speed";
-print(greeting);
+println(greeting);
 
 // ── Explicit types ────────────────────────────────────────────────
 let pi: float64 = 3.14159265358979;
@@ -11,14 +11,14 @@ let n:  int64   = 1000000;
 
 // ── Arithmetic ────────────────────────────────────────────────────
 let circumference = 2.0 * pi * 5.0;
-print(circumference);
+println(circumference);
 
 // ── Mutable variables ─────────────────────────────────────────────
 mut sum = 0;
 for (i in 0..100) {
     sum = sum + i;
 }
-print(sum);   // 0+1+...+99 = 4950
+println(sum);   // 0+1+...+99 = 4950
 
 // ── Recursion ─────────────────────────────────────────────────────
 fn power(int64 base, int64 exp) -> int64 {
@@ -27,7 +27,7 @@ fn power(int64 base, int64 exp) -> int64 {
 }
 
 let p = power(2, 16);
-print(p);   // 65536
+println(p);   // 65536
 
 // ── Higher-order logic ────────────────────────────────────────────
 fn is_prime(int64 n) -> bool {
@@ -46,7 +46,7 @@ for (k in 2..100) {
         prime_count = prime_count + 1;
     }
 }
-print(prime_count);   // 25 primes below 100
+println(prime_count);   // 25 primes below 100
 
 // ── Hardware-typed variables (parsed + enforced) ──────────────────
 // let weights: tensor@gpu = ...;
@@ -54,4 +54,4 @@ print(prime_count);   // 25 primes below 100
 // gpu { let out = forward(inputs.toGpu(), weights); }
 
 let done = "Done.";
-print(done);
+println(done);

@@ -12,7 +12,7 @@ let vram = 25769803776;   // 24 GiB of accelerator memory
 
 @cpu fn scale(int64 n) -> int64 {
     // CPU context: I/O (print) and ordinary compute are both fine here.
-    print("scaling on the cpu");
+    println("scaling on the cpu");
     return n * 2;
 }
 
@@ -26,6 +26,6 @@ let vram = 25769803776;   // 24 GiB of accelerator memory
 }
 
 fn main() -> int64 {
-    print(int64_to_str(scale(21)));   // @cpu fn, called from CPU context
+    println(int64_to_str(scale(21)));   // @cpu fn, called from CPU context
     return 0;
 }
