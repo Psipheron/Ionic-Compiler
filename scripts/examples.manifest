@@ -90,6 +90,11 @@ examples/mastery/07_leak.ionic	ok	0	ok	ok
 examples/mastery/07_model_raii.ionic	ok	0	ok	ok
 examples/mastery/fail/gpu_cpu_io.ionic	neg	-	ok	ok
 examples/mastery/fail/immutable.ionic	neg	-	ok	ok
+# The Rust bootstrap has no shape channel, so it never compares matmul
+# dimensions: it accepts this program (exit 0, measured). Native rejects it
+# with "matmul shape mismatch", which is the documented behaviour — a product
+# of incompatible inner dimensions must not compile. Visible gap, not rot:
+# delete this skip when the bootstrap's checker reaches parity.
 examples/mastery/fail/matmul_shape.ionic	neg	-	ok	skip
 examples/mastery/fail/mixed_pool.ionic	neg	-	ok	ok
 examples/mastery/fail/multi_error.ionic	neg	-	ok	ok
