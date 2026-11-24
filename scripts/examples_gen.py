@@ -26,6 +26,20 @@ NATIVE = os.environ.get("IONIC", "./ionic_new")
 RUST = "./target/release/ionic"
 TIMEOUT = int(os.environ.get("EXAMPLE_TIMEOUT", "60"))
 
+# Measure with both ML backends forced OFF, regardless of what is installed.
+#
+# Without this the manifest records the machine, not the program: an example
+# that uses mlx_* exits 0 on a developer box with mlx-c linked in and 1 ("not
+# compiled in") on a bare CI runner. The first version of this gate was
+# generated locally and then failed on CI for exactly that reason — two rows
+# asserted exit statuses the runner's environment could not produce.
+#
+# Forcing the backends off makes every measurement depend only on the compiler
+# and the source, so the file regenerates identically here and on the runner and
+# `--check` can actually hold. Backend-dependent behaviour is covered by the
+# dedicated MLX/ONNX steps in ci.yml, which run where the libraries exist.
+MEASURE_ENV = {**os.environ, "IONIC_NO_MLX": "1", "IONIC_NO_ORT": "1"}
+
 # A comment, not a bare header line: the gate strips comment lines and treats
 # everything else as data, so an un-prefixed header would be parsed as a row
 # naming a file called "path".
@@ -44,12 +58,19 @@ PREAMBLE = """\
 #             `neg` — must be REJECTED by the compiler (the *_error and
 #                     mastery/fail programs; their own first line says so)
 #   run_exit  the exit status the compiled program must produce, or `.` for
-#             "compile only". `.` is used where the status legitimately depends
-#             on which ML backends the machine has, or where the program is
-#             deliberately silent.
+#             "compile only". `.` is used where the program is deliberately
+#             silent, and for anything whose exit status is a property of the
+#             machine rather than the source — see the note on ML backends below.
 #   native    `ok`   — the self-hosted compiler must meet this expectation
 #             `skip` — known gap, recorded rather than hidden
 #   rust      same, for the Rust bootstrap (target/release/ionic)
+#
+# Every measurement is taken with IONIC_NO_MLX=1 and IONIC_NO_ORT=1, so the file
+# describes the program rather than the machine that generated it. Without that,
+# an example using mlx_* records exit 0 on a box with mlx-c installed and exit 1
+# ("backend not compiled in") on a CI runner, and `--check` can never agree with
+# either. Backend-dependent behaviour is tested by the dedicated MLX/ONNX steps
+# in ci.yml, which run where the libraries exist.
 #
 # `skip` is deliberately narrow and every entry carries its reason. A gate that
 # silently tolerated a whole class of failure would not be a gate, so the point
@@ -76,7 +97,8 @@ def kind_of(path):
 def compiles(binary, path, out):
     # Both backends print diagnostics to stdout, so capture both streams.
     return subprocess.run(
-        [binary, path, "-o", out], capture_output=True, timeout=TIMEOUT
+        [binary, path, "-o", out],
+        capture_output=True, timeout=TIMEOUT, env=MEASURE_ENV,
     ).returncode == 0
 
 
@@ -99,14 +121,16 @@ def measure(path):
     run_exit = "."
     if native_ok:
         try:
-            proc = subprocess.run(["/tmp/gen_n"], capture_output=True, timeout=TIMEOUT)
+            proc = subprocess.run(
+                ["/tmp/gen_n"], capture_output=True, timeout=TIMEOUT, env=MEASURE_ENV
+            )
         except subprocess.TimeoutExpired:
             proc = None
         if proc is not None:
-            # A silent exit-0 program is either a deliberately quiet demo or one
-            # whose output depends on the machine's backends. Either way the
-            # gate cannot assert a status it does not understand, so compile
-            # only.
+            # A program that must exit 0 but prints nothing is either a
+            # deliberately silent demo or one whose output depends on the
+            # machine. Either way the gate cannot assert a status it does not
+            # understand, so record compile-only.
             silent_ok = proc.returncode == 0 and not proc.stdout.strip()
             if not silent_ok:
                 run_exit = str(proc.returncode)

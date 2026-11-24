@@ -10,12 +10,19 @@
 #             `neg` — must be REJECTED by the compiler (the *_error and
 #                     mastery/fail programs; their own first line says so)
 #   run_exit  the exit status the compiled program must produce, or `.` for
-#             "compile only". `.` is used where the status legitimately depends
-#             on which ML backends the machine has, or where the program is
-#             deliberately silent.
+#             "compile only". `.` is used where the program is deliberately
+#             silent, and for anything whose exit status is a property of the
+#             machine rather than the source — see the note on ML backends below.
 #   native    `ok`   — the self-hosted compiler must meet this expectation
 #             `skip` — known gap, recorded rather than hidden
 #   rust      same, for the Rust bootstrap (target/release/ionic)
+#
+# Every measurement is taken with IONIC_NO_MLX=1 and IONIC_NO_ORT=1, so the file
+# describes the program rather than the machine that generated it. Without that,
+# an example using mlx_* records exit 0 on a box with mlx-c installed and exit 1
+# ("backend not compiled in") on a CI runner, and `--check` can never agree with
+# either. Backend-dependent behaviour is tested by the dedicated MLX/ONNX steps
+# in ci.yml, which run where the libraries exist.
 #
 # `skip` is deliberately narrow and every entry carries its reason. A gate that
 # silently tolerated a whole class of failure would not be a gate, so the point
@@ -49,7 +56,7 @@ examples/math.ionic	ok	0	ok	ok
 # Uses `c += 1`. The Rust bootstrap has no compound assignment at all, so it
 # fails to parse the file. Native compiles and runs it. Fixing `+=` in the
 # bootstrap removes this skip; until then it is a real backend gap, not rot.
-examples/mlx_matmul.ionic	ok	0	ok	skip
+examples/mlx_matmul.ionic	ok	1	ok	skip
 examples/multitarget_test.ionic	ok	0	ok	ok
 examples/rss_churn.ionic	ok	0	ok	ok
 examples/rss_churn_let.ionic	ok	0	ok	ok
@@ -75,7 +82,7 @@ examples/mastery/03_escapes.ionic	ok	0	ok	ok
 examples/mastery/03_file_io.ionic	ok	0	ok	ok
 # Exit status depends on whether a model backend is linked in: 1 with ONNX,
 # 0 on a bare runner. Compile-only, so the gate is not measuring the machine.
-examples/mastery/04_placement_types.ionic	ok	1	ok	ok
+examples/mastery/04_placement_types.ionic	ok	0	ok	ok
 examples/mastery/04_pool_budget.ionic	ok	0	ok	ok
 examples/mastery/04_pool_polymorphism.ionic	ok	0	ok	ok
 examples/mastery/05_selective.ionic	ok	0	ok	ok

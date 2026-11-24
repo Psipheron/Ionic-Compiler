@@ -40,8 +40,20 @@
 #   BACKEND=rust   scripts/examples_check.sh   # Rust bootstrap only
 #   IONIC=./some/binary scripts/examples_check.sh
 set -u
-case "$0" in
-  */*) cd "$(dirname "$0")/.." || exit 1 ;;
+# Resolve through symlinks: a script linked into ~/bin or /usr/local/bin would
+# otherwise `cd` to the link's directory and fail to find the repo. Other gates
+# in scripts/ have the same limitation, but this one is worth getting right
+# because it is the kind of thing people wire into an editor's save hook.
+self="$0"
+while [ -L "$self" ]; do
+    target=$(readlink "$self")
+    case "$target" in
+      /*) self="$target" ;;
+      *)  self="$(dirname "$self")/$target" ;;
+    esac
+done
+case "$self" in
+  */*) cd "$(dirname "$self")/.." || exit 1 ;;
   *)   cd . || exit 1 ;;
 esac
 
@@ -53,6 +65,18 @@ WORK="${TMPDIR:-/tmp}/ionic_examples_check"
 # only here so a regression that turns one into an infinite loop fails the gate
 # instead of hanging CI until the job's own timeout.
 LIMIT="${EXAMPLE_TIMEOUT:-60}"
+
+# Measure with both ML backends forced OFF, matching scripts/examples_gen.py.
+#
+# The manifest records what the *program* does, not what this machine happens to
+# have installed. An example that uses mlx_* exits 0 with mlx-c linked in and 1
+# ("not compiled in") without it, so measuring on whatever box is running turns
+# a portable expectation into a machine-specific one. The first version of this
+# gate was generated on a developer machine with MLX and then failed on CI for
+# exactly that reason. Backend behaviour is covered by the dedicated MLX/ONNX
+# steps in ci.yml, which run where the libraries actually exist.
+export IONIC_NO_MLX=1
+export IONIC_NO_ORT=1
 
 rm -rf "$WORK"; mkdir -p "$WORK" || exit 2
 
@@ -109,6 +133,7 @@ if [ ! -s "$WORK/rows" ]; then
 fi
 
 echo "==> Examples: compile, run and reject across backends"
+echo "    (ML backends forced off: the manifest describes the program, not this machine)"
 
 fail=0
 n_ok=0
