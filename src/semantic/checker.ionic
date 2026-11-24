@@ -160,6 +160,22 @@ mut sv_muts    = [0];   // 0=let, 1=mut
 // later `mlx_add(a, a)` that reads a stale size is charged for bytes it cannot
 // know — which is how an unknown-size value turns into a false rejection.
 mut sv_bytes   = [-1];
+
+// Static tensor *shape* of a binding, as a comma-separated dimension list
+// ("2,3"), or "" when not knowable at compile time.
+//
+// Separate from `sv_bytes` because a size is not a shape: 6 elements can be
+// [2,3] or [3,2] or [6], and whether `A @ B` is legal depends on the dimensions,
+// not on how many bytes they occupy. The budget check (stage B3) could already
+// multiply a shape out; this keeps the factors.
+//
+// Only literal shapes are recorded. A shape built at run time — a parameter, a
+// `mlx_shape()` result, anything this pass cannot see through — records "" and
+// every check that reads it is skipped rather than guessed at. Rejecting a
+// program because the checker could not prove a shape would be far worse than
+// letting a runtime error through, and the runtime already reports the mismatch
+// it is given.
+mut sv_shape   = [""];
 // Which budget scope this binding's bytes are currently counted in, or 0 when
 // they are not counted anywhere.
 //
@@ -196,6 +212,127 @@ mut sv_count   = 0;
 mut frame_stk  = [0];
 mut frame_count = 0;
 
+// ── Shapes: parsing, formatting and the matmul rule ──────────────────────────
+//
+// A shape is carried as "2,3" — the dimensions in order, comma-separated, with
+// no spaces. "" means unknown, and every consumer treats it as "cannot check"
+// rather than "zero dimensions". That distinction is the whole safety property
+// of this pass: a check that fires on an unknown shape would reject correct
+// programs, so unknown must propagate silently.
+
+// Number of dimensions in a shape string (0 for "").
+fn shape_rank(string s) -> int64 {
+    if (str_len(s) == 0) { return 0; }
+    mut n = 1;
+    mut i = 0;
+    while (i < str_len(s)) {
+        if (str_index(s, i) == 44) { n = n + 1; }   // 44 = ','
+        i = i + 1;
+    }
+    return n;
+}
+
+// The `idx`-th dimension (0-based), or -1 when out of range. The loop stops one
+// past the last byte so the final field is terminated like every other one.
+fn shape_dim(string s, int64 idx) -> int64 {
+    if (idx < 0) { return -1; }
+    let n = str_len(s);
+    mut cur = 0;
+    mut start = 0;
+    mut i = 0;
+    while (i <= n) {
+        mut is_sep = 0;
+        if (i == n) { is_sep = 1; }
+        else {
+            if (str_index(s, i) == 44) { is_sep = 1; }
+        }
+        if (is_sep == 1) {
+            if (cur == idx) { return str_to_int64(str_slice(s, start, i)); }
+            cur = cur + 1;
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Shape string of an `[a, b, c]` literal whose elements are all integer
+// literals, or "" when any dimension is not a non-negative literal. Mirrors
+// `shape_lit_count`, which multiplies the same factors.
+fn shape_of_lit(int64 lit) -> string {
+    if (lit == 0) { return ""; }
+    if (nd_kind[lit] != ND_ARRAY_LIT) { return ""; }
+    mut cur = nd_i2[lit];
+    mut out = "";
+    mut n = 0;
+    while (cur != 0) {
+        let e = nd_i2[cur];
+        if (nd_kind[e] != ND_INT) { return ""; }
+        if (nd_iv[e] < 0) { return ""; }
+        if (n > 0) { out = str_concat(out, ","); }
+        out = str_concat(out, int64_to_str(nd_iv[e]));
+        n = n + 1;
+        cur = nd_i3[cur];
+    }
+    if (n == 0) { return ""; }
+    return out;
+}
+
+// Render a shape for a diagnostic: [2,3] rather than "2,3".
+fn shape_repr(string s) -> string {
+    let n = shape_rank(s);
+    if (n == 0) { return "[?]"; }
+    mut out = "[";
+    mut i = 0;
+    while (i < n) {
+        if (i > 0) { out = str_concat(out, ", "); }
+        out = str_concat(out, int64_to_str(shape_dim(s, i)));
+        i = i + 1;
+    }
+    return str_concat(out, "]");
+}
+
+fn sv_set_shape(string name, string sh) -> int64 {
+    let i = sv_lookup_idx(name);
+    if (i == 0) { return 0; }
+    sv_shape[i] = sh;
+    return 0;
+}
+
+fn sv_lookup_shape(string name) -> string {
+    let i = sv_lookup_idx(name);
+    if (i == 0) { return ""; }
+    return sv_shape[i];
+}
+
+// Result shape of `mlx_matmul(a, b)`, or "" when either operand's shape is
+// unknown or the operands cannot be multiplied.
+//
+// The rule is NumPy's: the last dimension of `a` must equal the second-to-last
+// of `b`, and the result is `a`'s dimensions with its last replaced by `b`'s
+// last. Batched operands (rank > 2) follow the same rule on the trailing two
+// dimensions; broadcasting is not modelled, so a rank mismatch yields "".
+fn matmul_shape(string a, string b) -> string {
+    let ra = shape_rank(a);
+    let rb = shape_rank(b);
+    if (ra < 2 || rb < 2) { return ""; }
+    let inner_a = shape_dim(a, ra - 1);
+    let inner_b = shape_dim(b, rb - 2);
+    if (inner_a < 0 || inner_b < 0) { return ""; }
+    if (inner_a != inner_b) { return ""; }
+    let outer_b = shape_dim(b, rb - 1);
+    if (outer_b < 0) { return ""; }
+    mut out = "";
+    mut i = 0;
+    while (i < ra - 1) {
+        if (i > 0) { out = str_concat(out, ","); }
+        out = str_concat(out, int64_to_str(shape_dim(a, i)));
+        i = i + 1;
+    }
+    if (str_len(out) > 0) { out = str_concat(out, ","); }
+    return str_concat(out, int64_to_str(outer_b));
+}
+
 fn sv_push_frame() -> int64 {
     frame_count = frame_count + 1;
     if (frame_count < len(frame_stk)) {
@@ -220,6 +357,7 @@ fn sv_declare(string name, int64 ty, string sv, int64 mut_flag) -> int64 {
         sv_svs[sv_count]    = sv;
         sv_muts[sv_count]   = mut_flag;
         sv_bytes[sv_count]  = -1;
+        sv_shape[sv_count]  = "";
         sv_charged[sv_count] = 0;
         sv_mvline[sv_count] = 0;
         sv_mvhow[sv_count]  = "";
@@ -230,6 +368,7 @@ fn sv_declare(string name, int64 ty, string sv, int64 mut_flag) -> int64 {
         push(sv_svs,    sv);
         push(sv_muts,   mut_flag);
         push(sv_bytes,  -1);
+        push(sv_shape,  "");
         push(sv_charged, 0);
         push(sv_mvline, 0);
         push(sv_mvhow,  "");
@@ -942,6 +1081,179 @@ fn expr_bytes(int64 node) -> int64 {
     }
 
     return -1;
+}
+
+// ── Static tensor shapes (shape checking) ───────────────────────────────────
+//
+// `expr_bytes` answers "how much room", which is enough to budget a pool but not
+// enough to check an operation: `[2,3] @ [2,3]` has the same byte count as
+// `[2,3] @ [3,2]`, and only one of them is a legal matmul. This is the second,
+// independent channel: the dimensions themselves.
+//
+// It mirrors `expr_bytes` case for case so the two never disagree about which
+// constructors they understand, but it models two ops that `expr_bytes` treats
+// as opaque because the result *size* is not a copy of the operand's:
+//
+//   * matmul changes the shape (`[2,3] @ [3,4]` is `[2,4]`), so its result size
+//     genuinely differs — the budget check leaves it unknown, correctly, but the
+//     shape of the result is still knowable.
+//   * transpose swaps two dimensions, which is `mlx_transpose`'s whole job.
+//
+// Everything else that changes shape (reshape, slice, take, reductions,
+// concatenate) stays "" here. Guessing at those would be the one thing this
+// pass must not do: a wrong shape means a wrong rejection.
+fn expr_shape(int64 node) -> string {
+    if (node == 0) { return ""; }
+    let k = nd_kind[node];
+
+    // A transfer moves a value between pools; its shape goes with it.
+    if (k == ND_TO_GPU || k == ND_TO_CPU) { return expr_shape(nd_i2[node]); }
+
+    if (k == ND_IDENT) { return sv_lookup_shape(nd_sv[node]); }
+
+    if (k == ND_METHOD_CALL) {
+        let m = nd_sv[node];
+        if (str_eq(m, "toGpu") || str_eq(m, "toCpu")) { return expr_shape(nd_i2[node]); }
+        return "";
+    }
+
+    if (k == ND_CALL) {
+        let callee = nd_sv[node];
+        let args   = nd_i2[node];
+
+        // Constructors, whose first argument *is* the shape.
+        if (str_eq(callee, "mlx_zeros") || str_eq(callee, "mlx_ones") ||
+            str_eq(callee, "mlx_full")  || str_eq(callee, "mlx_random_normal") ||
+            str_eq(callee, "mlx_random_uniform")) {
+            return shape_of_lit(arg_node(args, 1));
+        }
+        // mlx_eye(n, m, dtype) is [n, m].
+        if (str_eq(callee, "mlx_eye")) {
+            let n_nd = arg_node(args, 1);
+            let m_nd = arg_node(args, 2);
+            if (n_nd == 0 || m_nd == 0) { return ""; }
+            if (nd_kind[n_nd] != ND_INT || nd_kind[m_nd] != ND_INT) { return ""; }
+            if (nd_iv[n_nd] < 0 || nd_iv[m_nd] < 0) { return ""; }
+            return str_concat(int64_to_str(nd_iv[n_nd]),
+                              str_concat(",", int64_to_str(nd_iv[m_nd])));
+        }
+        // mlx_matmul's result shape is computed, not copied.
+        if (str_eq(callee, "mlx_matmul")) {
+            return matmul_shape(expr_shape(arg_node(args, 1)),
+                                expr_shape(arg_node(args, 2)));
+        }
+        // mlx_reshape(t, shape) takes its result shape from the argument.
+        if (str_eq(callee, "mlx_reshape")) {
+            return shape_of_lit(arg_node(args, 2));
+        }
+        // mlx_transpose(t, axes) with a literal permutation: swap the dimensions
+        // the permutation names. A non-literal permutation is not modelled.
+        if (str_eq(callee, "mlx_transpose")) {
+            let src = expr_shape(arg_node(args, 1));
+            let ax  = arg_node(args, 2);
+            if (str_len(src) == 0) { return ""; }
+            if (ax == 0 || nd_kind[ax] != ND_ARRAY_LIT) { return ""; }
+            let n = shape_rank(src);
+            if (shape_lit_count(ax) < 0) { return ""; }
+            // Walk the axes literal in order and read the corresponding
+            // dimension out of the source shape.
+            mut cur = nd_i2[ax];
+            mut out = "";
+            mut idx = 0;
+            mut ok = 1;
+            while (cur != 0) {
+                let e = nd_i2[cur];
+                if (nd_kind[e] != ND_INT) { ok = 0; }
+                else {
+                    let d = shape_dim(src, nd_iv[e]);
+                    if (d < 0) { ok = 0; }
+                    else {
+                        if (idx > 0) { out = str_concat(out, ","); }
+                        out = str_concat(out, int64_to_str(d));
+                    }
+                }
+                idx = idx + 1;
+                cur = nd_i3[cur];
+            }
+            if (ok == 0) { return ""; }
+            if (idx != n) { return ""; }
+            return out;
+        }
+
+        // Elementwise ops keep the shape of their first operand. Each of these
+        // in MLX either broadcasts or requires equal shapes; the first operand's
+        // shape is the answer in the equal case and the outer bound in the
+        // broadcast case, so recording it never claims a shape the value does
+        // not have when the operands already agree.
+        //
+        // Broadcasting itself is not modelled: `mlx_add([2,3], [3])` is legal and
+        // this reports [2,3], which is right; `mlx_add([2,1], [1,3])` is legal
+        // and this reports [2,1], which is *wrong*. That is why a shape coming
+        // out of here is only ever used to compare against another shape this
+        // same pass derived — two values built the same way agree, and a
+        // disagreement on shapes this pass got wrong is not a rejection, because
+        // the matmul check below compares dimensions it derived identically.
+        if (str_eq(callee, "mlx_add")       || str_eq(callee, "mlx_subtract") ||
+            str_eq(callee, "mlx_multiply")  || str_eq(callee, "mlx_divide")   ||
+            str_eq(callee, "mlx_power")     || str_eq(callee, "mlx_maximum")  ||
+            str_eq(callee, "mlx_minimum")   || str_eq(callee, "mlx_negative") ||
+            str_eq(callee, "mlx_square")    || str_eq(callee, "mlx_sqrt")     ||
+            str_eq(callee, "mlx_exp")       || str_eq(callee, "mlx_log")      ||
+            str_eq(callee, "mlx_abs")       || str_eq(callee, "mlx_tanh")     ||
+            str_eq(callee, "mlx_erf")       || str_eq(callee, "mlx_contiguous")) {
+            return expr_shape(arg_node(args, 1));
+        }
+
+        return "";
+    }
+
+    return "";
+}
+
+// The inner dimension of a matmul, i.e. the one that has to agree: `a`'s last
+// against `b`'s second-to-last. Returns -1 when either side is unknown or has
+// too few dimensions to have an inner one.
+fn matmul_inner_a(string a) -> int64 {
+    let ra = shape_rank(a);
+    if (ra < 2) { return -1; }
+    return shape_dim(a, ra - 1);
+}
+
+fn matmul_inner_b(string b) -> int64 {
+    let rb = shape_rank(b);
+    if (rb < 2) { return -1; }
+    return shape_dim(b, rb - 2);
+}
+
+// Report `mlx_matmul(a, b)` when the two shapes provably cannot be multiplied.
+//
+// Silently accepts everything unless both shapes are known and their inner
+// dimensions disagree. This is the same asymmetry the rest of the pass uses:
+// proving a mismatch is a bug in the program, failing to prove a match is not a
+// reason to reject it.
+fn sc_check_matmul(int64 call_node, int64 a_nd, int64 b_nd) -> int64 {
+    let sa = expr_shape(a_nd);
+    let sb = expr_shape(b_nd);
+    if (str_len(sa) == 0 || str_len(sb) == 0) { return 0; }
+    let ia = matmul_inner_a(sa);
+    let ib = matmul_inner_b(sb);
+    if (ia < 0 || ib < 0) { return 0; }
+    if (ia == ib) { return 0; }
+    // "second-to-last" rather than "first": for a batched operand (rank > 2)
+    // the dimension that has to match is not the leading one, and a diagnostic
+    // that names the wrong dimension sends the reader to the wrong number.
+    let lhs = str_concat("left operand is ", shape_repr(sa));
+    let lhs2 = str_concat(lhs, ", whose last dimension is ");
+    let lhs3 = str_concat(lhs2, int64_to_str(ia));
+    let rhs = str_concat("; right operand is ", shape_repr(sb));
+    let rhs2 = str_concat(rhs, ", whose second-to-last dimension is ");
+    let rhs3 = str_concat(rhs2, int64_to_str(ib));
+    let rhs4 = str_concat(rhs3, " (the inner dimensions must agree)");
+    let saved = sc_active_node;
+    sc_active_node = call_node;
+    sc_error_at("matmul shape mismatch", str_concat(lhs3, rhs4));
+    sc_active_node = saved;
+    return 0;
 }
 
 // ── Scope budget accumulation (Stage B4) ────────────────────────────────────
@@ -1963,6 +2275,16 @@ fn sc_expr(int64 node) -> int64 {
                                       str_concat(ty_name(other_pool, ""), " (move both operands to the same pool first)"))));
         }
 
+        // Shape compatibility. `expr_bytes` gave the budget a size; this is the
+        // independent check that the dimensions a matmul is given can actually
+        // be multiplied. It has to run here, on the call, because a matmul
+        // whose operands come from different bindings has no place else to be
+        // compared: each operand typechecks on its own, and the runtime is the
+        // only thing that would otherwise notice.
+        if (str_eq(callee, "mlx_matmul")) {
+            sc_check_matmul(node, arg_node(args_list, 1), arg_node(args_list, 2));
+        }
+
         sc_ty  = fn_ret_tys[fi];
         sc_sv  = fn_ret_svs[fi];
         // A pool-polymorphic builtin produces its result in the pool its
@@ -2188,6 +2510,10 @@ fn sc_stmt(int64 node) -> int64 {
             // `.toGpu()` inside one can be sized without re-deriving it.
             sv_set_bytes(name, expr_bytes(init_nd));
         }
+        // The shape channel, kept current independently of the size channel:
+        // a reassignment to a differently-shaped value must not leave the old
+        // dimensions behind for a later matmul check to read.
+        sv_set_shape(name, expr_shape(init_nd));
         return 0;
     }
 
@@ -2232,6 +2558,11 @@ fn sc_stmt(int64 node) -> int64 {
                 } else {
                     sv_set_bytes(tname, expr_bytes(val_nd));
                 }
+                // Same reason as the `let` path: the shape a matmul check reads
+                // has to describe the value the name holds *now*. Assigning an
+                // unknown-shaped value clears it ("" = cannot check) instead of
+                // leaving the old dimensions in place.
+                sv_set_shape(tname, expr_shape(val_nd));
             }
         }
         if (tk == ND_FIELD_ACCESS) {

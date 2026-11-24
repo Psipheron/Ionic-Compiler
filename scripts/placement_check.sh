@@ -29,6 +29,9 @@
 #   no declared pool                    -> no budget in force
 #   using a transferred value           -> rejected (B5)
 #   builtins borrow / temporaries move  -> compiles (B5)
+#   matmul with incompatible dimensions -> rejected (B7)
+#   matmul with agreeing dimensions     -> compiles (B7)
+#   matmul of an unknown shape          -> not rejected (B7)
 #   CPU-only I/O in a binding           -> rejected, not only as a bare call
 #   CPU-only I/O via the stat builtins  -> rejected
 #   CPU-only I/O in an @gpu fn body     -> rejected
@@ -696,6 +699,73 @@ expect_ok "no pool means no budget" \
     return 1;
 }
 fn main() -> int64 { return 0; }'
+
+echo
+echo "=== matmul shapes are checked (Stage B7) ==="
+
+# `expr_bytes` sizes a value; it cannot check an operation, because `[2,3]` and
+# `[3,2]` occupy the same bytes and only one of them can be multiplied by
+# `[2,3]`. The shape channel is the second, independent check.
+expect_reject "inner dimensions that cannot be multiplied" "matmul shape mismatch" \
+'fn main() -> int64 {
+    let a = mlx_zeros([2, 3], 0);
+    let b = mlx_zeros([4, 5], 0);
+    let c = mlx_matmul(a, b);
+    println(mlx_size(c));
+    return 0;
+}'
+
+# The same byte count, a legal product: the check must not fire just because
+# the operands are non-square.
+expect_ok "inner dimensions that agree compile" \
+'fn main() -> int64 {
+    let a = mlx_zeros([2, 3], 0);
+    let b = mlx_zeros([3, 4], 0);
+    let c = mlx_matmul(a, b);
+    println(mlx_size(c));
+    mlx_free(a); mlx_free(b); mlx_free(c);
+    return 0;
+}'
+
+# The shape of the *result* is computed, not copied, so a chained matmul is
+# checked against what the previous product actually was.
+expect_reject "a chained matmul uses the computed result shape" "matmul shape mismatch" \
+'fn main() -> int64 {
+    let a = mlx_zeros([2, 3], 0);
+    let b = mlx_zeros([3, 4], 0);
+    let c = mlx_zeros([5, 6], 0);
+    let d = mlx_matmul(mlx_matmul(a, b), c);
+    println(mlx_size(d));
+    return 0;
+}'
+
+# A transpose with a literal permutation changes the shape, so what was
+# illegal can become legal.
+expect_ok "a transposed operand is compared by its new shape" \
+'fn main() -> int64 {
+    let a = mlx_zeros([2, 3], 0);
+    let b = mlx_zeros([2, 3], 0);
+    let t = mlx_transpose(b, [1, 0]);
+    let c = mlx_matmul(a, t);
+    println(mlx_size(c));
+    mlx_free(a); mlx_free(b); mlx_free(t); mlx_free(c);
+    return 0;
+}'
+
+# A shape the checker cannot see through — a parameter, an `mlx_shape()`
+# result — records nothing, and the check is skipped. Being unable to prove a
+# match is not a reason to reject a program, and the runtime reports the
+# mismatch it is actually given.
+expect_ok "an unknown shape is not a rejection" \
+'fn mul(tensor@cpu a, tensor@cpu b) -> tensor@cpu { return mlx_matmul(a, b); }
+fn main() -> int64 {
+    let n = mlx_size(mlx_zeros([7], 0));
+    let a = mlx_zeros([n, 3], 0);
+    let b = mlx_zeros([3, 5], 0);
+    let c = mul(a, b);
+    println(mlx_size(c));
+    return 0;
+}'
 
 echo
 echo "=== existing placement rules still hold ==="

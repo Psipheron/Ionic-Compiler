@@ -1,0 +1,26 @@
+// Mastery — matmul shape mismatch; must be REJECTED.
+//
+// The pool budget sizes a value (how many bytes), which is not enough to check
+// an operation: `[2,3] @ [2,3]` and `[2,3] @ [3,2]` occupy the same bytes and
+// only one of them is a legal matmul. The shape channel is the check that
+// compares the dimensions themselves, so a mismatch is caught here instead of
+// at run time.
+//
+//   [error] matmul shape mismatch: left operand is [2, 3], whose last dimension
+//           is 3; right operand is [4, 5], whose second-to-last dimension is 4
+//           (the inner dimensions must agree)
+//
+//   NO_COLOR=1 ./ionic_new examples/mastery/fail/matmul_shape.ionic -o /tmp/x
+//
+// Both shapes are literals, so the checker can prove the mismatch. A shape it
+// cannot see through (a parameter, an `mlx_shape()` result) records nothing and
+// the check is skipped — being unable to prove a match is not a reason to
+// reject the program.
+
+fn main() -> int64 {
+    let a = mlx_zeros([2, 3], 0);
+    let b = mlx_zeros([4, 5], 0);   // last dim 3 != 4: not multipliable
+    let c = mlx_matmul(a, b);
+    println(mlx_size(c));
+    return 0;
+}

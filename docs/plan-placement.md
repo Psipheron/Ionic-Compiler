@@ -1,6 +1,6 @@
 # Functional Hardware-Placement Awareness
 
-Status: **Stage A complete, Stage B (B1–B6) complete, Stage C partially complete
+Status: **Stage A complete, Stage B (B1–B7) complete, Stage C partially complete
 (pool as a runtime fact), Stage D items 2, 3a and 5 complete (allocator backstop,
 handle refcounting, device-capacity comparison)** — revised 2026-11-03
 Author: audit + design pass
@@ -467,16 +467,47 @@ lands is archaeology.
 6. **Mixed-pool operands** are a compile error when both placements are known
    (§6.2). ✅ **Done** — it is also required for B1's result-pool inference to
    be well defined, so it landed with B1 rather than after it.
+7. **Static shape checking for matmul.** ✅ **Done — 2026-11-24.** `expr_bytes`
+   answers "how much room", which is not enough to check an operation:
+   `[2,3] @ [2,3]` and `[2,3] @ [3,2]` occupy the same bytes and only one of
+   them is a legal matmul. Shapes therefore travel in a second, independent
+   column: `sv_shape[]`, a comma-separated dimension list (`"2,3"`) with `""`
+   meaning *unknown*.
+
+   The distinction between unknown and zero is the whole safety property. A
+   check that fired on an unknown shape would reject correct programs, so
+   unknown propagates silently and every consumer treats it as "cannot check".
+   `expr_shape()` mirrors `expr_bytes()` case for case, and models the two ops
+   whose result shape is genuinely not a copy of an operand's:
+   `mlx_matmul` (NumPy's rule — `a`'s last dimension must equal `b`'s
+   second-to-last, and the result is `a`'s dimensions with its last replaced by
+   `b`'s last) and `mlx_transpose` with a literal permutation.
+   `mlx_reshape` takes its result shape from the shape argument. Reductions,
+   slices, `take`, casts and concatenation stay `""` — guessing at those is
+   the one thing this pass must not do, because a wrong shape means a wrong
+   rejection.
+
+   `sc_check_matmul()` runs on the `ND_CALL` handler and reports only when both
+   shapes are known *and* their inner dimensions disagree. It is the same
+   asymmetry the rest of the pass uses: proving a mismatch is a bug in the
+   program, failing to prove a match is not a reason to reject it.
+
+   **Broadcasting is not modelled, and that is deliberate.** `mlx_add([2,3],[3])`
+   reports `[2,3]` (right); `mlx_add([2,1],[1,3])` reports `[2,1]` (wrong). A
+   shape from `expr_shape` is therefore only ever compared against another shape
+   this same pass derived, so the two agree when built the same way and a
+   disagreement is not turned into a rejection.
 
 **Verify:** `tensor_mismatch.ionic` still fails with the same message ✅;
 `04_placement_types.ionic` still compiles ✅; a malformed pool declaration or an
 out-of-range `@gpu(f)` is rejected ✅ (B2); an over-budget program is rejected
 with the arithmetic shown ✅ (B3/B4); reading a transferred binding is rejected
-✅ (B5) — see `scripts/placement_check.sh`, whose `static sizes and the scope
-budget` section covers an over-budget allocation, the same allocation under a
-wider fraction, dtype affecting the size, `gpu { }` blocks being budgeted,
-parameters and unsized results being exempt, and "no pool declared means no
-budget", and whose `transfers move` section covers use-after-move in both
+✅ (B5); a matmul whose literal shapes cannot be multiplied is rejected and one
+whose shapes agree compiles ✅ (B7) — see `scripts/placement_check.sh`, whose
+`static sizes and the scope budget` section covers an over-budget allocation, the
+same allocation under a wider fraction, dtype affecting the size, `gpu { }` blocks
+being budgeted, parameters and unsized results being exempt, and "no pool declared
+means no budget", and whose `transfers move` section covers use-after-move in both
 directions, freeing a moved value, and the four patterns that must stay legal
 (builtins borrowing, transferring a temporary, rebinding a name).
 

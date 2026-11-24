@@ -90,6 +90,7 @@ examples/mastery/07_leak.ionic	ok	0	ok	ok
 examples/mastery/07_model_raii.ionic	ok	0	ok	ok
 examples/mastery/fail/gpu_cpu_io.ionic	neg	-	ok	ok
 examples/mastery/fail/immutable.ionic	neg	-	ok	ok
+examples/mastery/fail/matmul_shape.ionic	neg	-	ok	skip
 examples/mastery/fail/mixed_pool.ionic	neg	-	ok	ok
 examples/mastery/fail/multi_error.ionic	neg	-	ok	ok
 examples/mastery/fail/resolution_miss.ionic	neg	-	ok	ok

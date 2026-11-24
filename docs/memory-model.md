@@ -226,7 +226,7 @@ removing capabilities the language is built around:
 **Accepted: cyclic aggregates leak.** No cycle collector is planned, and the
 language makes no promise to reclaim a cyclic aggregate graph. This is a
 deliberate, bounded, programmer-visible leak, in the same category as a `push`
-that drops an ownership claim (§4.2) and the two known gaps noted in §9.
+that drops an ownership claim (§4.2) and the two remaining gaps noted in §9.
 
 Scope, stated precisely so it can be tested rather than assumed:
 
@@ -551,10 +551,24 @@ This document records the decision and plan.
     what took `scripts/rss_check.sh` from ~48 B/iter to **0 bytes growth** across
     N=200000..800000.
   - **Two gaps remain, both documented at the point of emission** in
-    `src/codegen/native.ionic`: a `let` re-executed by a loop leaks one block per
-    iteration (releasing on re-entry is unsound under the single-exit design,
-    because the slot may hold a `getenv` borrow left by another path), and a user
-    function receiving a producer temp still leaks by design.
+    `src/codegen/native.ionic`:
+    - a user function receiving a producer temp still leaks by design;
+    - **a `let` re-executed by a loop body still leaks one block per iteration**,
+      for strings only. The array pass reclaims this shape (§11.4), and the same
+      transformation was written for strings and gated on the same four slot
+      conditions — written more than once (`ncg_loop_depth > 0`), never poisoned
+      (`local_poison[slot] == 0`), not assigned elsewhere in the body
+      (`ncg_is_assigned_name == 0`), and not already owning
+      (`local_own_str[slot] == 0`). It is **disabled**, because it is unsound as
+      written: a compiler built by a compiler carrying the block cannot compile
+      itself. `src/imports.ionic`'s `imp_norm` has
+      `let seg = str_slice(path, j0, j);` in a loop, and the self-hosted binary
+      reports `cannot resolve import 'imports.ionic'` with the entry path
+      truncated by exactly six characters — a corrupted local, not an import bug.
+      The difference from the array case worth chasing is that an array's claim
+      is raised on the *store* while a string's is raised on the *initialiser*,
+      and this release runs before the store. Until that is worked out, leaking
+      is the safe direction: bounded growth, versus a use-after-free.
   - **Array emission has also landed** (§11.4): array slots carry their own
     claim column and release symbol, with the loop re-entry release reclaiming a
     per-iteration array literal. Elements are never released, by design.

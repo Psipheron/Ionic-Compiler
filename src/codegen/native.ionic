@@ -3075,23 +3075,11 @@ fn ncg_stmt(int64 node) -> int64 {
         // already held something else, because the exit block cannot tell which
         // of the two values survived.
         //
-        // KNOWN GAP — a `let` re-executed by a loop. The claim is discharged
-        // once, in the exit block, so a body that runs N times mints N blocks
-        // and releases one:
-        //
-        //     for (i in 0..n) { let t = int64_to_str(i); s = t; }   // ~48 B/iter
-        //
-        // The obvious repair — release the slot's old value on re-entry — is
-        // unsound with a single-exit design, because the slot's contents on the
-        // second iteration are whatever the *previous* iteration left there, and
-        // nothing in the AST at the `let` says whether that was this producer's
-        // block or, on another path, a `getenv` borrow parked in the same slot.
-        // Releasing a borrowed pointer is a use-after-free, so this needs either
-        // a proof that no other statement writes the slot (then release is safe)
-        // or a per-iteration scope destructor (then it is unconditional). Neither
-        // exists yet; leaking is the safe direction. Note that `s = t` is handled
-        // — the assignment path releases `s`'s old value — so the leak is one
-        // block per iteration, not two.
+        // A `let` re-executed by a loop body leaks one block per iteration: the
+        // claim is discharged once in the exit block, so a body that runs N times
+        // mints N blocks and releases one. The release-on-re-entry that would fix
+        // it is written below but disabled — see the note there for why it is
+        // unsound as it stands.
         //
         // A literal qualifies: `ionic_str_lit` returns a pinned counted copy, so
         // a release on one is a no-op. That is what makes
@@ -3103,6 +3091,41 @@ fn ncg_stmt(int64 node) -> int64 {
         if (owns_str == 1 && nd_kind[init] == ND_IDENT) {
             ncg_emit_retain_r(r);
         }
+
+        // Reclaim a `let` re-executed by a loop body.
+        //
+        // NOT ENABLED. The array pass below does this, and the transformation is
+        // the same in principle, but it is unsound for strings as written here.
+        // Emitting the release is gated on four compile-time facts about the
+        // slot, and all four hold for the shape
+        //
+        //     for (i in 0..n) { let t = int64_to_str(i); s = t; }
+        //
+        // yet a compiler built by a compiler carrying this block cannot compile
+        // itself: `src/imports.ionic` has `let seg = str_slice(path, j0, j);`
+        // inside `imp_norm`'s loop, and the self-hosted binary reports
+        //     ionic: cannot resolve import 'imports.ionic'
+        //     tried: //imports.ionic
+        // — the entry path truncated by six characters, i.e. a corrupted local.
+        //
+        // So the array pass's argument (poison is permanent, so every value the
+        // slot can hold is either 0 or one this pass minted) does not transfer.
+        // The difference worth chasing is that an array's claim is raised on the
+        // *store* while a string's is raised on the *initialiser*, and the
+        // release here runs before the store. Until that is worked out, leaking
+        // is the safe direction: one block per iteration is bounded, whereas a
+        // wrong release is a use-after-free. See docs/memory-model.md §9.
+        if (owns_str == 1 && local_poison[slot] == 0
+            && ncg_loop_depth > 0
+            && ncg_is_assigned_name(name) == 0
+            && local_own_str[slot] == 0
+            && 1 == 0) {
+            let oldr = scratch_push();
+            ncg_load_slot(oldr, slot);
+            ncg_emit_release_r(oldr);
+            scratch_pop();
+        }
+
         if (releasable == 0) { local_set_poison(slot, 1); }
         local_set_own_str(slot, owns_str);
 
@@ -3923,6 +3946,31 @@ fn ncg_main_wrapper(int64 top_list) -> int64 {
     spill_base    = mw_deep + 4 + 8;   // skip CSR area (n_csr=0 but reserve slots)
     let n_locals  = mw_deep + 4 + 16;  // 4 slack + 8 CSR + 8 scratch headroom
     ncg_fn_prologue(n_locals);
+
+    // Zero every top-level slot, for the same reason `ncg_fn_node` does: a claim
+    // is compile-time state, and the array pass releases a loop slot's previous
+    // contents on re-entry. That release reads the slot before anything has
+    // written it on the first iteration, so the slot must hold 0 —
+    // `ionic_array_release(NULL)` is a no-op, which makes "never written"
+    // indistinguishable from "already released".
+    //
+    // Without this the wrapper's slots hold whatever was on the stack, and the
+    // first iteration passed that garbage to `ionic_array_release`. Reproduced
+    // directly, with no string involved: a top-level `while` loop whose body is
+    // `let a = [1, 2, 3];` aborts (exit 134) without this loop and prints
+    // `3 3 3` with it.
+    //
+    // The range stops at `csr_base_slot`: everything below it can be a local
+    // (top-level `let`s plus `__argc`/`__argv`), and everything from it onwards
+    // is the CSR save area, the spill area and headroom, which are written
+    // before they are read. `n_csr` is 0 here, so the prologue saved no
+    // callee-saved registers that this loop could clobber.
+    a64_load_imm(REG_X16, 0);
+    mut zi = 0;
+    while (zi < csr_base_slot) {
+        a64_store_fp(REG_X16, local_offset(zi));
+        zi = zi + 1;
+    }
 
     // Call ionic_runtime_init(argc, argv)
     let init_sym = sym_undef("ionic_runtime_init");
