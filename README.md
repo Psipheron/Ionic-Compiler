@@ -75,7 +75,7 @@ Released tarballs (`ionic-<version>-aarch64-apple-darwin.tar.gz`) are
 tarball ships the standard library and the C runtime source alongside it:
 
 ```
-ionic-v0.2.1-aarch64-apple-darwin/
+ionic-v1.0.0-aarch64-apple-darwin/
 ├── ionic                       # the compiler
 ├── lib/std/*.ionic             # bundled standard library
 └── src/ionic_model_runtime.c   # C runtime, linked into every program you build
@@ -84,7 +84,7 @@ ionic-v0.2.1-aarch64-apple-darwin/
 At startup `ionic` publishes its own directory as `$IONIC_ROOT` (via the C
 runtime), so it finds `lib/` and `src/ionic_model_runtime.c` **relative to
 the executable** — you can run it from any working directory. Homebrew
-installs it the same way (`brew install ByteTheBait/ionic/ionic`).
+installs it the same way (`brew install Psipheron/ionic/ionic`).
 
 Because the runtime is compiled with `clang` at link time, building a
 program still needs a C compiler on `PATH`; nothing else is required.

@@ -1,0 +1,100 @@
+# Every .ionic file under examples/, and what each backend must do with it.
+#
+# Format (tab-separated, `#` starts a comment line):
+#
+#   path <TAB> kind <TAB> run_exit <TAB> native <TAB> rust
+#
+#   path      repository-relative path, so a moved file fails loudly rather
+#             than silently dropping out of the gate.
+#   kind      `ok`  — must compile
+#             `neg` — must be REJECTED by the compiler (the *_error and
+#                     mastery/fail programs; their own first line says so)
+#   run_exit  the exit status the compiled program must produce, or `.` for
+#             "compile only". `.` is used where the status legitimately depends
+#             on which ML backends the machine has, or where the program is
+#             deliberately silent.
+#   native    `ok`   — the self-hosted compiler must meet this expectation
+#             `skip` — known gap, recorded rather than hidden
+#   rust      same, for the Rust bootstrap (target/release/ionic)
+#
+# `skip` is deliberately narrow and every entry carries its reason. A gate that
+# silently tolerated a whole class of failure would not be a gate, so the point
+# of writing these down is that fixing one means deleting a line here — the
+# list can only shrink, never grow unnoticed.
+#
+# What this gate does NOT assert: the text a program prints. Output correctness
+# belongs to io_check.sh (the contract), the multitarget differential job
+# (Mach-O vs ELF) and rss_check.sh (allocation shape). Duplicating it here would
+# make every example edit a three-file change.
+#
+# Only the columns below `path` are generated. To change an expectation, either
+# change the code or explain the divergence in a comment above its row.
+#
+# Regenerate after an intentional change:
+#   python3 scripts/examples_gen.py
+
+# path	kind	run_exit	native	rust
+examples/bootstrap_test.ionic	ok	0	ok	ok
+examples/fib.ionic	ok	0	ok	ok
+# ── Negative tests: the compiler must reject these ──────────────────────────
+# A `neg` entry is the only place a non-zero compile IS the pass condition.
+# Without these, "all examples compile" would be satisfied by deleting the
+# error cases, which is precisely what they exist to pin down.
+examples/gpu_error.ionic	neg	-	ok	ok
+examples/hello.ionic	ok	0	ok	ok
+examples/hello_world.ionic	ok	0	ok	ok
+examples/hw_tag_error.ionic	neg	-	ok	ok
+examples/hw_tags.ionic	ok	0	ok	ok
+examples/math.ionic	ok	0	ok	ok
+# Uses `c += 1`. The Rust bootstrap has no compound assignment at all, so it
+# fails to parse the file. Native compiles and runs it. Fixing `+=` in the
+# bootstrap removes this skip; until then it is a real backend gap, not rot.
+examples/mlx_matmul.ionic	ok	0	ok	skip
+examples/multitarget_test.ionic	ok	0	ok	ok
+examples/rss_churn.ionic	ok	0	ok	ok
+examples/rss_churn_let.ionic	ok	0	ok	ok
+examples/showcase.ionic	ok	0	ok	ok
+examples/stdlib_test.ionic	ok	0	ok	ok
+examples/type_error.ionic	neg	-	ok	ok
+examples/mastery/00_discrepancies.ionic	ok	0	ok	ok
+# Exits 7 on purpose: "explicit exit status — main's return value is ignored".
+# A gate that demanded 0 here would be asserting the opposite of the lesson.
+examples/mastery/00_hello.ionic	ok	7	ok	ok
+examples/mastery/00_toplevel.ionic	ok	0	ok	ok
+examples/mastery/01_literals.ionic	ok	0	ok	ok
+examples/mastery/01_print_variants.ionic	ok	0	ok	ok
+examples/mastery/01_ranges.ionic	ok	0	ok	ok
+examples/mastery/01_strings.ionic	ok	0	ok	ok
+examples/mastery/02_arrays.ionic	ok	0	ok	ok
+examples/mastery/02_data_bug.ionic	ok	0	ok	ok
+examples/mastery/02_string_array_print.ionic	ok	0	ok	ok
+examples/mastery/02_structs.ionic	ok	0	ok	ok
+# Exits 2 on purpose when no argument is supplied (argv demo).
+examples/mastery/03_args.ionic	ok	2	ok	ok
+examples/mastery/03_escapes.ionic	ok	0	ok	ok
+examples/mastery/03_file_io.ionic	ok	0	ok	ok
+# Exit status depends on whether a model backend is linked in: 1 with ONNX,
+# 0 on a bare runner. Compile-only, so the gate is not measuring the machine.
+examples/mastery/04_placement_types.ionic	ok	1	ok	ok
+examples/mastery/04_pool_budget.ionic	ok	0	ok	ok
+examples/mastery/04_pool_polymorphism.ionic	ok	0	ok	ok
+examples/mastery/05_selective.ionic	ok	0	ok	ok
+examples/mastery/07_leak.ionic	ok	0	ok	ok
+examples/mastery/07_model_raii.ionic	ok	0	ok	ok
+examples/mastery/fail/gpu_cpu_io.ionic	neg	-	ok	ok
+examples/mastery/fail/immutable.ionic	neg	-	ok	ok
+examples/mastery/fail/mixed_pool.ionic	neg	-	ok	ok
+examples/mastery/fail/multi_error.ionic	neg	-	ok	ok
+examples/mastery/fail/resolution_miss.ionic	neg	-	ok	ok
+# The Rust bootstrap accepts both of these — it has no use-after-move or
+# The Rust bootstrap has no tensor-placement checking, so it accepts this
+# program. Native rejects it, which is the documented behaviour — a placement
+# mismatch must not compile. Visible gap, not rot: delete this skip when the
+# bootstrap's checker reaches parity.
+examples/mastery/fail/tensor_mismatch.ionic	neg	-	ok	skip
+# The Rust bootstrap accepts both of these — it has no use-after-move or
+# The Rust bootstrap has no use-after-move checking, so it accepts this
+# program. Native rejects it: after `let g = x.toGpu()`, `x` is consumed and
+# using it is an error. Visible gap, not rot: delete this skip when the
+# bootstrap's checker reaches parity.
+examples/mastery/fail/use_after_move.ionic	neg	-	ok	skip

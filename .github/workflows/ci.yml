@@ -213,6 +213,30 @@ jobs:
       - name: RSS regression gate
         run: ./scripts/rss_check.sh
 
+      # ── Every example, on both backends ──────────────────────────────────
+      #
+      # `examples/` is what a new user reads first, and it had no owner: 24 of
+      # the 35 files were referenced by no CI step, so a language change could
+      # break a demo and nothing noticed until someone tried to teach from it.
+      #
+      # The half that matters most is cross-backend. The same file can compile
+      # on the self-hosted compiler and fail on the Rust bootstrap —
+      # examples/mlx_matmul.ionic uses `c += 1`, which the bootstrap does not
+      # implement — and nothing compared the two. scripts/examples.manifest
+      # records each file's expected outcome per backend, and is checked for
+      # coverage in both directions: adding an example without declaring it
+      # fails, and deleting one without deleting its row fails.
+      #
+      # This job builds the Rust bootstrap earlier, so both backends exist here.
+      - name: Examples — compile, run and reject on both backends
+        run: ./scripts/examples_check.sh
+
+      # The manifest is measured data, so it must agree with reality. This
+      # catches behaviour changing for a good reason while the manifest is left
+      # stale — which would leave a gate that passes for the wrong reason.
+      - name: Examples — manifest matches measured behaviour
+        run: python3 scripts/examples_gen.py --check
+
       - name: Smoke test — hello world (self-hosted compiler)
         run: |
           echo 'fn main() -> int64 { print("ok"); return 0; }' > /tmp/hi2.ionic
