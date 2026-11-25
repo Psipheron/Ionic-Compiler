@@ -1,0 +1,13 @@
+// Mastery — two parameters with one name; must be REJECTED.
+//
+// Both parameters share one frame, so the second slot takes the name and the
+// first parameter is unreachable in the body: `g(1, 2)` returned 1.
+
+fn g(int64 a, int64 a) -> int64 {
+    return a;
+}
+
+fn main() -> int64 {
+    println(g(1, 2));
+    return 0;
+}

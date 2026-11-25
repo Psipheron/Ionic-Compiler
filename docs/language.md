@@ -31,6 +31,37 @@ let name: string = "hi";  // explicit type annotation
 
 `let` variables cannot be reassigned. `mut` variables can.
 
+A name may be bound again in the *same* scope: the later binding takes over and
+the earlier value is no longer reachable by that name.
+
+```ionic
+let a = f();
+println(a);   // the first value
+let a = g();
+println(a);   // the second one, in the same slot
+```
+
+It may **not** be bound again in a nested scope. A local's storage is not
+released at `}`, so the inner binding would make the outer one unreachable for
+the rest of the function — the old value would silently never be readable again.
+This is a compile error:
+
+```ionic
+let a = 11;
+if (c) {
+    let a = 22;   // error: 'a' is already declared in an enclosing scope
+}
+println(a);       // would print 22, not 11
+```
+
+The same rule rejects redeclaring a `for` loop variable
+(`for (i in 0..3) { let i = 42; }`), a declaration whose initialiser reads the
+name being declared (`let a = a * 2;`), a duplicated parameter name
+(`fn g(int64 a, int64 a)`), and a duplicate top-level `let`.
+
+A local that reuses a *global*'s name is fine, including from a top-level block:
+globals live in their own storage, so the two bindings are distinct values.
+
 ---
 
 ## Functions

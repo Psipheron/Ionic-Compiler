@@ -147,7 +147,10 @@ if (want_linux != host_linux) { cross_compiling = 1; }
 // resolve relative to where the source lives, not the process CWD.
 imp_reset();
 if (!str_eq(entry_path, "")) { g_imp_dir = imp_dir_of(entry_path); }
-imp_expand(src_str);
+// The entry source is expanded with its own path so its body lands in the
+// source map too; `src_path` is what g_source_path already points at, so a
+// diagnostic in the entry file resolves to the same place it always did.
+imp_expand(src_str, src_path);
 // Join the fragments in one pass. `g_parts[0]` is a sentinel, so the run is
 // 1..g_part_cnt, and `str_join` appends the separator after every element —
 // the same bytes the per-fragment `str_concat(frag, "\n")` loop produced, but

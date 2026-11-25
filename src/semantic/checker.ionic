@@ -218,6 +218,33 @@ mut sv_mvhow   = [""];  // ".toGpu()" / ".toCpu()" — the transfer that consume
 // source name is what lets the duplicate charge be zeroed — and, because the
 // alias is recorded by name, releasing either one releases the bytes once.
 mut sv_alias   = [""];
+// 1 when this binding came from the top-level globals pre-pass.
+//
+// Globals live in a *separate* table in codegen, so a local that reuses a
+// global's name is a genuine shadow of two distinct storages and works. A local
+// that reuses a *local's* name is a different thing: codegen appends a fresh
+// stack slot but resolves every later reference by name to the first match, so
+// the inner binding is silently dead (and its own initialiser reads the
+// uninitialised new slot). The redeclaration check needs to tell the two apart,
+// so this column marks the ones it must exempt.
+mut sv_gdecl   = [0];
+// Source line of the declaration, for the redeclaration diagnostic.
+mut sv_dlines  = [0];
+// Frame (`frame_count`) the binding was declared in.
+//
+// This is what separates the two kinds of re-declaration, which are not the
+// same bug. A *same-frame* re-`let` is fine: the emitter appends a slot and
+// `local_find` returns the newest match, so `let a = f(); print(a);
+// let a = g(); print(a);` prints both values correctly (measured). A
+// *cross-frame* one shadows a name an enclosing block still owns, and since the
+// emitter's table is never popped at `}`, every later read of that name
+// resolves to the inner slot: `let a = f(); if (c) { let a = g(); } print(a);`
+// printed 22 22 instead of 22 11.
+mut sv_frames  = [0];
+// 1 for a `for` loop variable. A loop variable must not be shadowed even by a
+// `let` in its own frame, because the loop body *is* that frame:
+// `for (i in 0..3) { let i = 42; ... }` printed 0 1 2 rather than 42.
+mut sv_loopv   = [0];
 mut sv_count   = 0;
 mut frame_stk  = [0];
 mut frame_count = 0;
@@ -372,6 +399,10 @@ fn sv_declare(string name, int64 ty, string sv, int64 mut_flag) -> int64 {
         sv_mvline[sv_count] = 0;
         sv_mvhow[sv_count]  = "";
         sv_alias[sv_count]  = "";
+        sv_gdecl[sv_count]  = 0;
+        sv_dlines[sv_count] = 0;
+        sv_frames[sv_count] = frame_count;
+        sv_loopv[sv_count]  = 0;
     } else {
         push(sv_names,  name);
         push(sv_tys,    ty);
@@ -383,7 +414,188 @@ fn sv_declare(string name, int64 ty, string sv, int64 mut_flag) -> int64 {
         push(sv_mvline, 0);
         push(sv_mvhow,  "");
         push(sv_alias,  "");
+        push(sv_gdecl,  0);
+        push(sv_dlines, 0);
+        push(sv_frames, frame_count);
+        push(sv_loopv,  0);
     }
+    return 0;
+}
+
+// Mark the binding just declared as a `for` loop variable (see `sv_loopv`).
+fn sv_mark_loopvar(string name) -> int64 {
+    let i = sv_lookup_idx(name);
+    if (i != 0) { sv_loopv[i] = 1; }
+    return 0;
+}
+
+// Mark the binding just declared as a top-level global (see `sv_gdecl`).
+fn sv_mark_global(string name) -> int64 {
+    let i = sv_lookup_idx(name);
+    if (i != 0) { sv_gdecl[i] = 1; }
+    return 0;
+}
+
+// Record where the binding just declared was written, for a redeclaration
+// diagnostic that names both sites.
+fn sv_set_decl_line(string name, int64 line) -> int64 {
+    let i = sv_lookup_idx(name);
+    if (i != 0) { sv_dlines[i] = line; }
+    return 0;
+}
+
+// Report a declaration that shadows a name an *enclosing* block still owns, or
+// that re-uses a `for` loop variable. Returns 1 when it did, so the caller can
+// skip declaring it.
+//
+// Only these two shapes are broken, and the distinction matters because the
+// emitter treats them differently:
+//
+//   * A *same-frame* re-`let` is correct. `local_def` appends a slot and
+//     `local_find` returns the newest match, so `let a = f(); print(a);
+//     let a = g(); print(a);` printed 11 then 22 (measured), and so did the
+//     string, array and struct forms. `scripts/placement_check.sh` documents
+//     this as legal ("rebinding a name clears the moved mark"), and it is the
+//     only way to reuse a slot, so rejecting it would be a false rejection.
+//
+//   * A *cross-frame* re-declaration is broken. The emitter's local table is
+//     never popped at `}` (`local_reset` runs once per function), so a binding
+//     made inside a block keeps the name: `let a = f(); if (c) { let a = g(); }
+//     print(a);` printed 22 22 instead of 22 11. The outer value is simply
+//     unreachable after the block.
+//
+//   * A `for` loop variable is broken even within its own frame, because the
+//     loop body *is* that frame: `for (i in 0..3) { let i = 42; ... }` printed
+//     0 1 2 rather than 42.
+//
+// A *global* is exempt: globals live in their own table, so a local reusing a
+// global's name is a real shadow of two distinct storages and works.
+//
+// The self-referential initialiser (`let a = a * 2;`) is a separate rule; see
+// sv_expr_refs_ident and its use in sc_stmt.
+fn sv_check_redeclare(string name, int64 line) -> int64 {
+    let i = sv_lookup_idx(name);
+    if (i == 0) { return 0; }
+    if (sv_gdecl[i] == 1) { return 0; }
+    mut what = "";
+    if (sv_loopv[i] == 1) {
+        what = str_concat("'", str_concat(name, "' is a `for` loop variable here; declaring it again inside the loop would make every read in the body resolve to the new binding. Rename one"));
+    } else if (sv_frames[i] != frame_count) {
+        what = str_concat("'", str_concat(name, "' is already declared in an enclosing scope; re-declaring it here would make the outer binding unreachable after this block. Rename one"));
+    } else {
+        return 0;   // same frame: a legal rebinding
+    }
+    let first = sv_dlines[i];
+    mut loc = "";
+    if (first > 0) {
+        loc = str_concat(" (already declared on line ",
+              str_concat(int64_to_str(srcmap_line(first)), ")"));
+    }
+    let msg = str_concat(what, loc);
+    print_span(line, 1, msg);
+    sc_error(msg);
+    return 1;
+}
+
+// 1 when `name` is already declared in the current frame (and is not a global).
+//
+// Used for parameter lists, where every parameter shares one frame: a duplicate
+// parameter is a silent miscompile (`fn g(int64 a, int64 a)` called `g(1, 2)`
+// returned 1) but the same-frame rule above deliberately allows a rebinding, so
+// it cannot be expressed with sv_check_redeclare.
+fn sv_declared_in_frame(string name) -> int64 {
+    let i = sv_lookup_idx(name);
+    if (i == 0) { return 0; }
+    if (sv_gdecl[i] == 1) { return 0; }
+    if (sv_frames[i] != frame_count) { return 0; }
+    return 1;
+}
+
+// 1 when `name` resolves to a top-level global.
+fn sv_decl_is_global(string name) -> int64 {
+    let i = sv_lookup_idx(name);
+    if (i == 0) { return 0; }
+    return sv_gdecl[i];
+}
+
+// Report a duplicate top-level `let`, and return 1 so the caller skips it.
+//
+// A second top-level binding of one name is a different failure from a shadowed
+// local: both live in the globals table, so the second overwrites the first and
+// every reader — including a function body checked before the second was seen —
+// silently gets one of the two values. It has to be its own check because the
+// globals pre-pass runs at `frame_count == 0`, where every declaration looks
+// same-frame and `sv_check_redeclare` deliberately allows a rebinding.
+fn sv_check_dup_global(string name, int64 line) -> int64 {
+    if (sv_decl_is_global(name) == 0) { return 0; }
+    // The pool declaration has its own, more specific diagnostic (see
+    // pool_scan_toplevel), which runs first. Reporting it here as well would
+    // print two errors for one line.
+    if (str_eq(name, POOL_DECL_NAME)) { return 0; }
+    let i = sv_lookup_idx(name);
+    let first = sv_dlines[i];
+    mut loc = "";
+    if (first > 0) {
+        loc = str_concat(" (already declared on line ",
+              str_concat(int64_to_str(srcmap_line(first)), ")"));
+    }
+    let msg = str_concat(str_concat("'", name),
+                str_concat("' is already declared at top level; a second global of the same name would hide the first. Rename one",
+                loc));
+    print_span(line, 1, msg);
+    sc_error(msg);
+    return 1;
+}
+
+// 1 when the expression `node` mentions the identifier `name` anywhere.
+//
+// A declaration whose initialiser names the variable being declared
+// (`let a = a * 2;`) reads the *new* slot, because the emitter allocates it
+// before evaluating the initialiser: `let a = f(); let a = a * 2;` printed 0.
+// That is not the enclosing binding being shadowed, so the frame rule cannot
+// see it; it needs the initialiser inspected.
+//
+// Unmodelled node kinds report 0 rather than 1: a check that cannot see inside
+// a construct must not fire on it.
+fn sv_expr_refs_ident(int64 node, string name) -> int64 {
+    if (node == 0) { return 0; }
+    let k = nd_kind[node];
+    if (k == ND_IDENT) {
+        if (str_eq(nd_sv[node], name)) { return 1; }
+        return 0;
+    }
+    if (k == ND_INT || k == ND_FLOAT || k == ND_BOOL || k == ND_STR) { return 0; }
+    if (k == ND_BINOP || k == ND_UNOP || k == ND_FIELD_ACCESS ||
+        k == ND_TO_GPU || k == ND_TO_CPU || k == ND_INDEX) {
+        if (sv_expr_refs_ident(nd_i2[node], name) == 1) { return 1; }
+        return sv_expr_refs_ident(nd_i3[node], name);
+    }
+    if (k == ND_CALL) {
+        mut a = nd_i2[node];   // args list
+        while (a != 0) {
+            if (sv_expr_refs_ident(nd_i2[a], name) == 1) { return 1; }
+            a = nd_i3[a];
+        }
+        return 0;
+    }
+    if (k == ND_METHOD_CALL) {
+        if (sv_expr_refs_ident(nd_i2[node], name) == 1) { return 1; }
+        mut a = nd_i3[node];   // args list
+        while (a != 0) {
+            if (sv_expr_refs_ident(nd_i2[a], name) == 1) { return 1; }
+            a = nd_i3[a];
+        }
+        return 0;
+    }
+    if (k == ND_ARRAY_LIT || k == ND_STRUCT_LIT) {
+        mut a = nd_i2[node];
+        while (a != 0) {
+            if (sv_expr_refs_ident(nd_i2[a], name) == 1) { return 1; }
+            a = nd_i3[a];
+        }
+        return 0;
+    }
+    if (k == ND_FIELD_INIT) { return sv_expr_refs_ident(nd_i2[node], name); }
     return 0;
 }
 
@@ -535,6 +747,13 @@ fn sv_is_defined(string name) -> bool {
     return sv_lookup_idx(name) != 0;
 }
 
+// Index of the binding `name` visible now, or 0. `sv_lookup_idx` searches the
+// whole live table, which is what "is this name in scope" means here: the table
+// is pushed and popped per block, so anything it still holds is visible.
+fn sv_scope_has(string name) -> int64 {
+    return sv_lookup_idx(name);
+}
+
 // ── Struct registry ────────────────────────────────────────────────────────────
 mut st_names  = [""];
 mut st_sizes  = [0];
@@ -599,6 +818,10 @@ mut fn_pstarts = [0];
 mut fn_hws     = [0];   // hw annotation node per fn (0 = none) — for @cpu/@gpu checks
 mut fn_is_builtin = [0]; // 1 for registered builtins, 0 for user functions
 mut fn_pool_poly = [0];  // 1 = result pool is inferred from the first tensor arg
+// Source line of the declaration, used only to point a duplicate-name
+// diagnostic back at the definition it collides with. 0 for builtins, which
+// have no source line.
+mut fn_decl_lines = [0];
 // 1 when calling this function from a GPU context would (transitively) perform
 // CPU-only work — see `gpu_taint_compute`. Parallel to fn_names, filled by a
 // whole-program pre-pass because the question is interprocedural.
@@ -807,6 +1030,11 @@ mut sc_cur_fn_ret_sv = "";
 mut sc_cur_fn_name   = "";
 mut sc_in_gpu_block  = 0;
 mut sc_in_conversion = 0;   // 1 while evaluating .toGpu()/.toCpu() operand
+// 1 during the top-level statement walk, where `let`s were already declared by
+// the globals pre-pass (see sc_program). Without it the walk would declare each
+// global a second time and lose the global mark that every later shadow check
+// depends on.
+mut sc_in_globals_pass = 0;
 
 // ── GPU/tensor helpers ────────────────────────────────────────────────────────
 fn is_tensor_ty(int64 ty) -> bool {
@@ -1739,6 +1967,53 @@ fn register_fn_node(int64 node) -> int64 {
     let name        = nd_sv[node];
     let params_list = nd_i2[node];
     let ret_ty_nd   = nd_i3[node];
+
+    // A duplicate top-level name is fatal at link time, not here: codegen emits
+    // one defined symbol per `fn`, so two `fn trim` definitions put two atoms
+    // with the same name in the object and `ld` aborts on the malformed file
+    // ("malformed atom files with duplicate names") — a crash with no line and
+    // no mention of the user's code.
+    //
+    // This is the pass that establishes the registry, and it runs before any
+    // body is checked, so it is the first point where "already registered" can
+    // be asked and the last point where both definitions are still attributable
+    // to a source line. Emit a normal diagnostic and skip registration; the
+    // error count stops the driver before codegen, so neither definition reaches
+    // the object file. It is common with stdlib imports (`std.str` and
+    // `std.data` both declare `trim`), where the two sources are individually
+    // valid and nothing else notices they disagree.
+    let dup_of = fn_find(name);
+    if (dup_of != 0) {
+        let first_line = fn_decl_lines[dup_of];
+        // `nd_iv` on an FN_DEF node is the fn keyword's line (see sc_fn); the
+        // node's own nd_line points at the body's end, which is the wrong place
+        // to send the reader. Fall back to nd_line only if it is missing.
+        mut line = nd_iv[node];
+        if (line <= 0) { line = nd_line[node]; }
+        // `first_line` is a combined-buffer line, so it names the wrong file and
+        // the wrong number on its own. Resolve it through the source map: the
+        // first `trim` in this program lives in lib/std/str.ionic, not at some
+        // mid-file offset of the entry source, and the message must say so.
+        mut prev = "";
+        if (first_line > 0) {
+            let first_file = srcmap_file(first_line);
+            if (str_len(first_file) > 0) {
+                prev = str_concat(" (first declared at ",
+                       str_concat(first_file, str_concat(":", str_concat(int64_to_str(srcmap_line(first_line)), ")"))));
+            } else {
+                prev = str_concat(" (first declared on line ", str_concat(int64_to_str(first_line), ")"));
+            }
+        }
+        let ctx = str_concat("duplicate function '", str_concat(name, "'"));
+        let msg = str_concat(
+            "this name is already defined; both definitions emit one symbol and the linker aborts. Rename one",
+            prev);
+        let full = str_concat(ctx, str_concat(": ", msg));
+        print_span(line, 1, full);
+        sc_error(full);
+        return 0;
+    }
+
     mut ret_ty = TY_VOID;
     mut ret_sv = "";
     // `node_ty_val_sv` rather than `node_ty_sv`: the latter only encodes a
@@ -1751,6 +2026,9 @@ fn register_fn_node(int64 node) -> int64 {
     // element type and a returned array did not.
     if (ret_ty_nd != 0) { ret_ty = node_ty_to_int(ret_ty_nd); ret_sv = node_ty_val_sv(ret_ty_nd); }
     let hw_node = nd_i5[node];
+    // The fn keyword's line, so a later duplicate can name where this one was.
+    mut decl_line = nd_iv[node];
+    if (decl_line <= 0) { decl_line = nd_line[node]; }
     fn_count = fn_count + 1;
     if (fn_count < len(fn_names)) {
         fn_names[fn_count]   = name;
@@ -1761,6 +2039,7 @@ fn register_fn_node(int64 node) -> int64 {
         fn_pool_poly[fn_count]  = 0;
         fn_taints[fn_count]     = 0;
         fn_taint_leafs[fn_count] = "";
+        fn_decl_lines[fn_count] = decl_line;
     } else {
         push(fn_names,   name);
         push(fn_ret_tys, ret_ty);
@@ -1770,6 +2049,7 @@ fn register_fn_node(int64 node) -> int64 {
         push(fn_pool_poly,  0);
         push(fn_taints,     0);
         push(fn_taint_leafs, "");
+        push(fn_decl_lines, decl_line);
     }
     let pstart = fp_count + 1;
     if (fn_count < len(fn_pstarts)) { fn_pstarts[fn_count] = pstart; }
@@ -1863,6 +2143,7 @@ fn register_builtin(string name, int64 pcount, int64 ret_ty, string ret_sv) -> i
         fn_pool_poly[fn_count]  = 0;
         fn_taints[fn_count]     = 0;
         fn_taint_leafs[fn_count] = "";
+        fn_decl_lines[fn_count] = 0;   // builtins have no source line
     } else {
         push(fn_names,   name);
         push(fn_ret_tys, ret_ty);
@@ -1873,6 +2154,7 @@ fn register_builtin(string name, int64 pcount, int64 ret_ty, string ret_sv) -> i
         push(fn_pool_poly,  0);
         push(fn_taints,     0);
         push(fn_taint_leafs, "");
+        push(fn_decl_lines, 0);
     }
     let pstart = fp_count + 1;
     if (fn_count < len(fn_pstarts)) { fn_pstarts[fn_count] = pstart; }
@@ -2725,6 +3007,31 @@ fn sc_stmt(int64 node) -> int64 {
         let mut_flag = nd_iv[node];
         let ty_ann  = nd_i2[node];
         let init_nd = nd_i3[node];
+        // Top-level `let`s were already declared by the globals pre-pass, which
+        // runs before any body is checked so functions can reference them. Only
+        // the initialiser is left to check here. `frame_count == 0` confines
+        // this to the top level: a `let` inside a top-level `if` block is one
+        // frame deeper and is an ordinary local that shadows the global.
+        if (sc_in_globals_pass == 1 && frame_count == 0) {
+            sc_expr(init_nd);
+            return 0;
+        }
+        // Two independent defects, reported before the initialiser is typed
+        // because the initialiser is itself where the second one is visible.
+        mut bad = 0;
+        if (sv_is_defined(name) && sv_expr_refs_ident(init_nd, name) == 1) {
+            // The emitter allocates the new slot before evaluating the
+            // initialiser, so `let a = f(); let a = a * 2;` read the *new*
+            // uninitialised slot and printed 0; the same applies to shadowing a
+            // global (`let x = 10; fn main() { let x = x + 1; }` printed 1, not
+            // 11). A rebinding that means "the old value" must be a `mut`.
+            let msg = str_concat(str_concat("initialiser for '", name),
+                        str_concat("' reads '", str_concat(name, "' itself, which is not yet initialised here. Use `mut` and assign, or rename one")));
+            print_span(nd_line[node], 1, msg);
+            sc_error(msg);
+            bad = 1;
+        }
+        if (sv_check_redeclare(name, nd_line[node]) == 1) { bad = 1; }
         sc_expr(init_nd);
         let init_ty = sc_ty;
         let init_sv_val = sc_sv;
@@ -2747,7 +3054,14 @@ fn sc_stmt(int64 node) -> int64 {
         // sv_bytes/sv_charged to -1/0 and would otherwise leave the old bytes
         // counted in a scope that no longer holds them.
         sv_release_charge(name);
+        if (bad == 1) {
+            // Already reported; declaring it again would overwrite the outer
+            // binding's type and size, so every later check would reason about
+            // the wrong variable. Keep the original entry.
+            return 0;
+        }
         sv_declare(name, decl_ty, decl_sv_val, mut_flag);
+        sv_set_decl_line(name, nd_line[node]);
         // Stage B3/B4: a GPU-resident binding is charged against the enclosing
         // scope's budget. Sized values are summed; unsized ones are exempt (see
         // the COVERAGE note on budget_charge).
@@ -2913,7 +3227,24 @@ fn sc_stmt(int64 node) -> int64 {
             sc_error_at("for range end", str_concat("expected int64, got ", ty_name(sc_ty, "")));
         }
         sv_push_frame();
+        // The loop variable is a declaration like any other, so it gets the
+        // same redeclaration rule: an enclosing local of the same name would
+        // make every read in the body resolve to *that* binding, not to the
+        // loop counter, which is how `for (i in 0..3) { let i = 42; }` came to
+        // print 0 1 2. It is still declared (unlike a rejected `let`) because
+        // the body's checks should see the int64 the loop actually binds.
+        //
+        // `nd_iv` is the `for` keyword's line (the parser stores it there
+        // because new_node runs after the body is consumed, so nd_line is the
+        // closing brace) — otherwise the "already declared on line N" clause
+        // would name the end of the loop instead of its header.
+        let for_line0 = nd_iv[node];
+        mut for_line = for_line0;
+        if (for_line <= 0) { for_line = nd_line[node]; }
+        sv_check_redeclare(var_name, for_line);
         sv_declare(var_name, TY_INT64, "", 0);
+        sv_mark_loopvar(var_name);
+        sv_set_decl_line(var_name, for_line);
         sc_block_stmts(body_bl);
         sv_pop_frame();
         return 0;
@@ -3032,7 +3363,24 @@ fn sc_fn(int64 fn_node) -> int64 {
             sc_error_at(str_concat("@cpu fn '", str_concat(name, "'")),
                 str_concat("parameter '", str_concat(pname, "' is annotated @gpu (remove one annotation)")));
         }
+        // Two parameters with one name are the same silent miscompile as a
+        // re-`let`: the emitter appends a slot but resolves the name to the
+        // last match, so the first parameter is unreachable in the body
+        // (`fn g(int64 a, int64 a)` called `g(1, 2)` returned 1).
+        //
+        // Every parameter shares one frame, and `sv_check_redeclare`
+        // deliberately allows a same-frame rebinding, so the duplicate has to
+        // be asked for directly. `sv_declared_in_frame` answers exactly that
+        // question: is this name already bound by an earlier parameter of this
+        // list (globals exempt)?
+        if (sv_declared_in_frame(pname) == 1) {
+            let msg = str_concat(str_concat("parameter '", pname),
+                        "' is declared twice in this parameter list; the first one is unreachable. Rename one");
+            print_span(nd_line[param], 1, msg);
+            sc_error(msg);
+        }
         sv_declare(pname, pty, ptsv, 0);
+        sv_set_decl_line(pname, nd_line[param]);
         pnode = nd_i3[pnode];
     }
     sc_block_stmts(body_list);
@@ -3150,9 +3498,20 @@ fn sc_program(int64 structs_list, int64 fns_list, int64 top_list) -> int64 {
                 if (ik == ND_ARRAY_LIT)              { decl_ty = TY_ARRAY; decl_sv_val = elem_sv(array_lit_elem_ty(init_nd)); }
                 if (ik == ND_STRUCT_LIT)             { decl_ty = TY_STRUCT; decl_sv_val = nd_sv[init_nd]; }
             }
-            sv_declare(gname, decl_ty, decl_sv_val, mut_flag);
+            if (sv_check_dup_global(gname, nd_line[stmt]) == 1) {
+                // Reported; the first declaration is the one the rest of the
+                // program is checked against, so keep it rather than replacing
+                // it with this one.
+                snode = nd_i3[snode];
+            } else {
+                sv_declare(gname, decl_ty, decl_sv_val, mut_flag);
+                sv_mark_global(gname);
+                sv_set_decl_line(gname, nd_line[stmt]);
+                snode = nd_i3[snode];
+            }
+        } else {
+            snode = nd_i3[snode];
         }
-        snode = nd_i3[snode];
     }
 
     mut fnode = fns_list;
@@ -3164,11 +3523,13 @@ fn sc_program(int64 structs_list, int64 fns_list, int64 top_list) -> int64 {
     sc_cur_fn_name   = "<top-level>";
     sc_cur_fn_ret_ty = TY_UNKNOWN;
     sc_cur_fn_ret_sv = "";
+    sc_in_globals_pass = 1;
     snode = top_list;
     while (snode != 0) {
         sc_stmt(nd_i2[snode]);
         snode = nd_i3[snode];
     }
+    sc_in_globals_pass = 0;
 
     return 0;
 }

@@ -1,0 +1,14 @@
+// Mastery — redeclaring a `for` loop variable inside its own body; must be
+// REJECTED.
+//
+// The loop body *is* the loop variable's frame, so `let i = 42` inside it binds
+// a second `i` and every read in the body resolves to that one instead of the
+// counter: this program printed 0 1 2 rather than 42 42 42.
+
+fn main() -> int64 {
+    for (i in 0..3) {
+        let i = 42;
+        println(i);
+    }
+    return 0;
+}

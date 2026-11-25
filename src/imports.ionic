@@ -1,5 +1,6 @@
 // ── Import resolution ────────────────────────────────────────────────────────
-import "lexer/tokens.ionic";   // CH_* character constants
+import "lexer/tokens.ionic";      // CH_* character constants
+import "diagnostics.ionic";       // srcmap_add: combined-buffer → source map
 
 // Resolves `import` statements at compile time by loading sources from one
 // of three locations (first match wins):
@@ -303,7 +304,7 @@ fn imp_resolve_rel(string rel) -> int64 {
     }
     let saved = g_imp_dir;
     g_imp_dir = imp_dir_of(full);
-    imp_expand(content);
+    imp_expand(content, full);
     g_imp_dir = saved;
     return 0;
 }
@@ -322,7 +323,7 @@ fn imp_resolve(string modpath) -> int64 {
     let p_local = str_concat("./.ionic/packages/", str_concat(slash, ".ionic"));
     let c_local = imp_try_read(p_local);
     if (str_len(c_local) > 0) {
-        imp_expand(c_local);
+        imp_expand(c_local, p_local);
         return 0;
     }
 
@@ -335,7 +336,7 @@ fn imp_resolve(string modpath) -> int64 {
                                 str_concat(slash, ".ionic"));
         let c_user = imp_try_read(p_user);
         if (str_len(c_user) > 0) {
-            imp_expand(c_user);
+            imp_expand(c_user, p_user);
             return 0;
         }
     }
@@ -362,14 +363,14 @@ fn imp_resolve(string modpath) -> int64 {
             let p_root = str_concat(str_concat(root, "/lib/"), rel_std);
             let c_root = imp_try_read(p_root);
             if (str_len(c_root) > 0) {
-                imp_expand(c_root);
+                imp_expand(c_root, p_root);
                 return 0;
             }
         }
         let p_std = str_concat("lib/", rel_std);
         let c_std = imp_try_read(p_std);
         if (str_len(c_std) > 0) {
-            imp_expand(c_std);
+            imp_expand(c_std, p_std);
             return 0;
         }
     }
@@ -421,11 +422,20 @@ fn imp_emit(string frag) -> int64 {
 // The fragments are still emitted as ONE body after this file's imports, which
 // is what preserves the original ordering: a module's imports are spliced in
 // ahead of its own top-level statements.
-fn imp_expand(string src) -> int64 {
+//
+// `file` is the path this `src` was read from. It rides along only so this
+// module's body can be entered in the source map (diagnostics.ionic): every
+// body line's *original* line number is recorded, so a diagnostic that lands on
+// this part can be reported against `file` at the line the user actually wrote,
+// not at its shifted position in the combined buffer.
+fn imp_expand(string src, string file) -> int64 {
     let n = str_len(src);
-    mut lines: [string] = [""];   // sentinel at 0; body lines from 1
+    mut lines: [string] = [""];      // sentinel at 0; body lines from 1
+    mut srclines: [int64] = [0];     // parallel: source line number of each body line
+    mut src_line = 0;                // 1-based line of the file we are walking
     mut pos = 0;
     while (pos < n) {
+        src_line = src_line + 1;
         let nl = imp_next_nl(src, pos);
         let s0 = imp_skip_space(src, pos);
         mut is_imp = 0;
@@ -471,12 +481,23 @@ fn imp_expand(string src) -> int64 {
             }
         } else {
             push(lines, str_slice(src, pos, nl));
+            // Parallel to `lines`: this body line came from source line
+            // `src_line`. Recorded now, while we still know it, because the
+            // join below discards the association between line text and
+            // position.
+            push(srclines, src_line);
         }
         pos = nl + 1;
     }
     // `str_join` puts the separator after every element, so this reproduces
     // `line + "\n"` exactly. Count is len-1 because slot 0 is the sentinel.
-    imp_emit(str_join(lines, 1, len(lines) - 1, "\n"));
+    let nlines = len(lines) - 1;
+    imp_emit(str_join(lines, 1, nlines, "\n"));
+    // Register this module's body in the source map, but only when it actually
+    // produced a part — imp_emit drops an empty body, and a map entry with no
+    // matching buffer lines would misalign every part after it. `nlines >= 1`
+    // is exactly the "non-empty body" condition (a body always ends with "\n").
+    if (nlines >= 1) { srcmap_add(file, nlines, srclines); }
     return 0;
 }
 
@@ -487,5 +508,9 @@ fn imp_reset() -> int64 {
     g_mod_paths = [""];
     g_mod_count = 0;
     g_imp_dir = ".";
+    // The source map is built while expanding, so it must start empty alongside
+    // the fragment list; otherwise a second expansion would see parts from the
+    // first and map buffer lines to the wrong files.
+    srcmap_reset();
     return 0;
 }

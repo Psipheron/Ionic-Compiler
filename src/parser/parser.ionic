@@ -594,6 +594,11 @@ fn parse_stmt_body(Parser p, int64 hw) -> int64 {
     }
 
     if (k == TOK_FOR) {
+        // The `for` keyword's line goes in nd_iv because new_node runs after
+        // `parse_block` has consumed the body, so nd_line would be the closing
+        // brace. A redeclaration diagnostic has to point at the line that
+        // declares the loop variable, not at the end of the loop.
+        let for_line = p_line(p);
         p_advance(p);
         p_expect(p, TOK_LPAREN);
         let var = p_expect_ident(p);
@@ -603,7 +608,7 @@ fn parse_stmt_body(Parser p, int64 hw) -> int64 {
         let end = parse_expr(p);
         p_expect(p, TOK_RPAREN);
         let body = parse_block(p);
-        return new_node(ND_FOR, var, 0, start, end, body);
+        return new_node(ND_FOR, var, for_line, start, end, body);
     }
 
     if (k == TOK_GPU) {

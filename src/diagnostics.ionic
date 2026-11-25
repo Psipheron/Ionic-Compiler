@@ -71,12 +71,138 @@ mut g_source = "";
 // iTerm2, and Neovim auto-detect.
 mut g_source_path = "<source>";
 
+// ── Source map: combined-buffer line → (file, source line) ───────────────────
+//
+// The import expander splices every module's body into one buffer and the lexer
+// numbers lines across that buffer, so a token's `line` is a position in the
+// *combined* text — not in any one file. Without a map, an error in a library
+// reports the entry file at a nonsense line: a `trim` defined on line 125 of
+// std.str surfaced as "main.ionic:159", because std.str was spliced in ahead of
+// main's own body and every line after it shifted.
+//
+// Each recorded part is one module body, in buffer order, carrying the buffer
+// line its first body line lands on and the *source* line number of every one
+// of its body lines. Per-line numbers — rather than a single start offset — are
+// what keep the mapping exact when a module imports partway through a file: the
+// expander drops import lines, so a module's body lines are not always one
+// contiguous source run, and a `start_line + offset` guess would drift past such
+// a gap.
+//
+// Populated by the import expander (imports.ionic → srcmap_add); read by the
+// printers below so every location — the clickable link and the "[error] L:C:"
+// text — names the real file and line.
+mut g_sm_count     = 0;
+// Part paths live in ONE flat blob (each path followed by '\n'), not an array
+// of strings. A path is built by the expander in a callee and handed straight
+// to srcmap_add; the language's array `push` stores the pointer without
+// retaining it, so the slot keeps a buffer the producing frame releases on
+// return and later reads back truncated or garbled instead of the path.
+// Appending to a global string with str_concat copies the bytes into storage
+// the global keeps alive, so the offsets below always index live text.
+mut g_sm_paths     = "";
+mut g_sm_poff      = [0];   // byte offset of part i's path in g_sm_paths
+mut g_sm_pend      = [0];   // byte offset just past part i's path (exclusive)
+mut g_sm_bufstart  = [0];   // first combined-buffer line of this part's body
+mut g_sm_lcount    = [0];   // number of body lines in this part
+mut g_sm_srcstart  = [0];   // index into g_sm_srclines of this part's first line
+mut g_sm_srclines  = [0];   // flat: source line number for each body line
+mut g_sm_srcline_n = 0;     // elements used in g_sm_srclines
+mut g_sm_next_buf  = 1;     // buffer line the next part's body will start on
+
+fn srcmap_reset() -> int64 {
+    g_sm_count     = 0;
+    g_sm_paths     = "";
+    g_sm_poff      = [0];
+    g_sm_pend      = [0];
+    g_sm_bufstart  = [0];
+    g_sm_lcount    = [0];
+    g_sm_srcstart  = [0];
+    g_sm_srclines  = [0];
+    g_sm_srcline_n = 0;
+    g_sm_next_buf  = 1;
+    return 0;
+}
+
+// Record one part. `file`'s body has `nlines` lines, and `srclines[1..nlines]`
+// holds the source line number of each body line (built by the expander as it
+// walks the file). Parts are added in buffer order, so the running
+// `g_sm_next_buf` places each one where the joined buffer will put it: a part's
+// body occupies `nlines` lines and is followed by one separator newline.
+fn srcmap_add(string file, int64 nlines, [int64] srclines) -> int64 {
+    g_sm_count = g_sm_count + 1;
+    let p = g_sm_count;
+    // Append the path to the flat blob and remember where it sits. The length
+    // is taken from the blob offsets, not by re-measuring the argument, so the
+    // text cannot drift from its recorded range.
+    let off = str_len(g_sm_paths);
+    g_sm_paths = str_concat(g_sm_paths, str_concat(file, "\n"));
+    if (p < len(g_sm_poff))     { g_sm_poff[p]     = off; }
+    else { push(g_sm_poff, off); }
+    if (p < len(g_sm_pend))     { g_sm_pend[p]     = off + str_len(file); }
+    else { push(g_sm_pend, off + str_len(file)); }
+    if (p < len(g_sm_bufstart)) { g_sm_bufstart[p] = g_sm_next_buf; }
+    else { push(g_sm_bufstart, g_sm_next_buf); }
+    if (p < len(g_sm_lcount))   { g_sm_lcount[p]   = nlines; }
+    else { push(g_sm_lcount, nlines); }
+    if (p < len(g_sm_srcstart)) { g_sm_srcstart[p] = g_sm_srcline_n + 1; }
+    else { push(g_sm_srcstart, g_sm_srcline_n + 1); }
+    mut i = 1;
+    while (i <= nlines) {
+        g_sm_srcline_n = g_sm_srcline_n + 1;
+        let j = g_sm_srcline_n;
+        if (j < len(g_sm_srclines)) { g_sm_srclines[j] = srclines[i]; }
+        else { push(g_sm_srclines, srclines[i]); }
+        i = i + 1;
+    }
+    g_sm_next_buf = g_sm_next_buf + nlines + 1;
+    return 0;
+}
+
+// Part index whose body contains `buf_line`, or 0 when it lands in a separator
+// blank line (or outside every body).
+fn srcmap_part(int64 buf_line) -> int64 {
+    mut i = 1;
+    while (i <= g_sm_count) {
+        let start = g_sm_bufstart[i];
+        if (buf_line >= start && buf_line < start + g_sm_lcount[i]) { return i; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Source file a buffer line came from, or "" when unmapped.
+fn srcmap_file(int64 buf_line) -> string {
+    let p = srcmap_part(buf_line);
+    if (p == 0) { return ""; }
+    // Slice the stored path out of the flat blob. Both bounds were recorded
+    // when the part was added, so the result is exactly that module's path.
+    return str_slice(g_sm_paths, g_sm_poff[p], g_sm_pend[p]);
+}
+
+// Source line number for a buffer line; falls back to the buffer line itself
+// when unmapped, so an unmapped position degrades to the old behaviour rather
+// than to a wrong file.
+fn srcmap_line(int64 buf_line) -> int64 {
+    let p = srcmap_part(buf_line);
+    if (p == 0) { return buf_line; }
+    let local = buf_line - g_sm_bufstart[p];
+    return g_sm_srclines[g_sm_srcstart[p] + local];
+}
+
 // Build the clickable "path:line:col" string for the given location.
 // When colors are enabled, wraps the path in cyan+underline so it pops.
 // Otherwise returns plain text — which is what editors parse.
+//
+// `line` is a combined-buffer line; the link names the *source* file and line
+// it maps to, so a click lands in the real file. Falls back to g_source_path
+// and the buffer line when the position is unmapped (a separator line, or a
+// single-file compile where nothing was spliced).
 fn print_jump_hint(int64 line, int64 col) -> int64 {
-    let link = str_concat(g_source_path, str_concat(":",
-                  str_concat(int64_to_str(line), str_concat(":",
+    let mapped_file = srcmap_file(line);
+    mut path = g_source_path;
+    if (str_len(mapped_file) > 0) { path = mapped_file; }
+    let link = str_concat(path, str_concat(":",
+                  str_concat(int64_to_str(srcmap_line(line)), str_concat(":",
                   str_concat(int64_to_str(col), "")))));
     // Plain text path is always emitted so editors can extract it; this is
     // what VSCode/iTerm2/Neovim auto-detect as a clickable link.
@@ -227,8 +353,10 @@ fn diag_spaces(int64 n) -> string {
 fn print_span_warn(int64 line, int64 col, string msg) -> int64 {
     color_autodetect();
     print_jump_hint(line, col);
+    // Show the *source* line in the header; the caret below still indexes the
+    // combined buffer because that is what g_source holds.
     let tag   = color_wrap(ANSI_BOLD_YELLOW, "[warn]");
-    let loc   = color_wrap(ANSI_CYAN, str_concat(int64_to_str(line), str_concat(":", str_concat(int64_to_str(col), ":"))));
+    let loc   = color_wrap(ANSI_CYAN, str_concat(int64_to_str(srcmap_line(line)), str_concat(":", str_concat(int64_to_str(col), ":"))));
     println(str_concat(str_concat(tag, " "), str_concat(loc, str_concat(" ", msg))));
     if (str_len(g_source) > 0) {
         let lstart = diag_line_start(g_source, line);
@@ -248,8 +376,10 @@ fn print_span(int64 line, int64 col, string msg) -> int64 {
     // the user filters lines that contain "[error]" out of their buffer.
     print_jump_hint(line, col);
     // Layout: bold-red "[error] ", cyan "line:col:", reset, then message.
+    // The header reports the *source* line (what the link names); the caret
+    // below stays in buffer space because g_source holds the combined text.
     let tag   = color_wrap(ANSI_BOLD_RED, "[error]");
-    let loc   = color_wrap(ANSI_CYAN, str_concat(int64_to_str(line), str_concat(":", str_concat(int64_to_str(col), ":"))));
+    let loc   = color_wrap(ANSI_CYAN, str_concat(int64_to_str(srcmap_line(line)), str_concat(":", str_concat(int64_to_str(col), ":"))));
     println(str_concat(str_concat(tag, " "), str_concat(loc, str_concat(" ", msg))));
     if (str_len(g_source) > 0) {
         let lstart = diag_line_start(g_source, line);

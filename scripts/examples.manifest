@@ -97,6 +97,16 @@ examples/mastery/fail/immutable.ionic	neg	-	ok	ok
 # delete this skip when the bootstrap's checker reaches parity.
 examples/mastery/fail/matmul_shape.ionic	neg	-	ok	skip
 examples/mastery/fail/mixed_pool.ionic	neg	-	ok	ok
+# The Rust bootstrap has no redeclaration check, so it accepts this
+# program and compiles it to code whose inner binding silently wins.
+# Native rejects it. Visible gap, not rot: delete the skip when the
+# bootstrap's checker reaches parity.
+examples/mastery/fail/shadow_local.ionic	neg	-	ok	skip
+examples/mastery/fail/for_var.ionic	neg	-	ok	skip
+# The bootstrap does reject a duplicated parameter, but only at link time
+# (clang: "redefinition of argument") rather than with a diagnostic. The
+# gate asserts rejection, which both backends satisfy.
+examples/mastery/fail/dup_param.ionic	neg	-	ok	ok
 examples/mastery/fail/multi_error.ionic	neg	-	ok	ok
 examples/mastery/fail/resolution_miss.ionic	neg	-	ok	ok
 # The Rust bootstrap accepts both of these — it has no use-after-move or

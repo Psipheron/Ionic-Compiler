@@ -596,7 +596,7 @@ fn opt_cons_field_inits(int64 list) -> int64 {
 let CP_SZ = 256;            // max tracked constants per function
 mut cp_pc_names = [""];     // name (1-based)
 mut cp_pc_ivals = [0];
-mut cp_pc_flags = [0];     // 0=none, 1=int, 2=float
+mut cp_pc_flags = [0];     // 0=none, 1=int, 2=float, 3=declared-but-not-foldable
 mut cp_pc_count  = 0;
 mut cp_active = 0;          // 1 while inside a function being const-propagated
 
@@ -614,7 +614,20 @@ fn cp_pc_is_const(string name) -> int64 {
     return 0;
 }
 
+// Record `name` as a compile-time constant, unless it has already been
+// declared in this function.
+//
+// The table is keyed by *name* and this pass has no notion of scope, so two
+// sibling blocks each doing `let kind = <literal>` would collapse into one
+// entry and every reference in the function would fold to whichever literal
+// was recorded first — `if (c) { let kind = 5; ... } if (c) { let kind = 9;
+// ... }` printed 5 twice. A second declaration therefore *drops* the entry
+// instead of adding one: with more than one visible declaration of a name the
+// pass cannot tell which one a reference means, so it must fold none of them.
+// (Nested re-declaration in a single scope is rejected by the checker; this
+// covers the sibling case, which is legal and must compile correctly.)
 fn cp_pc_add_int(string name, int64 v) -> int64 {
+    if (cp_pc_is_const(name) != 0) { cp_pc_drop(name); return 0; }
     if (cp_pc_count >= CP_SZ) { return 0; }
     cp_pc_count = cp_pc_count + 1;
     if (cp_pc_count < len(cp_pc_names)) {
@@ -630,6 +643,7 @@ fn cp_pc_add_int(string name, int64 v) -> int64 {
 }
 
 fn cp_pc_add_float(string name, int64 bits) -> int64 {
+    if (cp_pc_is_const(name) != 0) { cp_pc_drop(name); return 0; }
     if (cp_pc_count >= CP_SZ) { return 0; }
     cp_pc_count = cp_pc_count + 1;
     if (cp_pc_count < len(cp_pc_names)) {
@@ -642,6 +656,27 @@ fn cp_pc_add_float(string name, int64 bits) -> int64 {
         push(cp_pc_flags, 2);
     }
     return 1;
+}
+
+// Record `name` as declared-but-not-foldable (flag 3). Used for parameters and
+// loop variables, which are declarations the pass must know about even though
+// they carry no literal: a later `let x = <literal>` is then a second
+// declaration and invalidates the entry rather than folding every `x` in the
+// function. A flag-3 entry never folds, so cp_pc_subst ignores it.
+fn cp_pc_add_barrier(string name) -> int64 {
+    if (cp_pc_is_const(name) != 0) { cp_pc_drop(name); return 0; }
+    if (cp_pc_count >= CP_SZ) { return 0; }
+    cp_pc_count = cp_pc_count + 1;
+    if (cp_pc_count < len(cp_pc_names)) {
+        cp_pc_names[cp_pc_count] = name;
+        cp_pc_ivals[cp_pc_count] = 0;
+        cp_pc_flags[cp_pc_count] = 3;
+    } else {
+        push(cp_pc_names, name);
+        push(cp_pc_ivals, 0);
+        push(cp_pc_flags, 3);
+    }
+    return 0;
 }
 
 fn cp_pc_drop(string name) -> int64 {
@@ -698,6 +733,10 @@ fn cp_pc_scan_stmt(int64 node, int64 in_fn) -> int64 {
     } else if (k == ND_WHILE) {
         if (nd_i3[node] != 0) { cp_pc_scan_stmt_list(nd_i2[nd_i3[node]], in_fn); }
     } else if (k == ND_FOR) {
+        // The loop variable is a declaration too: `for (i in 0..3)` followed by
+        // a sibling `let i = <literal>` must not let the pass fold the second
+        // `i` back to the loop counter or vice versa.
+        cp_pc_add_barrier(nd_sv[node]);
         if (nd_i4[node] != 0) { cp_pc_scan_stmt_list(nd_i2[nd_i4[node]], in_fn); }
     } else if (k == ND_BLOCK) {
         cp_pc_scan_stmt_list(nd_i2[node], in_fn);
@@ -916,6 +955,16 @@ fn opt_fn(int64 fn_node) -> int64 {
     // Scoped const propagation: pre-scan to collect `let x = const` bindings
     // that are never reassigned anywhere in this function, then substitute them.
     cp_pc_reset();
+    // Parameters are declarations too. Without this a body that begins
+    // `let p = 5;` after taking `p` as a parameter folds every later `p` to 5 —
+    // the parameter itself included, which is wrong for any call whose argument
+    // is not 5. Registering them as barriers makes the second declaration
+    // invalidate the name instead.
+    mut pn = nd_i2[fn_node];
+    while (pn != 0) {
+        if (nd_kind[nd_i2[pn]] == ND_PARAM) { cp_pc_add_barrier(nd_sv[nd_i2[pn]]); }
+        pn = nd_i3[pn];
+    }
     let body_block = nd_i4[fn_node];
     if (body_block != 0) {
         cp_pc_scan_stmt_list(nd_i2[body_block], 1);

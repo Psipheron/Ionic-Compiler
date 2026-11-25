@@ -1,0 +1,20 @@
+// Mastery — a local shadowing a local visible in an enclosing scope; must be
+// REJECTED.
+//
+// The emitter appends a stack slot for the inner `let` but resolves every later
+// reference by name to the newest match, and its local table is never popped at
+// `}`. So the inner declaration makes the outer binding unreachable for the rest
+// of the function: this program printed 22 22 instead of 22 11.
+
+fn f() -> int64 { return 11; }
+fn g() -> int64 { return 22; }
+
+fn main() -> int64 {
+    let a = f();
+    if (1 == 1) {
+        let a = g();
+        println(a);
+    }
+    println(a);
+    return 0;
+}
